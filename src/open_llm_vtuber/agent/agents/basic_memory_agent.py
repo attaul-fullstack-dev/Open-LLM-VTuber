@@ -566,7 +566,9 @@ class BasicMemoryAgent(AgentInterface):
                     }
                 )
             else:
-                logger.warning(f"Skipping invalid message from history: {msg}")
+                logger.warning(
+                    "Skipping invalid message from history (content omitted)"
+                )
         self._load_summary_state(conf_uid, history_uid)
         self._load_relationship_state(conf_uid, history_uid)
         logger.info(f"Loaded {len(self._memory)} messages from history.")
@@ -730,7 +732,10 @@ class BasicMemoryAgent(AgentInterface):
                 elif event["type"] == "message_stop":
                     break
                 elif event["type"] == "error":
-                    logger.error(f"LLM API Error: {event['message']}")
+                    logger.error(
+                        "LLM API error (message_chars={})",
+                        len(str(event.get("message", ""))),
+                    )
                     yield f"[Error from LLM: {event['message']}]"
                     return
 

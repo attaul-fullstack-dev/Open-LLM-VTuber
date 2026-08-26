@@ -173,7 +173,7 @@ character_config:
         temperature: 0.7 # 注意，DeepSeek 的温度范围是 0 到 1
 
       mistral_llm:
-        llm_api_key: 'Your Mistral API key' # Mistral API 密钥
+        llm_api_key: '${MISTRAL_API_KEY}' # 从环境变量读取；conf.yaml 仍可覆盖。
         model: 'pixtral-large-latest' # 使用的模型
         temperature: 1.0 # 温度，介于 0 到 2 之间
         # 可选的 Mistral 生成参数。删除后将使用服务商默认值。

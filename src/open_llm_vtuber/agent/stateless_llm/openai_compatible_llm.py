@@ -129,8 +129,11 @@ class AsyncLLM(StatelessLLMInterface):
             stream: AsyncStream[
                 ChatCompletionChunk
             ] = await self.client.chat.completions.create(**request_params)
+            tool_count = len(tools or []) if self.support_tools else 0
             logger.debug(
-                f"Tool Support: {self.support_tools}, Available tools: {available_tools}"
+                "Tool support enabled={}, available_tool_count={}",
+                self.support_tools,
+                tool_count,
             )
 
             async for chunk in stream:
@@ -146,7 +149,8 @@ class AsyncLLM(StatelessLLMInterface):
 
                     if has_tool_calls:
                         logger.debug(
-                            f"Tool calls detected in chunk: {chunk.choices[0].delta.tool_calls}"
+                            "Tool call chunks detected (count={})",
+                            len(chunk.choices[0].delta.tool_calls),
                         )
                         in_tool_call = True
                         # Process tool calls in the current chunk
@@ -193,7 +197,10 @@ class AsyncLLM(StatelessLLMInterface):
                     elif in_tool_call and not has_tool_calls:
                         in_tool_call = False
                         # Convert accumulated tool calls to the required format and output
-                        logger.info(f"Complete tool calls: {accumulated_tool_calls}")
+                        logger.info(
+                            "Tool calls completed (count={})",
+                            len(accumulated_tool_calls),
+                        )
 
                         # Use the from_dict method to create a ToolCallObject instance from a dictionary
                         complete_tool_calls = [
@@ -214,7 +221,10 @@ class AsyncLLM(StatelessLLMInterface):
 
             # If stream ends while still in a tool call, make sure to yield the tool call
             if in_tool_call and accumulated_tool_calls:
-                logger.info(f"Final tool call at stream end: {accumulated_tool_calls}")
+                logger.info(
+                    "Final tool calls completed at stream end (count={})",
+                    len(accumulated_tool_calls),
+                )
 
                 # Create a ToolCallObject instance from a dictionary using the from_dict method.
                 complete_tool_calls = [

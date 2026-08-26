@@ -63,7 +63,9 @@ class TTSTaskManager:
             return
 
         logger.debug(
-            f"🏃Queuing TTS task for: '''{tts_text}''' (by {display_text.name})"
+            "Queuing TTS task (characters={}, speaker_set={})",
+            len(tts_text),
+            bool(display_text.name),
         )
 
         # Get current sequence number
@@ -165,7 +167,7 @@ class TTSTaskManager:
 
     async def _generate_audio(self, tts_engine: TTSInterface, text: str) -> str:
         """Generate audio file from text"""
-        logger.debug(f"🏃Generating audio for '''{text}'''...")
+        logger.debug("Generating TTS audio (characters={})", len(text))
         return await tts_engine.async_generate_audio(
             text=text,
             file_name_no_ext=f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{str(uuid.uuid4())[:8]}",

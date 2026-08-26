@@ -92,12 +92,12 @@ async def handle_sentence_output(
     """Handle sentence output type with optional translation support"""
     full_response = ""
     async for display_text, tts_text, actions in output:
-        logger.debug(f"🏃 Processing output: '''{tts_text}'''...")
+        logger.debug("Processing TTS output (characters={})", len(tts_text))
 
         if translate_engine:
             if len(re.sub(r'[\s.,!?，。！？\'"』」）】\s]+', "", tts_text)):
                 tts_text = translate_engine.translate(tts_text)
-            logger.info(f"🏃 Text after translation: '''{tts_text}'''...")
+            logger.info("TTS translation completed (characters={})", len(tts_text))
         else:
             logger.debug("🚫 No translation engine available. Skipping translation.")
 

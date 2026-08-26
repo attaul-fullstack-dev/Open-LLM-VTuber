@@ -32,7 +32,7 @@ class RelationshipUpdate:
 
 
 _DATING_PROPOSAL = re.compile(
-    r"\b(?:mau(?:kah|\s+nggak|\s+gak)?\s+(?:jadi\s+)?pacar(?:ku|\s+aku)?|"
+    r"\b(?:mau(?:kah|\s+nggak|\s+ngga|\s+gak|\s+ga)?\s+(?:jadi\s+)?pacar(?:ku|\s+aku)?|"
     r"jadi\s+pacar(?:ku|\s+aku)|pacaran\s+(?:sama|dengan)\s+aku|"
     r"kita\s+(?:jadian|pacaran)|(?:jadian|pacaran)\s+yuk|"
     r"mau\s+jadian\s+(?:sama|dengan)\s+aku|"

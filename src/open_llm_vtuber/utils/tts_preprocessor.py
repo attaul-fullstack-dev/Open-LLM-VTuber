@@ -35,7 +35,7 @@ def tts_filter(
             text = filter_asterisks(text)
         except Exception as e:
             logger.warning(f"Error ignoring asterisks: {e}")
-            logger.warning(f"Text: {text}")
+            logger.warning("TTS input omitted from logs (characters={})", len(text))
             logger.warning("Skipping...")
 
     if ignore_brackets:
@@ -43,40 +43,40 @@ def tts_filter(
             text = filter_brackets(text)
         except Exception as e:
             logger.warning(f"Error ignoring brackets: {e}")
-            logger.warning(f"Text: {text}")
+            logger.warning("TTS input omitted from logs (characters={})", len(text))
             logger.warning("Skipping...")
     if ignore_parentheses:
         try:
             text = filter_parentheses(text)
         except Exception as e:
             logger.warning(f"Error ignoring parentheses: {e}")
-            logger.warning(f"Text: {text}")
+            logger.warning("TTS input omitted from logs (characters={})", len(text))
             logger.warning("Skipping...")
     if ignore_angle_brackets:
         try:
             text = filter_angle_brackets(text)
         except Exception as e:
             logger.warning(f"Error ignoring angle brackets: {e}")
-            logger.warning(f"Text: {text}")
+            logger.warning("TTS input omitted from logs (characters={})", len(text))
             logger.warning("Skipping...")
     if remove_special_char:
         try:
             text = remove_special_characters(text)
         except Exception as e:
             logger.warning(f"Error removing special characters: {e}")
-            logger.warning(f"Text: {text}")
+            logger.warning("TTS input omitted from logs (characters={})", len(text))
             logger.warning("Skipping...")
     if translator:
         try:
             logger.info("Translating...")
             text = translator.translate(text)
-            logger.info(f"Translated: {text}")
+            logger.info("TTS translation completed (characters={})", len(text))
         except Exception as e:
             logger.critical(f"Error translating: {e}")
-            logger.critical(f"Text: {text}")
+            logger.critical("TTS input omitted from logs (characters={})", len(text))
             logger.warning("Skipping...")
 
-    logger.debug(f"Filtered text: {text}")
+    logger.debug("TTS filtering completed (characters={})", len(text))
     return text
 
 

@@ -81,7 +81,7 @@ async def process_single_conversation(
         if skip_history:
             logger.debug("Skipping storing user input to history (proactive speak)")
 
-        logger.info(f"User input: {input_text}")
+        logger.info("User input received (characters={})", len(input_text))
         if images:
             logger.info(f"With {len(images)} images")
 
@@ -120,7 +120,9 @@ async def process_single_conversation(
                     logger.warning(
                         f"Received unexpected item type from agent chat stream: {type(output_item)}"
                     )
-                    logger.debug(f"Unexpected item content: {output_item}")
+                    logger.debug(
+                        "Unexpected item type from agent chat stream (content omitted)"
+                    )
 
         except Exception as e:
             logger.exception(
@@ -157,7 +159,7 @@ async def process_single_conversation(
                 name=context.character_config.character_name,
                 avatar=context.character_config.avatar,
             )
-            logger.info(f"AI response: {full_response}")
+            logger.info("AI response completed (characters={})", len(full_response))
             if not skip_history and hasattr(
                 context.agent_engine, "observe_relationship_event"
             ):

@@ -152,6 +152,37 @@ class RelationshipContinuityTests(unittest.IsolatedAsyncioTestCase):
         metadata = get_metadata(self.conf_uid, history_uid)
         self.assertEqual(metadata["relationship_reason"], "explicit_relationship_event")
 
+    def test_clear_indonesian_dating_variants_require_acceptance(self):
+        proposals = (
+            "Mau gak jadi pacarku?",
+            "Mau ngga jadi pacar aku?",
+            "Jadi pacar aku ya?",
+            "Kita pacaran yuk.",
+        )
+        for proposal in proposals:
+            with self.subTest(proposal=proposal):
+                update = detect_relationship_update(
+                    "stranger", proposal, "...Iya. Mau."
+                )
+                self.assertIsNotNone(update)
+                self.assertEqual(update.new_status, "dating")
+
+    def test_rejected_proposal_does_not_set_dating(self):
+        self.assertIsNone(
+            detect_relationship_update(
+                "close", "Mau jadi pacarku?", "Nggak. Aku belum mau."
+            )
+        )
+
+    def test_third_party_relationship_question_is_not_a_proposal(self):
+        self.assertIsNone(
+            detect_relationship_update(
+                "stranger",
+                "Karakter di anime itu pacaran nggak?",
+                "Kayaknya belum dijelasin di ceritanya.",
+            )
+        )
+
     def test_one_sided_romantic_message_does_not_set_dating(self):
         history_uid = self.create_history()
         agent = self.make_agent(history_uid)
