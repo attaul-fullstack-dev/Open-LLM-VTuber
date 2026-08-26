@@ -74,6 +74,13 @@ character_config:
         context_window_override: null
         # Extra input safety margin in tokens, in addition to max output tokens.
         context_safety_margin: 1024
+        # Incrementally summarize old turns only when context trimming occurs.
+        rolling_summary_enabled: True
+        # Compact summary target/hard cap in conservatively estimated tokens.
+        summary_target_tokens: 320
+        summary_max_tokens: 384
+        # Minimum newly evicted messages before one summary update.
+        summary_min_new_messages: 4
 
       letta_agent:
         host: 'localhost' # Host address

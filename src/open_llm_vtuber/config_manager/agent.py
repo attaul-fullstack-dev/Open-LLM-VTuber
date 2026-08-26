@@ -38,6 +38,12 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
         None, gt=0, alias="context_window_override"
     )
     context_safety_margin: int = Field(1024, ge=0, alias="context_safety_margin")
+    rolling_summary_enabled: bool = Field(True, alias="rolling_summary_enabled")
+    summary_target_tokens: int = Field(320, gt=0, alias="summary_target_tokens")
+    summary_max_tokens: int = Field(384, gt=0, alias="summary_max_tokens")
+    summary_min_new_messages: int = Field(
+        4, gt=0, alias="summary_min_new_messages"
+    )
 
     DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
         "llm_provider": Description(
@@ -71,6 +77,22 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
         "context_safety_margin": Description(
             en="Tokens reserved as a safety margin in addition to output tokens (default: 1024)",
             zh="除输出 token 外额外保留的安全余量（默认：1024）",
+        ),
+        "rolling_summary_enabled": Description(
+            en="Incrementally summarize old turns only when context trimming occurs (default: True)",
+            zh="仅在上下文裁剪发生时增量总结旧轮次（默认：True）",
+        ),
+        "summary_target_tokens": Description(
+            en="Target size for each compact rolling summary (default: 320 estimated tokens)",
+            zh="滚动摘要的目标大小（默认：约 320 token）",
+        ),
+        "summary_max_tokens": Description(
+            en="Hard estimated-token cap for stored conversation summaries (default: 384)",
+            zh="存储的对话摘要估算 token 硬上限（默认：384）",
+        ),
+        "summary_min_new_messages": Description(
+            en="Minimum newly evicted messages before updating a summary (default: 4)",
+            zh="更新摘要前至少新增的被裁剪消息数（默认：4）",
         ),
     }
 

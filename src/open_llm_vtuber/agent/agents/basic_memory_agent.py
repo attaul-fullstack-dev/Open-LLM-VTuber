@@ -8,13 +8,19 @@ from typing import (
     Union,
     Optional,
 )
+import asyncio
+from datetime import datetime, timezone
 from loguru import logger
 from .agent_interface import AgentInterface
 from ..output_types import SentenceOutput, DisplayText
 from ..stateless_llm.stateless_llm_interface import StatelessLLMInterface
 from ..stateless_llm.claude_llm import AsyncLLM as ClaudeAsyncLLM
 from ..stateless_llm.openai_compatible_llm import AsyncLLM as OpenAICompatibleAsyncLLM
-from ...chat_history_manager import get_history
+from ...chat_history_manager import (
+    get_history,
+    get_metadata,
+    update_summary_metadata,
+)
 from ..transformers import (
     sentence_divider,
     actions_extractor,
@@ -31,7 +37,13 @@ from ...mcpp.tool_executor import ToolExecutor
 from ..context_window import (
     ContextBudgetExceeded,
     ContextSelection,
+    estimate_tokens,
     select_messages_for_context,
+)
+from ..conversation_summary import (
+    IncrementalSummarizer,
+    SummaryState,
+    build_summary_message,
 )
 
 
@@ -57,6 +69,10 @@ class BasicMemoryAgent(AgentInterface):
         context_management_enabled: bool = True,
         context_window_override: Optional[int] = None,
         context_safety_margin: int = 1024,
+        rolling_summary_enabled: bool = True,
+        summary_target_tokens: int = 320,
+        summary_max_tokens: int = 384,
+        summary_min_new_messages: int = 4,
     ):
         """Initialize agent with LLM and configuration."""
         super().__init__()
@@ -78,6 +94,17 @@ class BasicMemoryAgent(AgentInterface):
         self._context_management_enabled = context_management_enabled
         self._context_window_override = context_window_override
         self._context_safety_margin = context_safety_margin
+        self._rolling_summary_enabled = rolling_summary_enabled
+        self._summary_min_new_messages = summary_min_new_messages
+        self._summary_state = SummaryState()
+        self._summary_conf_uid: Optional[str] = None
+        self._summary_history_uid: Optional[str] = None
+        self._summary_lock = asyncio.Lock()
+        self._summarizer = IncrementalSummarizer(
+            llm=llm,
+            target_tokens=summary_target_tokens,
+            maximum_tokens=summary_max_tokens,
+        )
 
         self._formatted_tools_openai = []
         self._formatted_tools_claude = []
@@ -138,23 +165,15 @@ class BasicMemoryAgent(AgentInterface):
 
         self._system = system
 
-    def _prepare_context(
+    def _select_context(
         self,
         messages: List[Dict[str, Any]],
         system_prompt: str,
         tools: Optional[List[Dict[str, Any]]] = None,
         protected_start: Optional[int] = None,
-    ) -> List[Dict[str, Any]]:
+    ) -> ContextSelection:
         """Budget one API request without changing ``_memory`` or disk history."""
-        if not self._context_management_enabled:
-            logger.debug(
-                "Context management disabled: model={}, messages={}",
-                getattr(self._llm, "model", "unknown"),
-                len(messages),
-            )
-            return list(messages)
-
-        selection: ContextSelection = select_messages_for_context(
+        return select_messages_for_context(
             messages=messages,
             system_prompt=system_prompt,
             model=getattr(self._llm, "model", None),
@@ -164,6 +183,8 @@ class BasicMemoryAgent(AgentInterface):
             tools=tools,
             protected_start=protected_start,
         )
+
+    def _log_context_stats(self, selection: ContextSelection) -> None:
         stats = selection.stats
         logger.info(
             "Context stats: model={}, context_limit={}, reserved_output={}, "
@@ -186,7 +207,182 @@ class BasicMemoryAgent(AgentInterface):
             stats.estimated_input_tokens,
             stats.used_fallback_limit,
         )
+
+    def _prepare_context(
+        self,
+        messages: List[Dict[str, Any]],
+        system_prompt: str,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        protected_start: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        if not self._context_management_enabled:
+            logger.debug(
+                "Context management disabled: model={}, messages={}",
+                getattr(self._llm, "model", "unknown"),
+                len(messages),
+            )
+            return list(messages)
+        selection = self._select_context(
+            messages,
+            system_prompt,
+            tools=tools,
+            protected_start=protected_start,
+        )
+        self._log_context_stats(selection)
         return selection.messages
+
+    def _load_summary_state(self, conf_uid: str, history_uid: str) -> None:
+        metadata = get_metadata(conf_uid, history_uid)
+        text = metadata.get("conversation_summary", "")
+        through = metadata.get("summary_through_message_index", 0)
+        try:
+            through = max(0, min(int(through or 0), len(self._memory)))
+        except (TypeError, ValueError):
+            through = 0
+        self._summary_conf_uid = conf_uid
+        self._summary_history_uid = history_uid
+        self._summary_state = SummaryState(
+            text=text if isinstance(text, str) else "",
+            summarized_through=through,
+            updated_at=metadata.get("summary_updated_at"),
+        )
+
+    async def _maybe_update_summary(
+        self,
+        *,
+        messages: List[Dict[str, Any]],
+        protected_start: int,
+        initial_selection: ContextSelection,
+    ) -> tuple[bool, bool, int, int]:
+        """Return update/failure/candidate count/current eviction boundary."""
+        if (
+            not self._rolling_summary_enabled
+            or not self._context_management_enabled
+            or not initial_selection.stats.trimmed
+            or not self._summary_conf_uid
+            or not self._summary_history_uid
+        ):
+            return False, False, 0, 0
+
+        protected_count = len(messages) - protected_start
+        selected_history_count = len(initial_selection.messages) - protected_count
+        evicted_through = max(0, protected_start - selected_history_count)
+
+        async with self._summary_lock:
+            start = self._summary_state.summarized_through
+            if evicted_through <= start:
+                return False, False, 0, evicted_through
+            candidates = messages[start:evicted_through]
+            if len(candidates) < self._summary_min_new_messages:
+                return False, False, 0, evicted_through
+
+            try:
+                updated_summary = await self._summarizer.summarize(
+                    self._summary_state.text,
+                    candidates,
+                )
+                updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                persisted = update_summary_metadata(
+                    self._summary_conf_uid,
+                    self._summary_history_uid,
+                    expected_summarized_through=start,
+                    conversation_summary=updated_summary,
+                    summarized_through=evicted_through,
+                    summary_updated_at=updated_at,
+                )
+                if not persisted:
+                    self._load_summary_state(
+                        self._summary_conf_uid,
+                        self._summary_history_uid,
+                    )
+                    return False, False, 0, evicted_through
+                self._summary_state = SummaryState(
+                    text=updated_summary,
+                    summarized_through=evicted_through,
+                    updated_at=updated_at,
+                )
+                return True, False, len(candidates), evicted_through
+            except Exception as error:
+                logger.warning(
+                    "Rolling summary update failed; keeping prior summary: type={}",
+                    type(error).__name__,
+                )
+                return False, True, len(candidates), evicted_through
+
+    async def _prepare_context_with_summary(
+        self,
+        messages: List[Dict[str, Any]],
+        system_prompt: str,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        protected_start: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Apply Stage 3 budgeting, update summary if needed, then inject it."""
+        if not self._context_management_enabled:
+            return self._prepare_context(
+                messages,
+                system_prompt,
+                tools=tools,
+                protected_start=protected_start,
+            )
+        if protected_start is None:
+            protected_start = max(0, len(messages) - 1)
+        initial_selection = self._select_context(
+            messages,
+            system_prompt,
+            tools=tools,
+            protected_start=protected_start,
+        )
+        updated, failed, new_count, evicted_through = await self._maybe_update_summary(
+            messages=messages,
+            protected_start=protected_start,
+            initial_selection=initial_selection,
+        )
+
+        summary_present = bool(self._summary_state.text.strip())
+        if summary_present:
+            # Stage 3 already chose not to send messages before evicted_through.
+            # Keep that same boundary even when a summary refresh fails, while
+            # retaining the unsummarized transcript for a later retry.
+            through = min(
+                max(self._summary_state.summarized_through, evicted_through),
+                protected_start,
+            )
+            summary_role = (
+                "assistant" if isinstance(self._llm, ClaudeAsyncLLM) else "system"
+            )
+            request_source = [
+                build_summary_message(self._summary_state.text, role=summary_role),
+                *messages[through:],
+            ]
+            final_protected_start = 1 + protected_start - through
+            final_selection = self._select_context(
+                request_source,
+                system_prompt,
+                tools=tools,
+                protected_start=final_protected_start,
+            )
+        else:
+            final_selection = initial_selection
+
+        self._log_context_stats(final_selection)
+        summary_included = summary_present and bool(final_selection.messages) and (
+            final_selection.messages[0].get("content", "").startswith(
+                "Conversation context from earlier messages"
+            )
+        )
+        logger.info(
+            "Summary stats: summary_present={}, summary_included={}, "
+            "summary_tokens={}, summarized_through={}, new_messages_summarized={}, "
+            "summary_updated={}, summary_generation_failed={}",
+            summary_present,
+            summary_included,
+            estimate_tokens(self._summary_state.text) if summary_present else 0,
+            self._summary_state.summarized_through,
+            new_count,
+            updated,
+            failed,
+        )
+        return final_selection.messages
 
     @staticmethod
     def _context_error_message(error: ContextBudgetExceeded) -> str:
@@ -261,6 +457,7 @@ class BasicMemoryAgent(AgentInterface):
                 )
             else:
                 logger.warning(f"Skipping invalid message from history: {msg}")
+        self._load_summary_state(conf_uid, history_uid)
         logger.info(f"Loaded {len(self._memory)} messages from history.")
 
     def handle_interrupt(self, heard_response: str) -> None:
@@ -372,7 +569,7 @@ class BasicMemoryAgent(AgentInterface):
 
         while True:
             try:
-                request_messages = self._prepare_context(
+                request_messages = await self._prepare_context_with_summary(
                     messages,
                     self._system,
                     tools=tools,
@@ -511,7 +708,7 @@ class BasicMemoryAgent(AgentInterface):
                 tools_for_api = tools
 
             try:
-                request_messages = self._prepare_context(
+                request_messages = await self._prepare_context_with_summary(
                     messages,
                     current_system_prompt,
                     tools=tools_for_api,
@@ -740,7 +937,7 @@ class BasicMemoryAgent(AgentInterface):
             else:
                 logger.info("Starting simple chat completion.")
                 try:
-                    request_messages = self._prepare_context(
+                    request_messages = await self._prepare_context_with_summary(
                         messages,
                         self._system,
                         protected_start=protected_start,

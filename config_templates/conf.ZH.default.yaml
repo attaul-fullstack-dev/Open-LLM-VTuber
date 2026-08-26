@@ -74,6 +74,13 @@ character_config:
         context_window_override: null
         # 除最大输出 token 外，额外保留的输入安全余量。
         context_safety_margin: 1024
+        # 仅在上下文裁剪发生时增量总结旧轮次。
+        rolling_summary_enabled: True
+        # 紧凑摘要的目标/硬上限（保守估算 token）。
+        summary_target_tokens: 320
+        summary_max_tokens: 384
+        # 一次摘要更新前最少新增的被裁剪消息数。
+        summary_min_new_messages: 4
 
       hume_ai_agent:
         api_key: ''

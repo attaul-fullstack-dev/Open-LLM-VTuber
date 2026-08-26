@@ -92,6 +92,18 @@ class AgentFactory:
                 context_safety_margin=basic_memory_settings.get(
                     "context_safety_margin", 1024
                 ),
+                rolling_summary_enabled=basic_memory_settings.get(
+                    "rolling_summary_enabled", True
+                ),
+                summary_target_tokens=basic_memory_settings.get(
+                    "summary_target_tokens", 320
+                ),
+                summary_max_tokens=basic_memory_settings.get(
+                    "summary_max_tokens", 384
+                ),
+                summary_min_new_messages=basic_memory_settings.get(
+                    "summary_min_new_messages", 4
+                ),
             )
 
         elif conversation_agent_choice == "mem0_agent":

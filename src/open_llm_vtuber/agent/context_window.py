@@ -115,7 +115,14 @@ def _history_turns(
     current: List[Dict[str, Any]] = []
 
     for message in history:
-        if message.get("role") == "user":
+        if message.get("role") == "system":
+            if current:
+                turns.append(current)
+                current = []
+            # Internal context such as a rolling summary is its own lowest-
+            # priority unit, so recent user/assistant turns never depend on it.
+            turns.append([message])
+        elif message.get("role") == "user":
             if current:
                 turns.append(current)
             current = [message]
