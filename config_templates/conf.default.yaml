@@ -164,6 +164,9 @@ character_config:
         llm_api_key: 'Your Mistral API key'
         model: 'pixtral-large-latest'
         temperature: 1.0 # value between 0 to 2
+        # Optional Mistral generation controls. Remove them to use provider defaults.
+        top_p: 0.9 # value between 0 and 1
+        max_tokens: 384 # maximum output tokens
 
       groq_llm:
         llm_api_key: 'your groq API key'

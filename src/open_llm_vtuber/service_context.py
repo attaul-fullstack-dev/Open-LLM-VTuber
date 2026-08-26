@@ -38,6 +38,31 @@ from .config_manager import (
 )
 
 
+def _redact_sensitive(value):
+    """Return a log-safe copy of nested config data."""
+    if isinstance(value, dict):
+        redacted = {}
+        for key, item in value.items():
+            normalized = str(key).lower()
+            is_secret = normalized in {
+                "api_key",
+                "llm_api_key",
+                "password",
+                "secret",
+                "secret_id",
+                "secret_key",
+                "access_token",
+                "auth_token",
+                "credential",
+                "credentials",
+            } or normalized.endswith(("_api_key", "_password", "_secret"))
+            redacted[key] = "[REDACTED]" if is_secret else _redact_sensitive(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_sensitive(item) for item in value]
+    return value
+
+
 class ServiceContext:
     """Initializes, stores, and updates the asr, tts, and llm instances and other
     configurations for a connected client."""
@@ -76,14 +101,14 @@ class ServiceContext:
         return (
             f"ServiceContext:\n"
             f"  System Config: {'Loaded' if self.system_config else 'Not Loaded'}\n"
-            f"    Details: {json.dumps(self.system_config.model_dump(), indent=6) if self.system_config else 'None'}\n"
+            f"    Details: {json.dumps(_redact_sensitive(self.system_config.model_dump()), indent=6) if self.system_config else 'None'}\n"
             f"  Live2D Model: {self.live2d_model.model_info if self.live2d_model else 'Not Loaded'}\n"
             f"  ASR Engine: {type(self.asr_engine).__name__ if self.asr_engine else 'Not Loaded'}\n"
-            f"    Config: {json.dumps(self.character_config.asr_config.model_dump(), indent=6) if self.character_config.asr_config else 'None'}\n"
+            f"    Config: {json.dumps(_redact_sensitive(self.character_config.asr_config.model_dump()), indent=6) if self.character_config.asr_config else 'None'}\n"
             f"  TTS Engine: {type(self.tts_engine).__name__ if self.tts_engine else 'Not Loaded'}\n"
-            f"    Config: {json.dumps(self.character_config.tts_config.model_dump(), indent=6) if self.character_config.tts_config else 'None'}\n"
+            f"    Config: {json.dumps(_redact_sensitive(self.character_config.tts_config.model_dump()), indent=6) if self.character_config.tts_config else 'None'}\n"
             f"  LLM Engine: {type(self.agent_engine).__name__ if self.agent_engine else 'Not Loaded'}\n"
-            f"    Agent Config: {json.dumps(self.character_config.agent_config.model_dump(), indent=6) if self.character_config.agent_config else 'None'}\n"
+            f"    Agent Config: {json.dumps(_redact_sensitive(self.character_config.agent_config.model_dump()), indent=6) if self.character_config.agent_config else 'None'}\n"
             f"  VAD Engine: {type(self.vad_engine).__name__ if self.vad_engine else 'Not Loaded'}\n"
             f"    Agent Config: {json.dumps(self.character_config.vad_config.model_dump(), indent=6) if self.character_config.vad_config else 'None'}\n"
             f"  System Prompt: {self.system_prompt or 'Not Set'}\n"
@@ -252,7 +277,10 @@ class ServiceContext:
             self.character_config.persona_prompt,
         )
 
-        logger.debug(f"Loaded service context with cache: {character_config}")
+        logger.debug(
+            "Loaded service context with cache: {}",
+            _redact_sensitive(character_config.model_dump()),
+        )
 
     async def load_from_config(self, config: Config) -> None:
         """
@@ -523,7 +551,8 @@ class ServiceContext:
                 await self.load_from_config(new_config)  # Await the async load
                 logger.debug(f"New config: {self}")
                 logger.debug(
-                    f"New character config: {self.character_config.model_dump()}"
+                    "New character config: {}",
+                    _redact_sensitive(self.character_config.model_dump()),
                 )
 
                 # Send responses to client

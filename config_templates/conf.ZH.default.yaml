@@ -163,6 +163,9 @@ character_config:
         llm_api_key: 'Your Mistral API key' # Mistral API 密钥
         model: 'pixtral-large-latest' # 使用的模型
         temperature: 1.0 # 温度，介于 0 到 2 之间
+        # 可选的 Mistral 生成参数。删除后将使用服务商默认值。
+        top_p: 0.9 # 取值范围 0 到 1
+        max_tokens: 384 # 最大输出 token 数
 
       groq_llm:
         llm_api_key: 'your groq API key' # Groq API 密钥

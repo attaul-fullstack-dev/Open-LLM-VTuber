@@ -30,6 +30,8 @@ class AsyncLLM(StatelessLLMInterface):
         organization_id: str = "z",
         project_id: str = "z",
         temperature: float = 1.0,
+        top_p: float | None = None,
+        max_tokens: int | None = None,
     ):
         """
         Initializes an instance of the `AsyncLLM` class.
@@ -41,10 +43,14 @@ class AsyncLLM(StatelessLLMInterface):
         - project_id (str, optional): The project ID for the OpenAI API. Defaults to "z".
         - llm_api_key (str, optional): The API key for the OpenAI API. Defaults to "z".
         - temperature (float, optional): What sampling temperature to use, between 0 and 2. Defaults to 1.0.
+        - top_p (float, optional): Nucleus sampling probability. Omitted when unset.
+        - max_tokens (int, optional): Maximum output tokens. Omitted when unset.
         """
         self.base_url = base_url
         self.model = model
         self.temperature = temperature
+        self.top_p = top_p
+        self.max_tokens = max_tokens
         self.client = AsyncOpenAI(
             base_url=base_url,
             organization=organization_id,
@@ -54,7 +60,13 @@ class AsyncLLM(StatelessLLMInterface):
         self.support_tools = True
 
         logger.info(
-            f"Initialized AsyncLLM with the parameters: {self.base_url}, {self.model}"
+            "Initialized AsyncLLM: base_url={}, model={}, temperature={}, "
+            "top_p={}, max_tokens={}",
+            self.base_url,
+            self.model,
+            self.temperature,
+            self.top_p,
+            self.max_tokens,
         )
 
     async def chat_completion(
@@ -97,14 +109,20 @@ class AsyncLLM(StatelessLLMInterface):
 
             available_tools = tools if self.support_tools else NOT_GIVEN
 
-            stream: AsyncStream[
-                ChatCompletionChunk
-            ] = await self.client.chat.completions.create(
-                messages=messages_with_system,
-                model=self.model,
-                stream=True,
-                temperature=self.temperature,
-                tools=available_tools,
+            request_params: Dict[str, Any] = {
+                "messages": messages_with_system,
+                "model": self.model,
+                "stream": True,
+                "temperature": self.temperature,
+                "tools": available_tools,
+            }
+            if self.top_p is not None:
+                request_params["top_p"] = self.top_p
+            if self.max_tokens is not None:
+                request_params["max_tokens"] = self.max_tokens
+
+            stream: AsyncStream[ChatCompletionChunk] = (
+                await self.client.chat.completions.create(**request_params)
             )
             logger.debug(
                 f"Tool Support: {self.support_tools}, Available tools: {available_tools}"
