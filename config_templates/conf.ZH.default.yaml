@@ -181,9 +181,11 @@ character_config:
         max_tokens: 384 # 最大输出 token 数
 
       groq_llm:
-        llm_api_key: 'your groq API key' # Groq API 密钥
-        model: 'llama-3.3-70b-versatile' # 使用的模型
-        temperature: 1.0 # 温度，介于 0 到 2 之间
+        llm_api_key: '${GROQ_API_KEY}' # 从环境变量读取；conf.yaml 仍可覆盖。
+        model: 'openai/gpt-oss-20b' # 使用的模型
+        temperature: 0.8 # 温度，介于 0 到 2 之间
+        top_p: 0.9 # 取值范围 0 到 1
+        max_tokens: 384 # 最大输出 token 数
 
   # === 自动语音识别 ===
   asr_config:

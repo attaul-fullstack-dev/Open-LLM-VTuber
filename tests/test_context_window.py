@@ -115,6 +115,11 @@ class ContextWindowTests(unittest.TestCase):
         self.assertEqual(limit, DEFAULT_CONTEXT_LIMIT)
         self.assertTrue(used_fallback)
 
+    def test_groq_gpt_oss_20b_uses_official_context_limit(self):
+        limit, used_fallback = resolve_context_limit("openai/gpt-oss-20b")
+        self.assertEqual(limit, 131_072)
+        self.assertFalse(used_fallback)
+
     def test_reserved_output_and_safety_margin_reduce_input_budget(self):
         selection = select_messages_for_context(
             messages=[message("user", "halo")],
