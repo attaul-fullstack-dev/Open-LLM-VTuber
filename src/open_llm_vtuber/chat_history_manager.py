@@ -99,6 +99,8 @@ def create_new_history(conf_uid: str) -> str:
             {
                 "role": "metadata",
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "relationship_status": "stranger",
+                "relationship_reason": "default",
             }
         ]
         with open(filepath, "w", encoding="utf-8") as f:

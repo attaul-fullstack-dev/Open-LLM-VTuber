@@ -19,6 +19,7 @@ from ..stateless_llm.openai_compatible_llm import AsyncLLM as OpenAICompatibleAs
 from ...chat_history_manager import (
     get_history,
     get_metadata,
+    update_metadate,
     update_summary_metadata,
 )
 from ..transformers import (
@@ -44,6 +45,13 @@ from ..conversation_summary import (
     IncrementalSummarizer,
     SummaryState,
     build_summary_message,
+)
+from ..relationship_context import (
+    RelationshipState,
+    RelationshipStatus,
+    build_relationship_context,
+    detect_relationship_update,
+    normalize_relationship_status,
 )
 
 
@@ -105,6 +113,7 @@ class BasicMemoryAgent(AgentInterface):
             target_tokens=summary_target_tokens,
             maximum_tokens=summary_max_tokens,
         )
+        self._relationship_state = RelationshipState()
 
         self._formatted_tools_openai = []
         self._formatted_tools_claude = []
@@ -245,6 +254,107 @@ class BasicMemoryAgent(AgentInterface):
             text=text if isinstance(text, str) else "",
             summarized_through=through,
             updated_at=metadata.get("summary_updated_at"),
+        )
+
+    def _load_relationship_state(self, conf_uid: str, history_uid: str) -> None:
+        metadata = get_metadata(conf_uid, history_uid)
+        self._relationship_state = RelationshipState(
+            status=normalize_relationship_status(
+                metadata.get("relationship_status", "stranger")
+            ),
+            updated_at=metadata.get("relationship_updated_at"),
+            reason=str(metadata.get("relationship_reason", "default")),
+        )
+        logger.info(
+            "Relationship stats: relationship_status={}, "
+            "relationship_updated=False, relationship_update_trigger=load_history",
+            self._relationship_state.status,
+        )
+
+    @property
+    def relationship_status(self) -> RelationshipStatus:
+        """Expose the active conversation state for backend controls/tests."""
+        return self._relationship_state.status
+
+    def _relationship_system_prompt(self, base_prompt: str) -> str:
+        return (
+            f"{base_prompt}\n\n"
+            f"{build_relationship_context(self._relationship_state.status)}"
+        )
+
+    def set_relationship_status(
+        self,
+        status: RelationshipStatus,
+        *,
+        trigger: str = "manual_backend_update",
+    ) -> bool:
+        """Persist an explicit backend relationship update for this conversation."""
+        normalized = normalize_relationship_status(status)
+        if normalized != status:
+            raise ValueError(f"Unsupported relationship status: {status}")
+        if not self._summary_conf_uid or not self._summary_history_uid:
+            logger.warning(
+                "Relationship update skipped: no active conversation history"
+            )
+            return False
+        if normalized == self._relationship_state.status:
+            return True
+
+        updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        persisted = update_metadate(
+            self._summary_conf_uid,
+            self._summary_history_uid,
+            {
+                "relationship_status": normalized,
+                "relationship_updated_at": updated_at,
+                "relationship_reason": trigger,
+            },
+        )
+        if not persisted:
+            logger.warning(
+                "Relationship update failed: trigger={}",
+                trigger,
+            )
+            return False
+
+        self._relationship_state = RelationshipState(
+            status=normalized,
+            updated_at=updated_at,
+            reason=trigger,
+        )
+        logger.info(
+            "Relationship stats: relationship_status={}, "
+            "relationship_updated=True, relationship_update_trigger={}",
+            normalized,
+            trigger,
+        )
+        return True
+
+    def reset_relationship(self) -> bool:
+        """Backend-level reset; no frontend UI is required for Tahap 5."""
+        return self.set_relationship_status("stranger", trigger="manual_reset")
+
+    def observe_relationship_event(
+        self,
+        user_text: str,
+        assistant_text: str,
+    ) -> bool:
+        """Evaluate one completed visible turn without another LLM request."""
+        update = detect_relationship_update(
+            self._relationship_state.status,
+            user_text,
+            assistant_text,
+        )
+        if update is None:
+            logger.info(
+                "Relationship stats: relationship_status={}, "
+                "relationship_updated=False, relationship_update_trigger=skipped",
+                self._relationship_state.status,
+            )
+            return False
+        return self.set_relationship_status(
+            update.new_status,
+            trigger=update.trigger,
         )
 
     async def _maybe_update_summary(
@@ -458,6 +568,7 @@ class BasicMemoryAgent(AgentInterface):
             else:
                 logger.warning(f"Skipping invalid message from history: {msg}")
         self._load_summary_state(conf_uid, history_uid)
+        self._load_relationship_state(conf_uid, history_uid)
         logger.info(f"Loaded {len(self._memory)} messages from history.")
 
     def handle_interrupt(self, heard_response: str) -> None:
@@ -568,10 +679,11 @@ class BasicMemoryAgent(AgentInterface):
         current_assistant_message_content = []
 
         while True:
+            current_system_prompt = self._relationship_system_prompt(self._system)
             try:
                 request_messages = await self._prepare_context_with_summary(
                     messages,
-                    self._system,
+                    current_system_prompt,
                     tools=tools,
                     protected_start=protected_start,
                 )
@@ -579,7 +691,7 @@ class BasicMemoryAgent(AgentInterface):
                 yield self._context_error_message(error)
                 return
             stream = self._llm.chat_completion(
-                request_messages, self._system, tools=tools
+                request_messages, current_system_prompt, tools=tools
             )
             pending_tool_calls.clear()
             current_assistant_message_content.clear()
@@ -696,16 +808,19 @@ class BasicMemoryAgent(AgentInterface):
         while True:
             if self.prompt_mode_flag:
                 if self._mcp_prompt_string:
-                    current_system_prompt = (
+                    base_system_prompt = (
                         f"{self._system}\n\n{self._mcp_prompt_string}"
                     )
                 else:
                     logger.warning("Prompt mode active but mcp_prompt_string is empty!")
-                    current_system_prompt = self._system
+                    base_system_prompt = self._system
                 tools_for_api = None
             else:
-                current_system_prompt = self._system
+                base_system_prompt = self._system
                 tools_for_api = tools
+            current_system_prompt = self._relationship_system_prompt(
+                base_system_prompt
+            )
 
             try:
                 request_messages = await self._prepare_context_with_summary(
@@ -936,16 +1051,20 @@ class BasicMemoryAgent(AgentInterface):
                 return
             else:
                 logger.info("Starting simple chat completion.")
+                current_system_prompt = self._relationship_system_prompt(self._system)
                 try:
                     request_messages = await self._prepare_context_with_summary(
                         messages,
-                        self._system,
+                        current_system_prompt,
                         protected_start=protected_start,
                     )
                 except ContextBudgetExceeded as error:
                     yield self._context_error_message(error)
                     return
-                token_stream = self._llm.chat_completion(request_messages, self._system)
+                token_stream = self._llm.chat_completion(
+                    request_messages,
+                    current_system_prompt,
+                )
                 complete_response = ""
                 async for event in token_stream:
                     text_chunk = ""

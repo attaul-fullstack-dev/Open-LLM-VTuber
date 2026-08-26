@@ -38,6 +38,7 @@ class MessageType(Enum):
         "fetch-and-set-history",
         "create-new-history",
         "delete-history",
+        "reset-relationship",
     ]
     CONVERSATION = ["mic-audio-end", "text-input", "ai-speak-signal"]
     CONFIG = ["fetch-configs", "switch-config"]
@@ -83,6 +84,7 @@ class WebSocketHandler:
             "fetch-and-set-history": self._handle_fetch_history,
             "create-new-history": self._handle_create_history,
             "delete-history": self._handle_delete_history,
+            "reset-relationship": self._handle_reset_relationship,
             "interrupt-signal": self._handle_interrupt,
             "mic-audio-data": self._handle_audio_data,
             "mic-audio-end": self._handle_conversation_trigger,
@@ -472,7 +474,28 @@ class WebSocketHandler:
             )
         )
         if history_uid == context.history_uid:
+            context.agent_engine.set_memory_from_history(
+                conf_uid=context.character_config.conf_uid,
+                history_uid=history_uid,
+            )
             context.history_uid = None
+
+    async def _handle_reset_relationship(
+        self, websocket: WebSocket, client_uid: str, data: WSMessage
+    ) -> None:
+        """Reset relationship metadata for the currently selected conversation."""
+        context = self.client_contexts[client_uid]
+        reset = getattr(context.agent_engine, "reset_relationship", None)
+        success = bool(context.history_uid and callable(reset) and reset())
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "type": "relationship-reset",
+                    "success": success,
+                    "history_uid": context.history_uid,
+                }
+            )
+        )
 
     async def _handle_audio_data(
         self, websocket: WebSocket, client_uid: str, data: WSMessage
