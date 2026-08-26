@@ -20,6 +20,7 @@ KNOWN_CONTEXT_LIMITS: Dict[str, int] = {
     "mistral-small-2603": 256_000,
     "mistral-small-2506": 128_000,
     "openai/gpt-oss-20b": 131_072,
+    "gemma4:31b-cloud": 262_144,
 }
 
 DEFAULT_CONTEXT_LIMIT = 32_768

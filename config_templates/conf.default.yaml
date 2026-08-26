@@ -140,9 +140,12 @@ character_config:
         verbose: False
 
       ollama_llm:
-        base_url: 'http://localhost:11434/v1'
+        base_url: 'http://localhost:11434/v1' # Use 'https://ollama.com/v1' for Ollama Cloud.
+        llm_api_key: 'default_api_key' # Use '${OLLAMA_API_KEY}' for Ollama Cloud; ignored locally.
         model: 'qwen2.5:latest'
         temperature: 1.0 # value between 0 to 2
+        top_p: null # optional nucleus sampling probability
+        max_tokens: null # optional maximum output tokens
         # seconds to keep the model in memory after inactivity. 
         # set to -1 to keep the model in memory forever (even after exiting open llm vtuber)
         keep_alive: -1

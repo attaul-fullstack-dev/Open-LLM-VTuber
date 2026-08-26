@@ -139,9 +139,12 @@ character_config:
         verbose: False # 是否输出详细信息
 
       ollama_llm:
-        base_url: 'http://localhost:11434/v1' # 基础 URL
+        base_url: 'http://localhost:11434/v1' # Ollama Cloud 请使用 'https://ollama.com/v1'
+        llm_api_key: 'default_api_key' # Ollama Cloud 请使用 '${OLLAMA_API_KEY}'；本地会忽略。
         model: 'qwen2.5:latest' # 使用的模型
         temperature: 1.0 # 温度，介于 0 到 2 之间
+        top_p: null # 可选的核采样概率
+        max_tokens: null # 可选的最大输出 token 数
         # 不活动后模型在内存中保留的时间（秒）
         # 设置为 -1 表示模型将永远保留在内存中（即使退出 open llm vtuber 之后也是）
         keep_alive: -1
