@@ -56,7 +56,13 @@ def _redact_sensitive(value):
                 "credential",
                 "credentials",
             } or normalized.endswith(("_api_key", "_password", "_secret"))
-            redacted[key] = "[REDACTED]" if is_secret else _redact_sensitive(item)
+            is_prompt = normalized in {"persona_prompt", "system_prompt"}
+            if is_secret:
+                redacted[key] = "[REDACTED]"
+            elif is_prompt:
+                redacted[key] = f"[OMITTED; chars={len(str(item or ''))}]"
+            else:
+                redacted[key] = _redact_sensitive(item)
         return redacted
     if isinstance(value, list):
         return [_redact_sensitive(item) for item in value]
@@ -111,7 +117,7 @@ class ServiceContext:
             f"    Agent Config: {json.dumps(_redact_sensitive(self.character_config.agent_config.model_dump()), indent=6) if self.character_config.agent_config else 'None'}\n"
             f"  VAD Engine: {type(self.vad_engine).__name__ if self.vad_engine else 'Not Loaded'}\n"
             f"    Agent Config: {json.dumps(self.character_config.vad_config.model_dump(), indent=6) if self.character_config.vad_config else 'None'}\n"
-            f"  System Prompt: {self.system_prompt or 'Not Set'}\n"
+            f"  System Prompt: {'Loaded (chars=' + str(len(self.system_prompt)) + ')' if self.system_prompt else 'Not Set'}\n"
             f"  MCP Enabled: {'Yes' if self.mcp_client else 'No'}"
         )
 
@@ -430,7 +436,7 @@ class ServiceContext:
             )
 
             logger.debug(f"Agent choice: {agent_config.conversation_agent_choice}")
-            logger.debug(f"System prompt: {system_prompt}")
+            logger.debug("System prompt configured: chars={}", len(system_prompt))
 
             # Save the current configuration
             self.character_config.agent_config = agent_config
@@ -479,7 +485,9 @@ class ServiceContext:
         Returns:
         - str: The system prompt with all tool prompts appended.
         """
-        logger.debug(f"constructing persona_prompt: '''{persona_prompt}'''")
+        logger.debug(
+            "Constructing system prompt: persona_chars={}", len(persona_prompt)
+        )
 
         for prompt_name, prompt_file in self.system_config.tool_prompts.items():
             if (
@@ -500,8 +508,7 @@ class ServiceContext:
 
             persona_prompt += prompt_content
 
-        logger.debug("\n === System Prompt ===")
-        logger.debug(persona_prompt)
+        logger.debug("System prompt constructed: chars={}", len(persona_prompt))
 
         return persona_prompt
 

@@ -31,6 +31,7 @@ class AsyncLLM(StatelessLLMInterface):
         """
         self.model = model
         self.system = system
+        self.max_tokens = 1024
 
         # Initialize Claude client
         self.client = AsyncAnthropic(
@@ -116,14 +117,18 @@ class AsyncLLM(StatelessLLMInterface):
                 if msg["role"] != "system"
             ]
 
-            logger.debug(f"Sending messages to Claude API: {converted_messages}")
-            logger.debug(f"Tools provided: {tools}")
+            logger.debug(
+                "Preparing Claude request: model={}, messages={}, tools={}",
+                self.model,
+                len(converted_messages),
+                len(tools) if tools else 0,
+            )
 
             async with self.client.messages.stream(
                 messages=converted_messages,
                 system=system if system else (self.system if self.system else ""),
                 model=self.model,
-                max_tokens=1024,
+                max_tokens=self.max_tokens,
                 tools=tools if tools else NOT_GIVEN,
             ) as stream:
                 current_tool_call_info = None

@@ -33,6 +33,11 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
     segment_method: Literal["regex", "pysbd"] = Field("pysbd", alias="segment_method")
     use_mcpp: Optional[bool] = Field(False, alias="use_mcpp")
     mcp_enabled_servers: Optional[List[str]] = Field([], alias="mcp_enabled_servers")
+    context_management_enabled: bool = Field(True, alias="context_management_enabled")
+    context_window_override: Optional[int] = Field(
+        None, gt=0, alias="context_window_override"
+    )
+    context_safety_margin: int = Field(1024, ge=0, alias="context_safety_margin")
 
     DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
         "llm_provider": Description(
@@ -54,6 +59,18 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
         "mcp_enabled_servers": Description(
             en="List of MCP servers to enable for the agent",
             zh="为智能体启用 MCP 服务器列表",
+        ),
+        "context_management_enabled": Description(
+            en="Trim only the request context when conversation history exceeds the model budget (default: True)",
+            zh="当对话历史超过模型预算时，仅裁剪请求上下文（默认：True）",
+        ),
+        "context_window_override": Description(
+            en="Optional context-window token limit override for the active model",
+            zh="当前模型可选的上下文窗口 token 上限覆盖值",
+        ),
+        "context_safety_margin": Description(
+            en="Tokens reserved as a safety margin in addition to output tokens (default: 1024)",
+            zh="除输出 token 外额外保留的安全余量（默认：1024）",
         ),
     }
 

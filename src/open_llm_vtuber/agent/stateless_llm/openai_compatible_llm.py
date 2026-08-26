@@ -105,7 +105,12 @@ class AsyncLLM(StatelessLLMInterface):
                     {"role": "system", "content": system},
                     *messages,
                 ]
-            logger.debug(f"Messages: {messages_with_system}")
+            logger.debug(
+                "Preparing chat request: model={}, messages={}, system_present={}",
+                self.model,
+                len(messages_with_system),
+                bool(system),
+            )
 
             available_tools = tools if self.support_tools else NOT_GIVEN
 
@@ -121,9 +126,9 @@ class AsyncLLM(StatelessLLMInterface):
             if self.max_tokens is not None:
                 request_params["max_tokens"] = self.max_tokens
 
-            stream: AsyncStream[ChatCompletionChunk] = (
-                await self.client.chat.completions.create(**request_params)
-            )
+            stream: AsyncStream[
+                ChatCompletionChunk
+            ] = await self.client.chat.completions.create(**request_params)
             logger.debug(
                 f"Tool Support: {self.support_tools}, Available tools: {available_tools}"
             )
@@ -242,7 +247,7 @@ class AsyncLLM(StatelessLLMInterface):
             logger.error(f"LLM API: Error occurred: {e}")
             logger.info(f"Base URL: {self.base_url}")
             logger.info(f"Model: {self.model}")
-            logger.info(f"Messages: {messages}")
+            logger.info("Message count: {}", len(messages))
             logger.info(f"temperature: {self.temperature}")
             yield "Error calling the chat endpoint: Error occurred while generating response. See the logs for details."
 

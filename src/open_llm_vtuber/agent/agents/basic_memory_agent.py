@@ -28,6 +28,11 @@ from ...mcpp.tool_manager import ToolManager
 from ...mcpp.json_detector import StreamJSONDetector
 from ...mcpp.types import ToolCallObject
 from ...mcpp.tool_executor import ToolExecutor
+from ..context_window import (
+    ContextBudgetExceeded,
+    ContextSelection,
+    select_messages_for_context,
+)
 
 
 class BasicMemoryAgent(AgentInterface):
@@ -49,6 +54,9 @@ class BasicMemoryAgent(AgentInterface):
         tool_manager: Optional[ToolManager] = None,
         tool_executor: Optional[ToolExecutor] = None,
         mcp_prompt_string: str = "",
+        context_management_enabled: bool = True,
+        context_window_override: Optional[int] = None,
+        context_safety_margin: int = 1024,
     ):
         """Initialize agent with LLM and configuration."""
         super().__init__()
@@ -67,6 +75,9 @@ class BasicMemoryAgent(AgentInterface):
         self._tool_executor = tool_executor
         self._mcp_prompt_string = mcp_prompt_string
         self._json_detector = StreamJSONDetector()
+        self._context_management_enabled = context_management_enabled
+        self._context_window_override = context_window_override
+        self._context_safety_margin = context_safety_margin
 
         self._formatted_tools_openai = []
         self._formatted_tools_claude = []
@@ -118,12 +129,72 @@ class BasicMemoryAgent(AgentInterface):
 
     def set_system(self, system: str):
         """Set the system prompt."""
-        logger.debug(f"Memory Agent: Setting system prompt: '''{system}'''")
+        logger.debug(
+            "Memory Agent: setting system prompt (chars={})", len(system or "")
+        )
 
         if self.interrupt_method == "user":
             system = f"{system}\n\nIf you received `[interrupted by user]` signal, you were interrupted."
 
         self._system = system
+
+    def _prepare_context(
+        self,
+        messages: List[Dict[str, Any]],
+        system_prompt: str,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        protected_start: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Budget one API request without changing ``_memory`` or disk history."""
+        if not self._context_management_enabled:
+            logger.debug(
+                "Context management disabled: model={}, messages={}",
+                getattr(self._llm, "model", "unknown"),
+                len(messages),
+            )
+            return list(messages)
+
+        selection: ContextSelection = select_messages_for_context(
+            messages=messages,
+            system_prompt=system_prompt,
+            model=getattr(self._llm, "model", None),
+            reserved_output_tokens=getattr(self._llm, "max_tokens", None),
+            safety_margin=self._context_safety_margin,
+            context_window_override=self._context_window_override,
+            tools=tools,
+            protected_start=protected_start,
+        )
+        stats = selection.stats
+        logger.info(
+            "Context stats: model={}, context_limit={}, reserved_output={}, "
+            "safety_margin={}, maximum_input_budget={}, system_tokens={}, tool_tokens={}, "
+            "history_tokens_before={}, history_tokens_after={}, "
+            "messages_before={}, messages_after={}, trimmed={}, "
+            "estimated_input_tokens={}, fallback_limit={}",
+            stats.model,
+            stats.context_limit,
+            stats.reserved_output,
+            stats.safety_margin,
+            stats.maximum_input_budget,
+            stats.system_tokens,
+            stats.tool_tokens,
+            stats.history_tokens_before,
+            stats.history_tokens_after,
+            stats.messages_before,
+            stats.messages_after,
+            stats.trimmed,
+            stats.estimated_input_tokens,
+            stats.used_fallback_limit,
+        )
+        return selection.messages
+
+    @staticmethod
+    def _context_error_message(error: ContextBudgetExceeded) -> str:
+        logger.warning("Context request rejected before provider call: {}", error)
+        return (
+            "Pesan ini terlalu panjang untuk context window model. "
+            "Pendekkan pesannya atau sesuaikan context_window_override."
+        )
 
     def _add_message(
         self,
@@ -294,12 +365,25 @@ class BasicMemoryAgent(AgentInterface):
     ) -> AsyncIterator[Union[str, Dict[str, Any]]]:
         """Handle Claude interaction loop with tool support."""
         messages = initial_messages.copy()
+        protected_start = max(0, len(initial_messages) - 1)
         current_turn_text = ""
         pending_tool_calls = []
         current_assistant_message_content = []
 
         while True:
-            stream = self._llm.chat_completion(messages, self._system, tools=tools)
+            try:
+                request_messages = self._prepare_context(
+                    messages,
+                    self._system,
+                    tools=tools,
+                    protected_start=protected_start,
+                )
+            except ContextBudgetExceeded as error:
+                yield self._context_error_message(error)
+                return
+            stream = self._llm.chat_completion(
+                request_messages, self._system, tools=tools
+            )
             pending_tool_calls.clear()
             current_assistant_message_content.clear()
 
@@ -407,6 +491,7 @@ class BasicMemoryAgent(AgentInterface):
     ) -> AsyncIterator[Union[str, Dict[str, Any]]]:
         """Handle OpenAI interaction with tool support."""
         messages = initial_messages.copy()
+        protected_start = max(0, len(initial_messages) - 1)
         current_turn_text = ""
         pending_tool_calls: Union[List[ToolCallObject], List[Dict[str, Any]]] = []
         current_system_prompt = self._system
@@ -425,8 +510,18 @@ class BasicMemoryAgent(AgentInterface):
                 current_system_prompt = self._system
                 tools_for_api = tools
 
+            try:
+                request_messages = self._prepare_context(
+                    messages,
+                    current_system_prompt,
+                    tools=tools_for_api,
+                    protected_start=protected_start,
+                )
+            except ContextBudgetExceeded as error:
+                yield self._context_error_message(error)
+                return
             stream = self._llm.chat_completion(
-                messages, current_system_prompt, tools=tools_for_api
+                request_messages, current_system_prompt, tools=tools_for_api
             )
             pending_tool_calls.clear()
             current_turn_text = ""
@@ -599,6 +694,7 @@ class BasicMemoryAgent(AgentInterface):
             self.prompt_mode_flag = False
 
             messages = self._to_messages(input_data)
+            protected_start = max(0, len(messages) - 1)
             tools = None
             tool_mode = None
             llm_supports_native_tools = False
@@ -643,7 +739,16 @@ class BasicMemoryAgent(AgentInterface):
                 return
             else:
                 logger.info("Starting simple chat completion.")
-                token_stream = self._llm.chat_completion(messages, self._system)
+                try:
+                    request_messages = self._prepare_context(
+                        messages,
+                        self._system,
+                        protected_start=protected_start,
+                    )
+                except ContextBudgetExceeded as error:
+                    yield self._context_error_message(error)
+                    return
+                token_stream = self._llm.chat_completion(request_messages, self._system)
                 complete_response = ""
                 async for event in token_stream:
                     text_chunk = ""

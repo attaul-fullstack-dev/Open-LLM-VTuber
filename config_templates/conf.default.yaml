@@ -68,6 +68,12 @@ character_config:
         # 'Plus' means that it has the ability to call tools by using OpenAI API.
         use_mcpp: True
         mcp_enabled_servers: ["time", "ddg-search"] # Enabled MCP servers
+        # Keep recent turns within the active model's context window.
+        context_management_enabled: True
+        # Optional model context limit override; null uses centralized model metadata/fallback.
+        context_window_override: null
+        # Extra input safety margin in tokens, in addition to max output tokens.
+        context_safety_margin: 1024
 
       letta_agent:
         host: 'localhost' # Host address

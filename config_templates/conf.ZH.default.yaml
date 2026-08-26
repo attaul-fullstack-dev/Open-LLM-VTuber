@@ -68,6 +68,12 @@ character_config:
         # 'Plus' 意味着它包含了通过 OpenAI API 调用工具的能力。
         use_mcpp: False
         mcp_enabled_servers: ["time", "ddg-search"] # 启用的 MCP 服务器
+        # 将最近对话保留在当前模型的上下文窗口内。
+        context_management_enabled: True
+        # 可选的模型上下文上限覆盖值；null 使用集中式模型元数据/回退值。
+        context_window_override: null
+        # 除最大输出 token 外，额外保留的输入安全余量。
+        context_safety_margin: 1024
 
       hume_ai_agent:
         api_key: ''
