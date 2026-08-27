@@ -140,7 +140,6 @@ async def send_conversation_start_signals(websocket_send: WebSocketSend) -> None
             }
         )
     )
-    await websocket_send(json.dumps({"type": "full-text", "text": "Thinking..."}))
 
 
 async def process_user_input(

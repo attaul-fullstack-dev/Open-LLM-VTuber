@@ -16,9 +16,11 @@ from openai import (
 from openai.types.chat import ChatCompletionChunk
 from openai.types.chat.chat_completion_chunk import ChoiceDeltaToolCall
 from loguru import logger
+import time
 
 from .stateless_llm_interface import StatelessLLMInterface
 from ...mcpp.types import ToolCallObject
+from ...request_latency import get_latency_phase, get_latency_tracker
 
 
 class AsyncLLM(StatelessLLMInterface):
@@ -93,6 +95,10 @@ class AsyncLLM(StatelessLLMInterface):
         - APIError: For other API-related errors
         """
         stream = None
+        tracker = get_latency_tracker()
+        latency_phase = get_latency_phase()
+        call_started_ms = time.perf_counter() * 1000
+        first_content_seen = False
         # Tool call related state variables
         accumulated_tool_calls = {}
         in_tool_call = False
@@ -126,9 +132,13 @@ class AsyncLLM(StatelessLLMInterface):
             if self.max_tokens is not None:
                 request_params["max_tokens"] = self.max_tokens
 
+            if tracker and latency_phase == "chat":
+                tracker.provider_started()
             stream: AsyncStream[
                 ChatCompletionChunk
             ] = await self.client.chat.completions.create(**request_params)
+            if tracker and latency_phase == "chat":
+                tracker.provider_headers_received()
             tool_count = len(tools or []) if self.support_tools else 0
             logger.debug(
                 "Tool support enabled={}, available_tool_count={}",
@@ -217,7 +227,14 @@ class AsyncLLM(StatelessLLMInterface):
                     continue
                 elif chunk.choices[0].delta.content is None:
                     chunk.choices[0].delta.content = ""
-                yield chunk.choices[0].delta.content
+                content = chunk.choices[0].delta.content
+                if content:
+                    if tracker and latency_phase == "chat" and not first_content_seen:
+                        first_content_seen = True
+                        await tracker.provider_first_token()
+                    if tracker and latency_phase == "chat":
+                        tracker.output_chars += len(content)
+                yield content
 
             # If stream ends while still in a tool call, make sure to yield the tool call
             if in_tool_call and accumulated_tool_calls:
@@ -262,6 +279,14 @@ class AsyncLLM(StatelessLLMInterface):
             yield "Error calling the chat endpoint: Error occurred while generating response. See the logs for details."
 
         finally:
+            if tracker:
+                if latency_phase == "chat":
+                    tracker.provider_finished()
+                elif latency_phase == "summary":
+                    tracker.add_summary(
+                        time.perf_counter() * 1000 - call_started_ms,
+                        triggered=True,
+                    )
             # make sure the stream is properly closed
             # so when interrupted, no more tokens will being generated.
             if stream:

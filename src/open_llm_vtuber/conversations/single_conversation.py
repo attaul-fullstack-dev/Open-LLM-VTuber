@@ -3,6 +3,8 @@ import asyncio
 import json
 from loguru import logger
 import numpy as np
+import time
+import uuid
 
 from .conversation_utils import (
     create_batch_input,
@@ -17,6 +19,11 @@ from .types import WebSocketSend
 from .tts_manager import TTSTaskManager
 from ..chat_history_manager import store_message
 from ..service_context import ServiceContext
+from ..request_latency import (
+    RequestLatencyTracker,
+    reset_latency_tracker,
+    set_latency_tracker,
+)
 
 # Import necessary types from agent outputs
 from ..agent.output_types import SentenceOutput, AudioOutput
@@ -48,8 +55,21 @@ async def process_single_conversation(
     # Create TTSTaskManager for this conversation
     tts_manager = TTSTaskManager()
     full_response = ""  # Initialize full_response here
+    llm = getattr(context.agent_engine, "_llm", None)
+    base_url = str(getattr(llm, "base_url", ""))
+    provider = "ollama_cloud" if "ollama.com" in base_url else type(llm).__name__
+    latency = RequestLatencyTracker(
+        websocket_send=websocket_send,
+        provider=provider,
+        model=str(getattr(llm, "model", "unknown")),
+        request_id=(metadata or {}).get("latency_request_id") or uuid.uuid4().hex,
+        client_user_send_ms=(metadata or {}).get("client_user_send_ms"),
+        client_websocket_send_ms=(metadata or {}).get("client_websocket_send_ms"),
+    )
+    latency_token = set_latency_tracker(latency)
 
     try:
+        await latency.emit("backend-received")
         # Send initial signals
         await send_conversation_start_signals(websocket_send)
         logger.info(f"New Conversation Chain {session_emoji} started!")
@@ -102,6 +122,7 @@ async def process_single_conversation(
 
                 elif isinstance(output_item, (SentenceOutput, AudioOutput)):
                     # Handle SentenceOutput or AudioOutput
+                    tts_started = time.perf_counter()
                     response_part = await process_agent_output(
                         output=output_item,
                         character_config=context.character_config,
@@ -111,6 +132,7 @@ async def process_single_conversation(
                         tts_manager=tts_manager,
                         translate_engine=context.translate_engine,
                     )
+                    latency.tts_ms += (time.perf_counter() - tts_started) * 1000
                     # Ensure response_part is treated as a string before concatenation
                     response_part_str = (
                         str(response_part) if response_part is not None else ""
@@ -171,7 +193,11 @@ async def process_single_conversation(
                         context.agent_engine, "observe_relationship_event", None
                     )
                 if observer is not None:
+                    event_started = time.perf_counter()
                     observer(input_text, full_response)
+                    latency.character_event_ms += (
+                        time.perf_counter() - event_started
+                    ) * 1000
 
         return full_response  # Return accumulated full_response
 
@@ -185,4 +211,12 @@ async def process_single_conversation(
         )
         raise
     finally:
+        try:
+            await latency.complete()
+        except Exception as latency_error:
+            logger.warning(
+                "Latency finalization failed: type={}",
+                type(latency_error).__name__,
+            )
+        reset_latency_tracker(latency_token)
         cleanup_conversation(tts_manager, session_emoji)

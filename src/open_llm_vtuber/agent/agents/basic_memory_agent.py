@@ -64,6 +64,12 @@ from ..relationship_context import (
     normalize_relationship_status,
 )
 import re
+import time
+from ...request_latency import (
+    get_latency_tracker,
+    reset_latency_phase,
+    set_latency_phase,
+)
 
 # Conservative, local-only character memory triggers. No LLM classifier and no
 # extra API call per message. Only explicit user requests are honored:
@@ -246,6 +252,10 @@ class BasicMemoryAgent(AgentInterface):
             stats.estimated_input_tokens,
             stats.used_fallback_limit,
         )
+        tracker = get_latency_tracker()
+        if tracker:
+            tracker.message_count = stats.messages_after
+            tracker.estimated_input_tokens = stats.estimated_input_tokens
 
     def _prepare_context(
         self,
@@ -494,6 +504,7 @@ class BasicMemoryAgent(AgentInterface):
         boundary advance, so later automatic summaries continue incrementally.
         On failure the previous summary and boundary are preserved.
         """
+        compact_started = time.perf_counter()
         if not self._summary_conf_uid or not self._summary_history_uid:
             return False, "No active conversation to compact."
         async with self._summary_lock:
@@ -504,10 +515,14 @@ class BasicMemoryAgent(AgentInterface):
             if len(candidates) < self._summary_min_new_messages:
                 return False, "Not enough new messages to compact yet."
             try:
-                updated_summary = await self._summarizer.summarize(
-                    self._summary_state.text,
-                    candidates,
-                )
+                phase_token = set_latency_phase("summary")
+                try:
+                    updated_summary = await self._summarizer.summarize(
+                        self._summary_state.text,
+                        candidates,
+                    )
+                finally:
+                    reset_latency_phase(phase_token)
             except Exception as error:
                 logger.warning(
                     "Manual compact failed; keeping prior summary: type={}",
@@ -541,6 +556,11 @@ class BasicMemoryAgent(AgentInterface):
                 "Manual compact stats: summary_updated=True, "
                 "summarized_through={}, messages_compacted={}",
                 self._summary_state.summarized_through,
+                len(candidates),
+            )
+            logger.info(
+                "[COMPACT LATENCY] total_ms={} messages_compacted={}",
+                round((time.perf_counter() - compact_started) * 1000, 2),
                 len(candidates),
             )
             return True, None
@@ -598,10 +618,14 @@ class BasicMemoryAgent(AgentInterface):
                 return False, False, 0, evicted_through
 
             try:
-                updated_summary = await self._summarizer.summarize(
-                    self._summary_state.text,
-                    candidates,
-                )
+                phase_token = set_latency_phase("summary")
+                try:
+                    updated_summary = await self._summarizer.summarize(
+                        self._summary_state.text,
+                        candidates,
+                    )
+                finally:
+                    reset_latency_phase(phase_token)
                 updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 persisted = update_summary_metadata(
                     self._summary_conf_uid,
@@ -638,13 +662,19 @@ class BasicMemoryAgent(AgentInterface):
         protected_start: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Apply Stage 3 budgeting, update summary if needed, then inject it."""
+        context_started = time.perf_counter()
+        tracker = get_latency_tracker()
+        summary_before_ms = tracker.summary_ms if tracker else 0.0
         if not self._context_management_enabled:
-            return self._prepare_context(
+            result = self._prepare_context(
                 messages,
                 system_prompt,
                 tools=tools,
                 protected_start=protected_start,
             )
+            if tracker:
+                tracker.add_context((time.perf_counter() - context_started) * 1000)
+            return result
         if protected_start is None:
             protected_start = max(0, len(messages) - 1)
         initial_selection = self._select_context(
@@ -703,6 +733,10 @@ class BasicMemoryAgent(AgentInterface):
             updated,
             failed,
         )
+        if tracker:
+            elapsed_ms = (time.perf_counter() - context_started) * 1000
+            summary_delta = max(0.0, tracker.summary_ms - summary_before_ms)
+            tracker.add_context(max(0.0, elapsed_ms - summary_delta), final_selection)
         return final_selection.messages
 
     @staticmethod
@@ -982,6 +1016,7 @@ class BasicMemoryAgent(AgentInterface):
                     yield "[Error: ToolExecutor not configured]"
                     return
 
+                tool_started = time.perf_counter()
                 tool_executor_iterator = self._tool_executor.execute_tools(
                     tool_calls=pending_tool_calls,
                     caller_mode="Claude",
@@ -998,6 +1033,9 @@ class BasicMemoryAgent(AgentInterface):
                     logger.warning(
                         "Tool executor finished without final results marker."
                     )
+                tracker = get_latency_tracker()
+                if tracker:
+                    tracker.add_tool((time.perf_counter() - tool_started) * 1000)
 
                 if tool_results_for_llm:
                     messages.append({"role": "user", "content": tool_results_for_llm})
@@ -1134,6 +1172,7 @@ class BasicMemoryAgent(AgentInterface):
                         yield "[Error: ToolExecutor/MCPClient not configured for prompt mode]"
                         continue
 
+                    tool_started = time.perf_counter()
                     tool_executor_iterator = self._tool_executor.execute_tools(
                         tool_calls=parsed_tools,
                         caller_mode="Prompt",
@@ -1150,6 +1189,9 @@ class BasicMemoryAgent(AgentInterface):
                         logger.warning(
                             "Prompt mode tool executor finished without final results marker."
                         )
+                    tracker = get_latency_tracker()
+                    if tracker:
+                        tracker.add_tool((time.perf_counter() - tool_started) * 1000)
 
                     if tool_results_for_llm:
                         result_strings = [
@@ -1175,6 +1217,7 @@ class BasicMemoryAgent(AgentInterface):
                     yield "[Error: ToolExecutor/MCPClient not configured for OpenAI mode]"
                     continue
 
+                tool_started = time.perf_counter()
                 tool_executor_iterator = self._tool_executor.execute_tools(
                     tool_calls=pending_tool_calls,
                     caller_mode="OpenAI",
@@ -1191,6 +1234,9 @@ class BasicMemoryAgent(AgentInterface):
                     logger.warning(
                         "OpenAI tool executor finished without final results marker."
                     )
+                tracker = get_latency_tracker()
+                if tracker:
+                    tracker.add_tool((time.perf_counter() - tool_started) * 1000)
 
                 if tool_results_for_llm:
                     messages.extend(tool_results_for_llm)

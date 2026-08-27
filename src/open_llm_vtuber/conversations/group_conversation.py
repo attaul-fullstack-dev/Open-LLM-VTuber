@@ -321,10 +321,6 @@ async def broadcast_thinking_state(
         group_members,
         {"type": "control", "text": "conversation-chain-start"},
     )
-    await broadcast_func(
-        group_members,
-        {"type": "full-text", "text": "Thinking..."},
-    )
 
 
 async def handle_member_error(

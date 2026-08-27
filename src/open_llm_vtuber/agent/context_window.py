@@ -141,22 +141,22 @@ def estimate_messages_tokens(messages: Sequence[Dict[str, Any]]) -> int:
 
 def _history_turns(
     history: Sequence[Dict[str, Any]],
-) -> List[List[Dict[str, Any]]]:
-    """Group stored history into user-led turns for coherent suffix trimming."""
-    turns: List[List[Dict[str, Any]]] = []
+) -> List[tuple[int, List[Dict[str, Any]]]]:
+    """Group stored history into user-led turns with their start indexes."""
+    indexed_turns: List[tuple[int, List[Dict[str, Any]]]] = []
     current: List[Dict[str, Any]] = []
 
-    for message in history:
+    for index, message in enumerate(history):
         if message.get("role") == "system":
             if current:
-                turns.append(current)
+                indexed_turns.append((index - len(current), current))
                 current = []
-            # Internal context such as a rolling summary is its own lowest-
-            # priority unit, so recent user/assistant turns never depend on it.
-            turns.append([message])
+            # Internal context such as a rolling summary is retained whenever
+            # budget allows, but recent user/assistant turns never depend on it.
+            indexed_turns.append((index, [message]))
         elif message.get("role") == "user":
             if current:
-                turns.append(current)
+                indexed_turns.append((index - len(current), current))
             current = [message]
         elif current:
             current.append(message)
@@ -166,8 +166,8 @@ def _history_turns(
             current.append(message)
 
     if current:
-        turns.append(current)
-    return turns
+        indexed_turns.append((len(history) - len(current), current))
+    return indexed_turns
 
 
 def select_messages_for_context(
@@ -240,15 +240,40 @@ def select_messages_for_context(
         trimmed = False
     else:
         remaining = maximum_input_budget - fixed_tokens
-        selected_turns: List[List[Dict[str, Any]]] = []
-        for turn in reversed(_history_turns(history)):
+
+        def _is_internal_unit(turn: List[Dict[str, Any]]) -> bool:
+            return bool(turn) and turn[0].get("role") == "system"
+
+        # Internal context (e.g. the rolling summary) is reserved first: it is
+        # tiny and replaces the evicted turns, so greedy transcript filling
+        # must never evict it just because it sorts as the oldest unit.
+        internal_units = [
+            (index, turn)
+            for index, turn in _history_turns(history)
+            if _is_internal_unit(turn)
+        ]
+        transcript_turns_newest_first = [
+            (index, turn)
+            for index, turn in reversed(_history_turns(history))
+            if not _is_internal_unit(turn)
+        ]
+        selected_turns: List[tuple[int, List[Dict[str, Any]]]] = []
+        for index, unit in internal_units:
+            unit_tokens = estimate_messages_tokens(unit)
+            if unit_tokens > remaining:
+                continue
+            selected_turns.append((index, unit))
+            remaining -= unit_tokens
+        for index, turn in transcript_turns_newest_first:
             turn_tokens = estimate_messages_tokens(turn)
             if turn_tokens > remaining:
                 break
-            selected_turns.append(turn)
+            selected_turns.append((index, turn))
             remaining -= turn_tokens
         selected_history = [
-            message for turn in reversed(selected_turns) for message in turn
+            message
+            for _, turn in sorted(selected_turns, key=lambda item: item[0])
+            for message in turn
         ]
         trimmed = len(selected_history) != len(history)
 
