@@ -100,6 +100,13 @@ _BOTTLENECK_CATEGORIES = (
     "unknown",
 )
 
+#: ``unattributed`` is only reported when this much wall-clock time cannot be
+#: mapped to any measured phase. Normal requests show sub-millisecond
+#: unattributed time; a corridor between marks that sits inside a *known*
+#: phase (tts_wait, playback_wait, provider TTFT, ...) is measured latency,
+#: not unattributed time.
+_UNATTRIBUTED_THRESHOLD_MS = 500.0
+
 
 def classify_bottleneck(metrics: dict[str, Any]) -> str:
     """Classify a request's dominant latency source.
@@ -117,13 +124,20 @@ def classify_bottleneck(metrics: dict[str, Any]) -> str:
     context_ms = value("context_build_ms")
     summary_ms = value("summary_ms")
     tool_ms = value("tool_ms")
-    tts_ms = value("tts_total_ms")
+    # TTS wall-clock blocking plus browser playback wait: serial audio phases.
+    tts_ms = value("tts_total_ms") + value("playback_wait_ms")
     disk_ms = (
         value("history_save_ms") + value("metadata_save_ms")
         + value("character_state_save_ms")
     )
     resp_proc_ms = value("response_processing_ms")
     total_ms = value("total_response_ms")
+    agent_stream_ms = value("agent_stream_ms")
+    # Agent-side time inside agent_stream that is NOT the provider call itself
+    # (sentence splitting, expression handling, audio prep, ...).
+    agent_non_provider = max(
+        0.0, agent_stream_ms - value("provider_wallclock_ms")
+    )
     attempts = int(metrics.get("provider_attempt_count") or 0)
     provider_started = bool(metrics.get("provider_started"))
     headers_received = bool(metrics.get("provider_headers_received"))
@@ -138,6 +152,15 @@ def classify_bottleneck(metrics: dict[str, Any]) -> str:
 
     if provider_started and attempts > 1:
         return "provider_retry"
+
+    # ``unattributed`` is reserved for wall-clock time that genuinely cannot
+    # be mapped to a measured phase. It is driven by ``unattributed_ms`` (the
+    # leftover after all exclusive segments), never by ``largest_gap_ms``: a
+    # large gap between marks that sits inside a known phase such as tts_wait
+    # is measured latency, and mislabeling it "unattributed" hides the real
+    # bottleneck.
+    if value("unattributed_ms") >= _UNATTRIBUTED_THRESHOLD_MS:
+        return "unattributed"
 
     if not provider_started:
         # The provider was never called; blame the largest pre-provider phase.
@@ -162,29 +185,12 @@ def classify_bottleneck(metrics: dict[str, Any]) -> str:
         (summary_ms, "summary"),
         (tool_ms, "tool"),
         (tts_ms, "tts"),
+        (agent_non_provider, "response_processing"),
         (disk_ms, "disk_persistence"),
         (resp_proc_ms, "response_processing"),
     ]
     top_ms, top_label = max(contributions, key=lambda item: item[0])
 
-    largest_gap = value("largest_gap_ms")
-    if largest_gap >= 2000:
-        # A >2s corridor between two recorded phase boundaries is a red flag
-        # unless it sits fully inside the provider span (that is normal
-        # provider TTFT/generation time). Do not paper it over with "mixed".
-        gap_from = str(metrics.get("largest_gap_from") or "")
-        gap_to = str(metrics.get("largest_gap_to") or "")
-        provider_marks = {
-            "provider_prepare",
-            "provider_request",
-            "provider_headers_received",
-            "provider_first_chunk",
-            "provider_first_content_token",
-            "provider_stream",
-        }
-        inside_provider = gap_from in provider_marks and gap_to in provider_marks
-        if not inside_provider:
-            return "unattributed"
     if top_ms >= 1000 and top_ms >= 0.5 * max(total_ms, 1.0):
         return top_label
     if top_ms >= 500:
@@ -566,6 +572,13 @@ class RequestLatencyTracker:
             segments.append(("conversation_prep_ms", span(received, agent_start)))
         if agent_start is not None and agent_end is not None:
             segments.append(("agent_stream_ms", span(agent_start, agent_end)))
+        # response_processing: the agent-side window between the agent stream
+        # ending and the TTS/playback phases starting (sentence splitting,
+        # expression handling, audio prep). It is a known phase, so it must be
+        # part of known_pipeline rather than counting as unattributed.
+        resp_tail = tts_start or playback_start
+        if agent_end is not None and resp_tail is not None:
+            segments.append(("response_processing_ms", span(agent_end, resp_tail)))
         if tts_start is not None and tts_end is not None:
             segments.append(("tts_wait_ms", span(tts_start, tts_end)))
         if playback_start is not None and playback_end is not None:
@@ -598,6 +611,10 @@ class RequestLatencyTracker:
         prepare_ms = self.phase_duration("provider_prepare_start", "provider_prepare_end")
         first_chunk_to_content = self.phase_duration(
             "provider_first_chunk", "provider_first_content_token"
+        )
+
+        provider_wallclock = self.phase_duration(
+            "provider_request_start", "provider_stream_end"
         )
 
         estimated_output_tokens = max(0, (self.output_chars + 3) // 4)
@@ -638,9 +655,14 @@ class RequestLatencyTracker:
             )
             provider_retry_overhead = max(0.0, last_end - first_start)
 
-        tts_total = (
-            self.tts_enqueue_ms + self.tts_wait_ms + self.tts_synthesis_ms
-        )
+        # TTS timing semantics (Phase 2.1): synthesis tasks run as concurrent
+        # asyncio tasks, so the summed per-chunk durations are *cumulative
+        # work* (tts_synthesis_ms, may exceed wall-clock) while tts_wait_ms is
+        # the wall-clock blocking span of the gather that the request actually
+        # waited on. Only wall-clock figures are labelled as totals.
+        tts_blocking = self.tts_wait_ms
+        tts_total = tts_blocking  # wall-clock blocking; never > total_response_ms
+        audio_blocking = tts_blocking + self.playback_wait_ms  # serial phases
         response_processing = 0.0
         agent_end = self._marks.get("agent_end")
         if agent_end is not None:
@@ -663,6 +685,7 @@ class RequestLatencyTracker:
             "agent_stream_ms": _round(
                 self.phase_duration("agent_start", "agent_end")
             ),
+            "provider_wallclock_ms": _round(provider_wallclock),
             "context_build_ms": round(self.context_build_ms, 2),
             "summary_ms": round(self.summary_ms, 2),
             "summary_triggered": self.summary_triggered,
@@ -672,8 +695,10 @@ class RequestLatencyTracker:
             "tts_enqueue_ms": round(self.tts_enqueue_ms, 2),
             "tts_synthesis_ms": round(self.tts_synthesis_ms, 2),
             "tts_wait_ms": round(self.tts_wait_ms, 2),
+            "tts_blocking_ms": round(tts_blocking, 2),
             "playback_wait_ms": round(self.playback_wait_ms, 2),
             "tts_total_ms": round(tts_total, 2),
+            "audio_blocking_ms": round(audio_blocking, 2),
             "history_save_ms": round(self.history_save_ms, 2),
             "metadata_save_ms": round(self.metadata_save_ms, 2),
             "character_state_save_ms": round(self.character_state_save_ms, 2),
@@ -751,7 +776,18 @@ class RequestLatencyTracker:
                 round(max(ttfts), 2) if ttfts else 0.0,
                 round(sum(totals) / len(totals), 2),
             )
-        await self.emit("response-complete", metrics=safe_values)
+        try:
+            await self.emit("response-complete", metrics=safe_values)
+        except Exception as emit_error:
+            # Instrumentation must never turn a completed request into an
+            # error: the trace/outcome were already logged above. This is a
+            # post-processing failure of the latency event itself, not of the
+            # request (e.g. the client disconnected right at completion).
+            logger.warning(
+                "[LLM TRACE] response-complete event send failed: type={} "
+                "(outcome already logged; this is a post-processing failure)",
+                type(emit_error).__name__,
+            )
         return values
 
 

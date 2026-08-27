@@ -66,6 +66,28 @@ class WSMessage(TypedDict, total=False):
     display_text: Optional[dict]
 
 
+def create_locked_send_text(websocket: WebSocket):
+    """Serialize all ``send_text`` calls on one connection.
+
+    Multiple coroutines write to the same WebSocket: the background
+    conversation task, the TTS payload sender task, and the receive loop
+    (interrupts/errors). When the transport write buffer is paused (slow
+    client, large audio payloads), two concurrent drains race inside
+    websockets' legacy protocol and its bare ``assert waiter is None or
+    waiter.cancelled()`` raises ``AssertionError`` with an empty message.
+    Serializing sends removes that race without reordering messages beyond
+    the lock itself.
+    """
+    send_lock = asyncio.Lock()
+    original_send_text = websocket.send_text
+
+    async def locked_send_text(message: str) -> None:
+        async with send_lock:
+            await original_send_text(message)
+
+    return locked_send_text
+
+
 class WebSocketHandler:
     """Handles WebSocket connections and message routing"""
 
@@ -126,6 +148,12 @@ class WebSocketHandler:
             Exception: If initialization fails
         """
         try:
+            # Serialize all sends on this connection (see create_locked_send_text
+            # for the race this prevents). Shadowing the instance method keeps
+            # every later ``websocket.send_text(...)`` call -- including the one
+            # passed into the service context -- behind the same lock.
+            websocket.send_text = create_locked_send_text(websocket)
+
             session_service_context = await self._init_service_context(
                 websocket.send_text, client_uid
             )
