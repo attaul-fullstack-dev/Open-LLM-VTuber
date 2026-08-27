@@ -26,6 +26,10 @@ KNOWN_CONTEXT_LIMITS: Dict[str, int] = {
 DEFAULT_CONTEXT_LIMIT = 32_768
 DEFAULT_RESERVED_OUTPUT_TOKENS = 1_024
 DEFAULT_SAFETY_MARGIN = 1_024
+# Vision providers tokenize image pixels, not the base64 transport string.  A
+# fixed conservative allowance keeps the context guard useful without treating
+# a normal photo upload as hundreds of thousands of text tokens.
+DEFAULT_IMAGE_INPUT_TOKENS = 4_096
 
 
 class ContextBudgetExceeded(ValueError):
@@ -100,9 +104,35 @@ def estimate_tokens(value: Any) -> int:
     return max(1, math.ceil(len(text.encode("utf-8")) / 3))
 
 
+def _estimate_content_tokens(content: Any) -> int:
+    """Estimate chat content while treating data-URL images as vision input.
+
+    OpenAI-compatible multimodal messages carry uploads as base64 data URLs.
+    Counting that transport encoding as ordinary text can reject an otherwise
+    valid image request before it reaches a vision-capable provider.
+    """
+    if not isinstance(content, list):
+        return estimate_tokens(content)
+
+    total = 0
+    for item in content:
+        if not isinstance(item, dict):
+            total += estimate_tokens(item)
+        elif item.get("type") == "image_url":
+            total += DEFAULT_IMAGE_INPUT_TOKENS
+        elif item.get("type") == "text":
+            total += estimate_tokens(item.get("text", ""))
+        else:
+            total += estimate_tokens(item)
+    return total
+
+
 def estimate_message_tokens(message: Dict[str, Any]) -> int:
+    # Account for role/name/other schema fields without serializing a base64
+    # image payload, then add the text/vision content estimate separately.
+    metadata = {key: value for key, value in message.items() if key != "content"}
     # Extra framing covers role/message delimiters used by chat templates.
-    return estimate_tokens(message) + 6
+    return estimate_tokens(metadata) + _estimate_content_tokens(message.get("content")) + 6
 
 
 def estimate_messages_tokens(messages: Sequence[Dict[str, Any]]) -> int:

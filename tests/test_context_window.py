@@ -3,6 +3,7 @@ import unittest
 
 from src.open_llm_vtuber.agent.agents.basic_memory_agent import BasicMemoryAgent
 from src.open_llm_vtuber.agent.context_window import (
+    DEFAULT_IMAGE_INPUT_TOKENS,
     DEFAULT_CONTEXT_LIMIT,
     ContextBudgetExceeded,
     estimate_message_tokens,
@@ -162,6 +163,39 @@ class ContextWindowTests(unittest.TestCase):
             selection.stats.estimated_input_tokens,
             estimate_message_tokens(message("user", "halo")),
         )
+
+    def test_base64_image_is_budgeted_as_vision_input_not_text_transport(self):
+        image_message = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "tolong jelaskan gambar ini"},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/jpeg;base64," + ("A" * 1_000_000),
+                        "detail": "auto",
+                    },
+                },
+            ],
+        }
+
+        # The base64 transport is huge, but a provider sees it as one image.
+        self.assertLess(estimate_message_tokens(image_message), 5_000)
+        self.assertGreaterEqual(
+            estimate_message_tokens(image_message), DEFAULT_IMAGE_INPUT_TOKENS,
+        )
+
+        selection = select_messages_for_context(
+            messages=[image_message],
+            system_prompt="persona",
+            model="test",
+            context_window_override=8_000,
+            reserved_output_tokens=384,
+            safety_margin=1_024,
+            protected_start=0,
+        )
+        self.assertFalse(selection.stats.trimmed)
+        self.assertEqual(selection.messages, [image_message])
 
 
 class _FakeLLM:
