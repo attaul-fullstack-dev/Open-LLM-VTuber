@@ -19,8 +19,18 @@ from ..stateless_llm.openai_compatible_llm import AsyncLLM as OpenAICompatibleAs
 from ...chat_history_manager import (
     get_history,
     get_metadata,
-    update_metadate,
     update_summary_metadata,
+)
+from ...character_state import (
+    CharacterState,
+    add_character_memory as persist_character_memory,
+    build_character_memory_context,
+    load_character_state,
+    migrate_relationship_if_needed,
+    remove_character_memory as remove_persisted_character_memory,
+    reset_character_memory as reset_persisted_character_memory,
+    reset_character_state as reset_persisted_character_state,
+    set_character_relationship,
 )
 from ..transformers import (
     sentence_divider,
@@ -52,6 +62,24 @@ from ..relationship_context import (
     build_relationship_context,
     detect_relationship_update,
     normalize_relationship_status,
+)
+import re
+
+# Conservative, local-only character memory triggers. No LLM classifier and no
+# extra API call per message. Only explicit user requests are honored:
+#   - Remember:  "Ingat ya, makanan favoritku ramen."
+#                "Jangan lupa kalau aku suka kopi."
+#   - Forget:    "Lupakan kalau makanan favoritku ramen."
+_MEMORY_REMEMBER = re.compile(
+    r"(?:tolong\s+)?(?:ingat|catat)\s+(?:ya|yah|dong|deh|dulu|kalau)?\s*[,:]?\s*|"
+    r"jangan\s+lupa\s+(?:ya|yah|dong|deh)?\s*[,:]?\s*",
+    re.IGNORECASE,
+)
+_MEMORY_FORGET = re.compile(
+    r"(?:tolong\s+)?lupakan\s+(?:ya|yah|dong|deh)?\s*"
+    r"(?:kalau|soal|tentang|yang\s+kamu\s+ingat)?\s+|"
+    r"hapus\s+dari\s+ingatan\s+",
+    re.IGNORECASE,
 )
 
 
@@ -114,6 +142,8 @@ class BasicMemoryAgent(AgentInterface):
             maximum_tokens=summary_max_tokens,
         )
         self._relationship_state = RelationshipState()
+        self._character_state = CharacterState()
+        self._character_conf_uid: Optional[str] = None
 
         self._formatted_tools_openai = []
         self._formatted_tools_claude = []
@@ -256,31 +286,38 @@ class BasicMemoryAgent(AgentInterface):
             updated_at=metadata.get("summary_updated_at"),
         )
 
-    def _load_relationship_state(self, conf_uid: str, history_uid: str) -> None:
-        metadata = get_metadata(conf_uid, history_uid)
+    def _load_character_state(self, conf_uid: str) -> None:
+        """Load (and lazily migrate) the character-level state for this conf."""
+        state = load_character_state(conf_uid)
+        state = migrate_relationship_if_needed(conf_uid, state)
+        self._character_state = state
+        self._character_conf_uid = conf_uid
         self._relationship_state = RelationshipState(
-            status=normalize_relationship_status(
-                metadata.get("relationship_status", "stranger")
-            ),
-            updated_at=metadata.get("relationship_updated_at"),
-            reason=str(metadata.get("relationship_reason", "default")),
+            status=state.relationship_status,
+            updated_at=state.relationship_updated_at,
+            reason=state.relationship_reason,
         )
         logger.info(
-            "Relationship stats: relationship_status={}, "
-            "relationship_updated=False, relationship_update_trigger=load_history",
-            self._relationship_state.status,
+            "Character state stats: relationship_status={}, "
+            "character_memory_count={}, relationship_update_trigger=load_history",
+            state.relationship_status,
+            len(state.memories),
         )
 
     @property
     def relationship_status(self) -> RelationshipStatus:
-        """Expose the active conversation state for backend controls/tests."""
+        """Expose the character-level relationship state for backend/tests."""
         return self._relationship_state.status
 
     def _relationship_system_prompt(self, base_prompt: str) -> str:
-        return (
-            f"{base_prompt}\n\n"
-            f"{build_relationship_context(self._relationship_state.status)}"
-        )
+        parts = [
+            base_prompt,
+            build_relationship_context(self._relationship_state.status),
+        ]
+        memory_context = build_character_memory_context(self._character_state)
+        if memory_context:
+            parts.append(memory_context)
+        return "\n\n".join(parts)
 
     def set_relationship_status(
         self,
@@ -288,35 +325,33 @@ class BasicMemoryAgent(AgentInterface):
         *,
         trigger: str = "manual_backend_update",
     ) -> bool:
-        """Persist an explicit backend relationship update for this conversation."""
+        """Persist an explicit relationship update at character level."""
         normalized = normalize_relationship_status(status)
         if normalized != status:
             raise ValueError(f"Unsupported relationship status: {status}")
-        if not self._summary_conf_uid or not self._summary_history_uid:
+        if not self._character_conf_uid:
             logger.warning(
-                "Relationship update skipped: no active conversation history"
+                "Relationship update skipped: no active character context"
             )
             return False
         if normalized == self._relationship_state.status:
             return True
 
         updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        persisted = update_metadate(
-            self._summary_conf_uid,
-            self._summary_history_uid,
-            {
-                "relationship_status": normalized,
-                "relationship_updated_at": updated_at,
-                "relationship_reason": trigger,
-            },
+        state = set_character_relationship(
+            self._character_conf_uid,
+            normalized,
+            trigger,
+            updated_at=updated_at,
         )
-        if not persisted:
+        if state is None:
             logger.warning(
                 "Relationship update failed: trigger={}",
                 trigger,
             )
             return False
 
+        self._character_state = state
         self._relationship_state = RelationshipState(
             status=normalized,
             updated_at=updated_at,
@@ -331,8 +366,184 @@ class BasicMemoryAgent(AgentInterface):
         return True
 
     def reset_relationship(self) -> bool:
-        """Backend-level reset; no frontend UI is required for Tahap 5."""
+        """Reset Mili's relationship for every conversation (character-level)."""
         return self.set_relationship_status("stranger", trigger="manual_reset")
+
+    def add_character_memory(self, text: str, *, explicit: bool = True) -> bool:
+        """Persist one long-term fact shared across all chats."""
+        if not self._character_conf_uid:
+            logger.warning("Character memory update skipped: no active character")
+            return False
+        state = persist_character_memory(
+            self._character_conf_uid, text, explicit=explicit
+        )
+        if state is None:
+            logger.warning(
+                "Character memory update failed: character_memory_updated=False"
+            )
+            return False
+        self._character_state = state
+        logger.info(
+            "Character memory stats: character_memory_updated=True, "
+            "character_memory_count={}",
+            len(state.memories),
+        )
+        return True
+
+    def remove_character_memory(self, text: str) -> bool:
+        """Forget stored facts overlapping the given text (character-level)."""
+        if not self._character_conf_uid:
+            return False
+        state = remove_persisted_character_memory(self._character_conf_uid, text)
+        if state is None:
+            logger.warning(
+                "Character memory removal failed: character_memory_updated=False"
+            )
+            return False
+        self._character_state = state
+        logger.info(
+            "Character memory stats: character_memory_updated=True, "
+            "character_memory_count={}",
+            len(state.memories),
+        )
+        return True
+
+    def list_character_memories(self) -> List[Dict[str, Any]]:
+        """Return stored long-term facts (for backend controls / future UI)."""
+        return list(self._character_state.memories)
+
+    def reset_character_memory(self) -> bool:
+        """Clear Mili's long-term memory; relationship is untouched."""
+        if not self._character_conf_uid:
+            return False
+        state = reset_persisted_character_memory(self._character_conf_uid)
+        if state is None:
+            logger.warning(
+                "Character memory reset failed: character_memory_updated=False"
+            )
+            return False
+        self._character_state = state
+        logger.info(
+            "Character memory stats: character_memory_updated=True, "
+            "character_memory_count=0, character_memory_reset=True"
+        )
+        return True
+
+    def reset_character_state(self) -> bool:
+        """Reset relationship to stranger and clear memory (no transcript touch)."""
+        if not self._character_conf_uid:
+            return False
+        state = reset_persisted_character_state(self._character_conf_uid)
+        if state is None:
+            logger.warning(
+                "Character state reset failed: character_memory_updated=False"
+            )
+            return False
+        self._character_state = state
+        self._relationship_state = RelationshipState(
+            status=state.relationship_status,
+            updated_at=state.relationship_updated_at,
+            reason=state.relationship_reason,
+        )
+        logger.info(
+            "Character state stats: relationship_status=stranger, "
+            "character_memory_count=0, character_state_reset=True"
+        )
+        return True
+
+    def _observe_character_memory_request(self, user_text: str) -> bool:
+        """Honor explicit remember/forget requests with cheap local rules."""
+        if not self._character_conf_uid:
+            return False
+        text = (user_text or "").strip()
+        if not text:
+            return False
+        forget_match = _MEMORY_FORGET.match(text)
+        if forget_match:
+            target = text[forget_match.end():].strip(" .,!?;:，。！？；：")
+            if len(target) >= 3:
+                return self.remove_character_memory(target)
+        remember_match = _MEMORY_REMEMBER.match(text)
+        if remember_match:
+            raw = text[remember_match.end():].strip()
+            content = raw.strip(" .,!?;:，。！？；：")
+            if (
+                len(content) >= 4
+                and not raw.endswith("?")
+                and not raw.endswith("？")
+            ):
+                return self.add_character_memory(content, explicit=True)
+        return False
+
+    def observe_character_events(
+        self,
+        user_text: str,
+        assistant_text: str,
+    ) -> bool:
+        """Observe one completed visible turn: relationship + explicit memory."""
+        relationship_updated = self.observe_relationship_event(
+            user_text, assistant_text
+        )
+        memory_updated = self._observe_character_memory_request(user_text)
+        return relationship_updated or memory_updated
+
+    async def compact_conversation(self) -> tuple[bool, Optional[str]]:
+        """Manually compress the active conversation using the rolling-summary pipeline.
+
+        The transcript is never modified: only the rolling summary and its
+        boundary advance, so later automatic summaries continue incrementally.
+        On failure the previous summary and boundary are preserved.
+        """
+        if not self._summary_conf_uid or not self._summary_history_uid:
+            return False, "No active conversation to compact."
+        async with self._summary_lock:
+            start = self._summary_state.summarized_through
+            candidates = self._memory[start:]
+            if not candidates:
+                return True, None
+            if len(candidates) < self._summary_min_new_messages:
+                return False, "Not enough new messages to compact yet."
+            try:
+                updated_summary = await self._summarizer.summarize(
+                    self._summary_state.text,
+                    candidates,
+                )
+            except Exception as error:
+                logger.warning(
+                    "Manual compact failed; keeping prior summary: type={}",
+                    type(error).__name__,
+                )
+                return False, (
+                    "Summary generation failed; transcript and previous "
+                    "summary are untouched."
+                )
+            updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            persisted = update_summary_metadata(
+                self._summary_conf_uid,
+                self._summary_history_uid,
+                expected_summarized_through=start,
+                conversation_summary=updated_summary,
+                summarized_through=len(self._memory),
+                summary_updated_at=updated_at,
+            )
+            if not persisted:
+                self._load_summary_state(
+                    self._summary_conf_uid,
+                    self._summary_history_uid,
+                )
+                return False, "Could not persist the compacted summary."
+            self._summary_state = SummaryState(
+                text=updated_summary,
+                summarized_through=len(self._memory),
+                updated_at=updated_at,
+            )
+            logger.info(
+                "Manual compact stats: summary_updated=True, "
+                "summarized_through={}, messages_compacted={}",
+                self._summary_state.summarized_through,
+                len(candidates),
+            )
+            return True, None
 
     def observe_relationship_event(
         self,
@@ -570,7 +781,7 @@ class BasicMemoryAgent(AgentInterface):
                     "Skipping invalid message from history (content omitted)"
                 )
         self._load_summary_state(conf_uid, history_uid)
-        self._load_relationship_state(conf_uid, history_uid)
+        self._load_character_state(conf_uid)
         logger.info(f"Loaded {len(self._memory)} messages from history.")
 
     def handle_interrupt(self, heard_response: str) -> None:

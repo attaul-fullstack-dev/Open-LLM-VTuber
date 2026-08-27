@@ -20,6 +20,7 @@ from .chat_history_manager import (
     get_history,
     delete_history,
     get_history_list,
+    update_metadate,
 )
 from .config_manager.utils import scan_config_alts_directory, scan_bg_directory
 from .conversations.conversation_handler import (
@@ -39,6 +40,12 @@ class MessageType(Enum):
         "create-new-history",
         "delete-history",
         "reset-relationship",
+        "compact-conversation",
+        "rename-history",
+        "fetch-character-memory",
+        "delete-character-memory",
+        "reset-character-memory",
+        "reset-character-state",
     ]
     CONVERSATION = ["mic-audio-end", "text-input", "ai-speak-signal"]
     CONFIG = ["fetch-configs", "switch-config"]
@@ -85,6 +92,12 @@ class WebSocketHandler:
             "create-new-history": self._handle_create_history,
             "delete-history": self._handle_delete_history,
             "reset-relationship": self._handle_reset_relationship,
+            "compact-conversation": self._handle_compact_conversation,
+            "rename-history": self._handle_rename_history,
+            "fetch-character-memory": self._handle_fetch_character_memory,
+            "delete-character-memory": self._handle_delete_character_memory,
+            "reset-character-memory": self._handle_reset_character_memory,
+            "reset-character-state": self._handle_reset_character_state,
             "interrupt-signal": self._handle_interrupt,
             "mic-audio-data": self._handle_audio_data,
             "mic-audio-end": self._handle_conversation_trigger,
@@ -483,7 +496,7 @@ class WebSocketHandler:
     async def _handle_reset_relationship(
         self, websocket: WebSocket, client_uid: str, data: WSMessage
     ) -> None:
-        """Reset relationship metadata for the currently selected conversation."""
+        """Reset Mili's relationship for ALL conversations (character-level)."""
         context = self.client_contexts[client_uid]
         reset = getattr(context.agent_engine, "reset_relationship", None)
         success = bool(context.history_uid and callable(reset) and reset())
@@ -493,6 +506,120 @@ class WebSocketHandler:
                     "type": "relationship-reset",
                     "success": success,
                     "history_uid": context.history_uid,
+                }
+            )
+        )
+
+    async def _handle_compact_conversation(
+        self, websocket: WebSocket, client_uid: str, data: WSMessage
+    ) -> None:
+        """Manually compact the active conversation now (rolling-summary path)."""
+        context = self.client_contexts[client_uid]
+        compact = getattr(context.agent_engine, "compact_conversation", None)
+        success, error = False, None
+        if context.history_uid and callable(compact):
+            success, error = await compact()
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "type": "compact-result",
+                    "success": success,
+                    "history_uid": context.history_uid,
+                    "error": error,
+                }
+            )
+        )
+
+    async def _handle_rename_history(
+        self, websocket: WebSocket, client_uid: str, data: dict
+    ) -> None:
+        """Persist a manual conversation title in history metadata."""
+        history_uid = data.get("history_uid")
+        title = str(data.get("title", "") or "").strip()
+        context = self.client_contexts[client_uid]
+        success = bool(
+            history_uid
+            and title
+            and update_metadate(
+                context.character_config.conf_uid,
+                history_uid,
+                {"title": title},
+            )
+        )
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "type": "history-renamed",
+                    "success": success,
+                    "history_uid": history_uid,
+                    "title": title if success else None,
+                }
+            )
+        )
+
+    async def _handle_fetch_character_memory(
+        self, websocket: WebSocket, client_uid: str, data: WSMessage
+    ) -> None:
+        """Return Mili's stored long-term facts (text + timestamp only)."""
+        context = self.client_contexts[client_uid]
+        memories = getattr(
+            context.agent_engine, "list_character_memories", lambda: []
+        )()
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "type": "character-memory",
+                    "memories": memories,
+                }
+            )
+        )
+
+    async def _handle_delete_character_memory(
+        self, websocket: WebSocket, client_uid: str, data: dict
+    ) -> None:
+        """Forget one stored long-term fact (by text)."""
+        context = self.client_contexts[client_uid]
+        text = str(data.get("text", "") or "")
+        remove = getattr(context.agent_engine, "remove_character_memory", None)
+        success = bool(text and callable(remove) and remove(text))
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "type": "character-memory-deleted",
+                    "success": success,
+                    "text": text,
+                }
+            )
+        )
+
+    async def _handle_reset_character_memory(
+        self, websocket: WebSocket, client_uid: str, data: WSMessage
+    ) -> None:
+        """Clear all of Mili's long-term memory (relationship untouched)."""
+        context = self.client_contexts[client_uid]
+        reset = getattr(context.agent_engine, "reset_character_memory", None)
+        success = bool(callable(reset) and reset())
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "type": "character-memory-reset",
+                    "success": success,
+                }
+            )
+        )
+
+    async def _handle_reset_character_state(
+        self, websocket: WebSocket, client_uid: str, data: WSMessage
+    ) -> None:
+        """Reset relationship to stranger and clear memory; transcripts stay."""
+        context = self.client_contexts[client_uid]
+        reset = getattr(context.agent_engine, "reset_character_state", None)
+        success = bool(callable(reset) and reset())
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "type": "character-state-reset",
+                    "success": success,
                 }
             )
         )

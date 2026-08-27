@@ -40,15 +40,29 @@ _DATING_PROPOSAL = re.compile(
     re.IGNORECASE,
 )
 _DATING_ACCEPTANCE = re.compile(
-    r"(?:^|[.!?…]\s*)(?:\.\.\.)?\s*(?:iya|ya|mau)\b|"
+    r"(?:^|[,.!?;…]\s*)(?:\.\.\.)?\s*(?:iya|ya|mau)\b|"
+    r"\b(?:iya|ya)\s*(?:[,.;…]+\s*)?(?:deh|dong|aku\s+mau|mau)\b|"
     r"\b(?:aku\s+(?:mau|terima)|kita\s+(?:jadian|pacaran)|jadi\s+pacarmu)\b",
     re.IGNORECASE,
 )
 _ROMANTIC_REJECTION = re.compile(
-    r"\b(?:nggak|gak|tidak|belum)\s+(?:mau|bisa)|"
+    r"(?:^|[.!?…]\s*)(?:nggak|ngga|gak|ga|tidak)(?:[.!?…]|$)|"
+    r"\b(?:nggak|ngga|gak|ga|tidak|belum)\s+"
+    r"(?:mau|bisa|setuju|pacaran|jadi\s+pacar)\b|"
+    r"\b(?:jawaban(?:ku)?|jawabanku)\b.{0,24}\b"
+    r"(?:nggak|ngga|gak|ga|tidak)\b|"
+    r"\b(?:tapi|namun)\b.{0,80}\b"
+    r"(?:nggak|ngga|gak|ga|tidak|belum|bukan)\b|"
+    r"\b(?:bukan\s+(?:jadi\s+)?pacar|tetap\s+teman|teman\s+aja)\b|"
+    r"\b(?:mungkin\b.{0,50}\b(?:nanti|suatu\s+hari)|sekarang\s+belum)\b|"
     r"\b(?:cuma|hanya)\s+teman|\bjangan\s+(?:ngarep|berharap)|\baku\s+tolak\b",
     re.IGNORECASE,
 )
+
+# Acceptance must be near the start of the answer. This leaves room for a few
+# natural tsundere hesitation sentences without treating a late, incidental
+# "iya" as mutual agreement.
+_DATING_ACCEPTANCE_PREFIX_CHARS = 240
 
 _CLOSE_USER_EVENT = re.compile(
     r"\b(?:aku\s+(?:percaya|nyaman\s+cerita)\s+(?:sama|dengan)\s+kamu|"
@@ -96,10 +110,11 @@ def detect_relationship_update(
     if not user or not assistant:
         return None
 
+    acceptance_prefix = assistant[:_DATING_ACCEPTANCE_PREFIX_CHARS]
     if (
         current_status != "dating"
         and _DATING_PROPOSAL.search(user)
-        and _DATING_ACCEPTANCE.search(assistant)
+        and _DATING_ACCEPTANCE.search(acceptance_prefix)
         and not _ROMANTIC_REJECTION.search(assistant)
     ):
         return RelationshipUpdate("dating", "explicit_relationship_event")

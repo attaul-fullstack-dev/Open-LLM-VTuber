@@ -160,13 +160,18 @@ async def process_single_conversation(
                 avatar=context.character_config.avatar,
             )
             logger.info("AI response completed (characters={})", len(full_response))
-            if not skip_history and hasattr(
-                context.agent_engine, "observe_relationship_event"
-            ):
-                context.agent_engine.observe_relationship_event(
-                    input_text,
-                    full_response,
+            if not skip_history:
+                observer = getattr(
+                    context.agent_engine,
+                    "observe_character_events",
+                    None,
                 )
+                if observer is None:
+                    observer = getattr(
+                        context.agent_engine, "observe_relationship_event", None
+                    )
+                if observer is not None:
+                    observer(input_text, full_response)
 
         return full_response  # Return accumulated full_response
 

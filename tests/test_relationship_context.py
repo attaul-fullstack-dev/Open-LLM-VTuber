@@ -19,6 +19,7 @@ from src.open_llm_vtuber.chat_history_manager import (
     get_metadata,
     store_message,
 )
+from src.open_llm_vtuber.character_state import load_character_state
 from src.open_llm_vtuber.config_manager import TTSPreprocessorConfig
 from src.open_llm_vtuber.websocket_handler import WebSocketHandler
 
@@ -121,20 +122,24 @@ class RelationshipContinuityTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(recreated.relationship_status, "close")
         self.assertEqual(
-            get_metadata(self.conf_uid, history_uid)["relationship_status"],
+            load_character_state(self.conf_uid).relationship_status,
             "close",
         )
 
-    def test_conversation_switching_keeps_states_isolated(self):
+    def test_relationship_is_global_across_conversations(self):
         history_a = self.create_history()
         history_b = self.create_history()
         agent = self.make_agent(history_a)
         agent.set_relationship_status("dating", trigger="synthetic_test_event")
-        agent.set_memory_from_history(self.conf_uid, history_b)
-        agent.set_relationship_status("familiar", trigger="synthetic_test_event")
 
+        # Switching chats never resets the character-level relationship.
+        agent.set_memory_from_history(self.conf_uid, history_b)
+        self.assertEqual(agent.relationship_status, "dating")
         agent.set_memory_from_history(self.conf_uid, history_a)
         self.assertEqual(agent.relationship_status, "dating")
+
+        # A later character-level update applies to every chat as well.
+        agent.set_relationship_status("familiar", trigger="synthetic_test_event")
         agent.set_memory_from_history(self.conf_uid, history_b)
         self.assertEqual(agent.relationship_status, "familiar")
 
@@ -149,8 +154,10 @@ class RelationshipContinuityTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(updated)
         self.assertEqual(agent.relationship_status, "dating")
-        metadata = get_metadata(self.conf_uid, history_uid)
-        self.assertEqual(metadata["relationship_reason"], "explicit_relationship_event")
+        character_state = load_character_state(self.conf_uid)
+        self.assertEqual(
+            character_state.relationship_reason, "explicit_relationship_event"
+        )
 
     def test_clear_indonesian_dating_variants_require_acceptance(self):
         proposals = (
@@ -167,6 +174,59 @@ class RelationshipContinuityTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNotNone(update)
                 self.assertEqual(update.new_status, "dating")
 
+    def test_live_dating_response_regression(self):
+        update = detect_relationship_update(
+            "stranger",
+            "Kamu mau nggak jadi pacar aku?",
+            "Hah? Kok tiba-tiba gitu? Iya. Mau. Udah, jangan suruh aku ngulang.",
+        )
+
+        self.assertIsNotNone(update)
+        self.assertEqual(update.new_status, "dating")
+
+    def test_hesitation_before_clear_acceptance_is_allowed(self):
+        accepted = (
+            "Hah? Iya. Mau.",
+            "Ih... iya deh.",
+            "Serius? Ya, aku mau.",
+            "[smirk] Hah? Iya, mau.",
+            "Apaan sih... yaudah, iya.",
+            "[happy] Ih... yaudah, iya.",
+            "Kamu serius? Iya, aku mau.",
+        )
+        for response in accepted:
+            with self.subTest(response=response):
+                update = detect_relationship_update(
+                    "close", "Mau nggak jadi pacar aku?", response
+                )
+                self.assertIsNotNone(update)
+                self.assertEqual(update.new_status, "dating")
+
+    def test_rejection_and_qualification_override_ambiguous_acceptance(self):
+        rejected = (
+            "Hah? Nggak.",
+            "Iya aku suka kamu, tapi nggak mau pacaran.",
+            "Aku mau dekat sama kamu, tapi bukan jadi pacar.",
+            "Mungkin iya suatu hari nanti, tapi sekarang belum.",
+            "Iya, aku ngerti maksud kamu. Tapi jawabanku nggak.",
+            "Aku mau tetap teman aja.",
+            "Iya, aku dengar. Jawabanku nggak.",
+        )
+        for response in rejected:
+            with self.subTest(response=response):
+                self.assertIsNone(
+                    detect_relationship_update(
+                        "close", "Mau jadi pacarku?", response
+                    )
+                )
+
+    def test_acceptance_too_far_into_response_is_ignored(self):
+        response = "Hah? " + ("Aku masih harus mikir panjang soal ini. " * 10) + "Iya."
+
+        self.assertIsNone(
+            detect_relationship_update("close", "Mau jadi pacarku?", response)
+        )
+
     def test_rejected_proposal_does_not_set_dating(self):
         self.assertIsNone(
             detect_relationship_update(
@@ -182,6 +242,29 @@ class RelationshipContinuityTests(unittest.IsolatedAsyncioTestCase):
                 "Kayaknya belum dijelasin di ceritanya.",
             )
         )
+
+    def test_detected_dating_survives_new_chat_delete_and_recreation(self):
+        history_a = self.create_history()
+        agent_a = self.make_agent(history_a)
+        self.assertTrue(
+            agent_a.observe_relationship_event(
+                "Kamu mau nggak jadi pacar aku?",
+                "Hah? Kok tiba-tiba gitu? Iya. Mau. Udah, jangan suruh aku ngulang.",
+            )
+        )
+        self.assertEqual(agent_a.relationship_status, "dating")
+
+        history_b = self.create_history()
+        agent_b = self.make_agent(history_b)
+        self.assertEqual(agent_b.relationship_status, "dating")
+
+        self.assertTrue(delete_history(self.conf_uid, history_a))
+        self.assertEqual(
+            load_character_state(self.conf_uid).relationship_status, "dating"
+        )
+
+        recreated = self.make_agent(history_b)
+        self.assertEqual(recreated.relationship_status, "dating")
 
     def test_one_sided_romantic_message_does_not_set_dating(self):
         history_uid = self.create_history()
@@ -311,10 +394,10 @@ class RelationshipContinuityTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(agent.reset_relationship())
 
         recreated = self.make_agent(history_uid)
-        metadata = get_metadata(self.conf_uid, history_uid)
+        character_state = load_character_state(self.conf_uid)
         self.assertEqual(recreated.relationship_status, "stranger")
-        self.assertEqual(metadata["relationship_status"], "stranger")
-        self.assertEqual(metadata["relationship_reason"], "manual_reset")
+        self.assertEqual(character_state.relationship_status, "stranger")
+        self.assertEqual(character_state.relationship_reason, "manual_reset")
 
     async def test_websocket_backend_reset_uses_active_conversation(self):
         history_uid = self.create_history()
@@ -334,13 +417,18 @@ class RelationshipContinuityTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(websocket.messages[-1]["success"])
         self.assertIn("reset-relationship", handler._message_handlers)
 
-    def test_delete_conversation_removes_relationship_metadata(self):
+    def test_delete_conversation_preserves_character_relationship(self):
         history_uid = self.create_history()
         agent = self.make_agent(history_uid)
         agent.set_relationship_status("dating", trigger="synthetic_test_event")
 
         self.assertTrue(delete_history(self.conf_uid, history_uid))
+        # Character-level relationship survives conversation deletion (v2).
         self.assertEqual(get_metadata(self.conf_uid, history_uid), {})
+        self.assertEqual(
+            load_character_state(self.conf_uid).relationship_status,
+            "dating",
+        )
 
 
 if __name__ == "__main__":

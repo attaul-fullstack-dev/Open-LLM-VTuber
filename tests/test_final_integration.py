@@ -15,6 +15,7 @@ from src.open_llm_vtuber.chat_history_manager import (
     store_message,
     update_summary_metadata,
 )
+from src.open_llm_vtuber.character_state import load_character_state
 from src.open_llm_vtuber.config_manager import TTSPreprocessorConfig
 from src.open_llm_vtuber.websocket_handler import WebSocketHandler
 
@@ -168,14 +169,15 @@ class FinalIntegrationTests(unittest.IsolatedAsyncioTestCase):
         agent.set_relationship_status("dating", trigger="synthetic_test_event")
         agent.set_memory_from_history(self.conf_uid, history_b)
 
-        for history_uid, status, summary, fact in (
-            (history_a, "dating", "summary A", "fakta A"),
-            (history_b, "stranger", "summary B", "fakta B"),
-            (history_a, "dating", "summary A", "fakta A"),
-            (history_b, "stranger", "summary B", "fakta B"),
+        for history_uid, summary, fact in (
+            (history_a, "summary A", "fakta A"),
+            (history_b, "summary B", "fakta B"),
+            (history_a, "summary A", "fakta A"),
+            (history_b, "summary B", "fakta B"),
         ):
             agent.set_memory_from_history(self.conf_uid, history_uid)
-            self.assertEqual(agent.relationship_status, status)
+            # Relationship is character-level now: it stays global across chats.
+            self.assertEqual(agent.relationship_status, "dating")
             self.assertEqual(agent._summary_state.text, summary)
             self.assertTrue(any(fact in item["content"] for item in agent._memory))
 
@@ -185,7 +187,7 @@ class FinalIntegrationTests(unittest.IsolatedAsyncioTestCase):
         metadata_before = copy.deepcopy(get_metadata(self.conf_uid, history_uid))
 
         with patch(
-            "src.open_llm_vtuber.agent.agents.basic_memory_agent.update_metadate",
+            "src.open_llm_vtuber.character_state.save_character_state",
             return_value=False,
         ):
             self.assertFalse(
@@ -194,6 +196,9 @@ class FinalIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(agent.relationship_status, "stranger")
         self.assertEqual(get_metadata(self.conf_uid, history_uid), metadata_before)
+        self.assertEqual(
+            load_character_state(self.conf_uid).relationship_status, "stranger"
+        )
 
     async def test_reconnect_and_restart_preserve_history_summary_relationship(self):
         stored = [
@@ -221,7 +226,7 @@ class FinalIntegrationTests(unittest.IsolatedAsyncioTestCase):
         restarted = self.make_agent(history_uid)
         self.assertEqual(restarted.relationship_status, "dating")
         self.assertEqual(
-            get_metadata(self.conf_uid, history_uid)["relationship_status"],
+            load_character_state(self.conf_uid).relationship_status,
             "dating",
         )
         self.assertEqual(len(restarted._memory), len(stored))
@@ -329,8 +334,10 @@ class FinalIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         agent.set_memory_from_history(self.conf_uid, "nonexistent-history-uid")
 
+        # Transcript and summary are per conversation (empty here), but the
+        # character-level relationship is global and survives an invalid uid.
         self.assertEqual(agent._memory, [])
-        self.assertEqual(agent.relationship_status, "stranger")
+        self.assertEqual(agent.relationship_status, "dating")
         self.assertEqual(agent._summary_state.text, "")
 
     async def test_invalid_relationship_reset_is_controlled(self):

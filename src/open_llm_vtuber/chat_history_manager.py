@@ -357,12 +357,22 @@ def get_history_list(conf_uid: str) -> List[dict]:
                         empty_history_uids.append(history_uid)
                         continue
 
+                    metadata = (
+                        messages[0]
+                        if messages and messages[0].get("role") == "metadata"
+                        else {}
+                    )
                     latest_message = actual_messages[-1]
                     history_info = {
                         "uid": history_uid,
                         "latest_message": latest_message,
                         "timestamp": (
                             latest_message["timestamp"] if latest_message else None
+                        ),
+                        "title": (
+                            str(metadata.get("title", "")).strip()
+                            if metadata
+                            else ""
                         ),
                     }
                     histories.append(history_info)
