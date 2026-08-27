@@ -9,6 +9,7 @@ from openai import (
     AsyncOpenAI,
     APIError,
     APIConnectionError,
+    APITimeoutError,
     RateLimitError,
     NotGiven,
     NOT_GIVEN,
@@ -20,7 +21,12 @@ import time
 
 from .stateless_llm_interface import StatelessLLMInterface
 from ...mcpp.types import ToolCallObject
-from ...request_latency import get_latency_phase, get_latency_tracker
+from ...request_latency import (
+    build_attempt_tracking_http_client,
+    describe_provider_config,
+    get_latency_phase,
+    get_latency_tracker,
+)
 
 
 class AsyncLLM(StatelessLLMInterface):
@@ -58,17 +64,22 @@ class AsyncLLM(StatelessLLMInterface):
             organization=organization_id,
             project=project_id,
             api_key=llm_api_key,
+            http_client=build_attempt_tracking_http_client(),
         )
         self.support_tools = True
 
+        provider_config = describe_provider_config(self.client)
         logger.info(
             "Initialized AsyncLLM: base_url={}, model={}, temperature={}, "
-            "top_p={}, max_tokens={}",
+            "top_p={}, max_tokens={}, provider_client_timeout_s={}, "
+            "provider_max_retries={}",
             self.base_url,
             self.model,
             self.temperature,
             self.top_p,
             self.max_tokens,
+            provider_config.get("provider_client_timeout_s"),
+            provider_config.get("provider_max_retries"),
         )
 
     async def chat_completion(
@@ -98,6 +109,7 @@ class AsyncLLM(StatelessLLMInterface):
         tracker = get_latency_tracker()
         latency_phase = get_latency_phase()
         call_started_ms = time.perf_counter() * 1000
+        first_chunk_seen = False
         first_content_seen = False
         # Tool call related state variables
         accumulated_tool_calls = {}
@@ -120,6 +132,8 @@ class AsyncLLM(StatelessLLMInterface):
 
             available_tools = tools if self.support_tools else NOT_GIVEN
 
+            if tracker and latency_phase == "chat":
+                tracker.provider_prepare_started()
             request_params: Dict[str, Any] = {
                 "messages": messages_with_system,
                 "model": self.model,
@@ -131,8 +145,8 @@ class AsyncLLM(StatelessLLMInterface):
                 request_params["top_p"] = self.top_p
             if self.max_tokens is not None:
                 request_params["max_tokens"] = self.max_tokens
-
             if tracker and latency_phase == "chat":
+                tracker.provider_prepare_done()
                 tracker.provider_started()
             stream: AsyncStream[
                 ChatCompletionChunk
@@ -150,6 +164,10 @@ class AsyncLLM(StatelessLLMInterface):
                 # Guard against chunks with missing choices field (e.g., from OpenWebUI)
                 if not chunk.choices:
                     continue
+
+                if tracker and latency_phase == "chat" and not first_chunk_seen:
+                    first_chunk_seen = True
+                    tracker.provider_first_chunk()
 
                 if self.support_tools:
                     has_tool_calls = (
@@ -236,6 +254,9 @@ class AsyncLLM(StatelessLLMInterface):
                         tracker.output_chars += len(content)
                 yield content
 
+            if tracker and latency_phase == "chat":
+                tracker.provider_stream_completed()
+
             # If stream ends while still in a tool call, make sure to yield the tool call
             if in_tool_call and accumulated_tool_calls:
                 logger.info(
@@ -251,16 +272,28 @@ class AsyncLLM(StatelessLLMInterface):
 
                 yield complete_tool_calls
 
+        except APITimeoutError as e:
+            logger.error(
+                f"Error calling the chat endpoint: Timeout. Failed to connect to the LLM API. \nCheck the configurations and the reachability of the LLM backend. \nSee the logs for details. \nTroubleshooting with documentation: https://open-llm-vtuber.github.io/docs/faq#%E9%81%87%E5%88%B0-error-calling-the-chat-endpoint-%E9%94%99%E8%AF%AF%E6%80%8E%E4%B9%88%E5%8A%9E \n{e.__cause__}"
+            )
+            if tracker and latency_phase == "chat":
+                tracker.record_provider_error("timeout")
+            yield "Error calling the chat endpoint: Timeout. Failed to connect to the LLM API. Check the configurations and the reachability of the LLM backend. See the logs for details."
+
         except APIConnectionError as e:
             logger.error(
                 f"Error calling the chat endpoint: Connection error. Failed to connect to the LLM API. \nCheck the configurations and the reachability of the LLM backend. \nSee the logs for details. \nTroubleshooting with documentation: https://open-llm-vtuber.github.io/docs/faq#%E9%81%87%E5%88%B0-error-calling-the-chat-endpoint-%E9%94%99%E8%AF%AF%E6%80%8E%E4%B9%88%E5%8A%9E \n{e.__cause__}"
             )
+            if tracker and latency_phase == "chat":
+                tracker.record_provider_error("connection_error")
             yield "Error calling the chat endpoint: Connection error. Failed to connect to the LLM API. Check the configurations and the reachability of the LLM backend. See the logs for details. Troubleshooting with documentation: [https://open-llm-vtuber.github.io/docs/faq#%E9%81%87%E5%88%B0-error-calling-the-chat-endpoint-%E9%94%99%E8%AF%AF%E6%80%8E%E4%B9%88%E5%8A%9E]"
 
         except RateLimitError as e:
             logger.error(
                 f"Error calling the chat endpoint: Rate limit exceeded: {e.response}"
             )
+            if tracker and latency_phase == "chat":
+                tracker.record_provider_error("rate_limit")
             yield "Error calling the chat endpoint: Rate limit exceeded. Please try again later. See the logs for details."
 
         except APIError as e:
@@ -276,6 +309,8 @@ class AsyncLLM(StatelessLLMInterface):
             logger.info(f"Model: {self.model}")
             logger.info("Message count: {}", len(messages))
             logger.info(f"temperature: {self.temperature}")
+            if tracker and latency_phase == "chat":
+                tracker.record_provider_error("api_error")
             yield "Error calling the chat endpoint: Error occurred while generating response. See the logs for details."
 
         finally:

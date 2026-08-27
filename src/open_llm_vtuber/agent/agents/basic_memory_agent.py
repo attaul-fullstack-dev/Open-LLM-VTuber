@@ -348,12 +348,18 @@ class BasicMemoryAgent(AgentInterface):
             return True
 
         updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        save_started = time.perf_counter()
         state = set_character_relationship(
             self._character_conf_uid,
             normalized,
             trigger,
             updated_at=updated_at,
         )
+        tracker = get_latency_tracker()
+        if tracker:
+            tracker.add_character_state_save(
+                (time.perf_counter() - save_started) * 1000
+            )
         if state is None:
             logger.warning(
                 "Relationship update failed: trigger={}",
@@ -384,9 +390,15 @@ class BasicMemoryAgent(AgentInterface):
         if not self._character_conf_uid:
             logger.warning("Character memory update skipped: no active character")
             return False
+        save_started = time.perf_counter()
         state = persist_character_memory(
             self._character_conf_uid, text, explicit=explicit
         )
+        tracker = get_latency_tracker()
+        if tracker:
+            tracker.add_character_state_save(
+                (time.perf_counter() - save_started) * 1000
+            )
         if state is None:
             logger.warning(
                 "Character memory update failed: character_memory_updated=False"
@@ -515,6 +527,9 @@ class BasicMemoryAgent(AgentInterface):
             if len(candidates) < self._summary_min_new_messages:
                 return False, "Not enough new messages to compact yet."
             try:
+                tracker = get_latency_tracker()
+                if tracker:
+                    tracker.mark("summary_start")
                 phase_token = set_latency_phase("summary")
                 try:
                     updated_summary = await self._summarizer.summarize(
@@ -523,6 +538,8 @@ class BasicMemoryAgent(AgentInterface):
                     )
                 finally:
                     reset_latency_phase(phase_token)
+                if tracker:
+                    tracker.mark("summary_end")
             except Exception as error:
                 logger.warning(
                     "Manual compact failed; keeping prior summary: type={}",
@@ -533,6 +550,8 @@ class BasicMemoryAgent(AgentInterface):
                     "summary are untouched."
                 )
             updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            tracker = get_latency_tracker()
+            save_started = time.perf_counter()
             persisted = update_summary_metadata(
                 self._summary_conf_uid,
                 self._summary_history_uid,
@@ -541,6 +560,10 @@ class BasicMemoryAgent(AgentInterface):
                 summarized_through=len(self._memory),
                 summary_updated_at=updated_at,
             )
+            if tracker:
+                tracker.add_metadata_save(
+                    (time.perf_counter() - save_started) * 1000
+                )
             if not persisted:
                 self._load_summary_state(
                     self._summary_conf_uid,
@@ -618,6 +641,9 @@ class BasicMemoryAgent(AgentInterface):
                 return False, False, 0, evicted_through
 
             try:
+                tracker = get_latency_tracker()
+                if tracker:
+                    tracker.mark("summary_start")
                 phase_token = set_latency_phase("summary")
                 try:
                     updated_summary = await self._summarizer.summarize(
@@ -626,7 +652,10 @@ class BasicMemoryAgent(AgentInterface):
                     )
                 finally:
                     reset_latency_phase(phase_token)
+                if tracker:
+                    tracker.mark("summary_end")
                 updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                save_started = time.perf_counter()
                 persisted = update_summary_metadata(
                     self._summary_conf_uid,
                     self._summary_history_uid,
@@ -635,6 +664,10 @@ class BasicMemoryAgent(AgentInterface):
                     summarized_through=evicted_through,
                     summary_updated_at=updated_at,
                 )
+                if tracker:
+                    tracker.add_metadata_save(
+                        (time.perf_counter() - save_started) * 1000
+                    )
                 if not persisted:
                     self._load_summary_state(
                         self._summary_conf_uid,
@@ -664,6 +697,8 @@ class BasicMemoryAgent(AgentInterface):
         """Apply Stage 3 budgeting, update summary if needed, then inject it."""
         context_started = time.perf_counter()
         tracker = get_latency_tracker()
+        if tracker:
+            tracker.mark("context_build_start")
         summary_before_ms = tracker.summary_ms if tracker else 0.0
         if not self._context_management_enabled:
             result = self._prepare_context(
@@ -734,6 +769,7 @@ class BasicMemoryAgent(AgentInterface):
             failed,
         )
         if tracker:
+            tracker.mark("context_build_end")
             elapsed_ms = (time.perf_counter() - context_started) * 1000
             summary_delta = max(0.0, tracker.summary_ms - summary_before_ms)
             tracker.add_context(max(0.0, elapsed_ms - summary_delta), final_selection)
@@ -1016,6 +1052,9 @@ class BasicMemoryAgent(AgentInterface):
                     yield "[Error: ToolExecutor not configured]"
                     return
 
+                tracker = get_latency_tracker()
+                if tracker:
+                    tracker.mark("tool_start")
                 tool_started = time.perf_counter()
                 tool_executor_iterator = self._tool_executor.execute_tools(
                     tool_calls=pending_tool_calls,
@@ -1035,6 +1074,7 @@ class BasicMemoryAgent(AgentInterface):
                     )
                 tracker = get_latency_tracker()
                 if tracker:
+                    tracker.mark("tool_end")
                     tracker.add_tool((time.perf_counter() - tool_started) * 1000)
 
                 if tool_results_for_llm:
@@ -1217,6 +1257,9 @@ class BasicMemoryAgent(AgentInterface):
                     yield "[Error: ToolExecutor/MCPClient not configured for OpenAI mode]"
                     continue
 
+                tracker = get_latency_tracker()
+                if tracker:
+                    tracker.mark("tool_start")
                 tool_started = time.perf_counter()
                 tool_executor_iterator = self._tool_executor.execute_tools(
                     tool_calls=pending_tool_calls,
@@ -1236,6 +1279,7 @@ class BasicMemoryAgent(AgentInterface):
                     )
                 tracker = get_latency_tracker()
                 if tracker:
+                    tracker.mark("tool_end")
                     tracker.add_tool((time.perf_counter() - tool_started) * 1000)
 
                 if tool_results_for_llm:

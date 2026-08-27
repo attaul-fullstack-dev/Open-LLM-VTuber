@@ -72,6 +72,7 @@ async def process_single_conversation(
         await latency.emit("backend-received")
         # Send initial signals
         await send_conversation_start_signals(websocket_send)
+        latency.mark("websocket_first_output")
         logger.info(f"New Conversation Chain {session_emoji} started!")
 
         # Process user input
@@ -90,6 +91,7 @@ async def process_single_conversation(
         # Store user message (check if we should skip storing to history)
         skip_history = metadata and metadata.get("skip_history", False)
         if context.history_uid and not skip_history:
+            save_started = time.perf_counter()
             store_message(
                 conf_uid=context.character_config.conf_uid,
                 history_uid=context.history_uid,
@@ -97,6 +99,7 @@ async def process_single_conversation(
                 content=input_text,
                 name=context.character_config.human_name,
             )
+            latency.add_history_save((time.perf_counter() - save_started) * 1000)
 
         if skip_history:
             logger.debug("Skipping storing user input to history (proactive speak)")
@@ -105,6 +108,7 @@ async def process_single_conversation(
         if images:
             logger.info(f"With {len(images)} images")
 
+        latency.mark("agent_start")
         try:
             # agent.chat yields Union[SentenceOutput, Dict[str, Any]]
             agent_output_stream = context.agent_engine.chat(batch_input)
@@ -116,6 +120,7 @@ async def process_single_conversation(
                 ):
                     # Handle tool status event: send WebSocket message
                     output_item["name"] = context.character_config.character_name
+                    output_item["request_id"] = latency.request_id
                     logger.debug(f"Sending tool status update: {output_item}")
 
                     await websocket_send(json.dumps(output_item))
@@ -132,7 +137,9 @@ async def process_single_conversation(
                         tts_manager=tts_manager,
                         translate_engine=context.translate_engine,
                     )
-                    latency.tts_ms += (time.perf_counter() - tts_started) * 1000
+                    latency.add_tts_enqueue(
+                        (time.perf_counter() - tts_started) * 1000
+                    )
                     # Ensure response_part is treated as a string before concatenation
                     response_part_str = (
                         str(response_part) if response_part is not None else ""
@@ -159,11 +166,17 @@ async def process_single_conversation(
                 )
             )
             # full_response will contain partial response before error
+        latency.mark("agent_end")
         # --- End processing agent response ---
 
         # Wait for any pending TTS tasks
         if tts_manager.task_list:
+            latency.mark("tts_wait_start")
             await asyncio.gather(*tts_manager.task_list)
+            latency.mark("tts_wait_end")
+            latency.add_tts_wait(
+                latency.phase_duration("tts_wait_start", "tts_wait_end") or 0.0
+            )
             await websocket_send(json.dumps({"type": "backend-synth-complete"}))
 
         await finalize_conversation_turn(
@@ -173,6 +186,7 @@ async def process_single_conversation(
         )
 
         if context.history_uid and full_response:  # Check full_response before storing
+            save_started = time.perf_counter()
             store_message(
                 conf_uid=context.character_config.conf_uid,
                 history_uid=context.history_uid,
@@ -181,6 +195,7 @@ async def process_single_conversation(
                 name=context.character_config.character_name,
                 avatar=context.character_config.avatar,
             )
+            latency.add_history_save((time.perf_counter() - save_started) * 1000)
             logger.info("AI response completed (characters={})", len(full_response))
             if not skip_history:
                 observer = getattr(
@@ -195,16 +210,20 @@ async def process_single_conversation(
                 if observer is not None:
                     event_started = time.perf_counter()
                     observer(input_text, full_response)
-                    latency.character_event_ms += (
-                        time.perf_counter() - event_started
-                    ) * 1000
+                    latency.add_time(
+                        "character_event_ms",
+                        (time.perf_counter() - event_started) * 1000,
+                    )
 
+        latency.mark("websocket_final_output")
         return full_response  # Return accumulated full_response
 
     except asyncio.CancelledError:
+        latency.interrupted = True
         logger.info(f"🤡👍 Conversation {session_emoji} cancelled because interrupted.")
         raise
     except Exception as e:
+        latency.internal_error = type(e).__name__
         logger.error(f"Error in conversation chain: {e}")
         await websocket_send(
             json.dumps({"type": "error", "message": f"Conversation error: {str(e)}"})
