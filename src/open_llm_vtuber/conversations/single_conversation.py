@@ -120,7 +120,9 @@ async def process_single_conversation(
                     raise RuntimeError(
                         "Active conversation agent does not support proactive chat"
                     )
-                agent_output_stream = proactive_chat()
+                agent_output_stream = proactive_chat(
+                    followup_context=(metadata or {}).get("proactive_followup")
+                )
             else:
                 # agent.chat yields Union[SentenceOutput, Dict[str, Any]]
                 agent_output_stream = context.agent_engine.chat(batch_input)

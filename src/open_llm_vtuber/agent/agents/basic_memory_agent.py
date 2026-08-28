@@ -21,6 +21,10 @@ from ...chat_history_manager import (
     get_metadata,
     update_summary_metadata,
 )
+from ...proactive_chat import (
+    ProactiveFollowupContext,
+    format_followup_instruction,
+)
 from ...character_state import (
     CharacterState,
     add_character_memory as persist_character_memory,
@@ -1390,12 +1394,18 @@ class BasicMemoryAgent(AgentInterface):
 
     def _proactive_chat_function_factory(
         self,
+        followup_context: Optional[
+            Union[Dict[str, Any], ProactiveFollowupContext]
+        ] = None,
     ) -> Callable[[], AsyncIterator[Union[SentenceOutput, Dict[str, Any]]]]:
         """Create an assistant-only turn using the normal character context.
 
         The generation cue is appended to the effective system prompt only for
         this request.  It never enters ``_memory`` or the persisted transcript.
         The generated assistant message does enter ``_memory`` normally.
+        ``followup_context`` carries the deterministic ignored-proactive state
+        (see ``proactive_chat.ProactiveFollowupContext``); it only shapes the
+        prompt and never triggers an extra model call.
         """
 
         @tts_filter(self._tts_preprocessor_config)
@@ -1433,6 +1443,15 @@ class BasicMemoryAgent(AgentInterface):
                     + proactive_instruction,
                 ]
             )
+            if isinstance(followup_context, dict):
+                parsed_followup = ProactiveFollowupContext.from_dict(followup_context)
+            else:
+                parsed_followup = followup_context
+            followup_block = format_followup_instruction(parsed_followup)
+            if followup_block:
+                current_system_prompt = "\n\n".join(
+                    [current_system_prompt, followup_block]
+                )
             try:
                 request_messages = await self._prepare_context_with_summary(
                     messages,
@@ -1467,9 +1486,12 @@ class BasicMemoryAgent(AgentInterface):
 
     async def chat_proactively(
         self,
+        followup_context: Optional[
+            Union[Dict[str, Any], ProactiveFollowupContext]
+        ] = None,
     ) -> AsyncIterator[Union[SentenceOutput, Dict[str, Any]]]:
         """Generate one proactive assistant message without a fake user turn."""
-        proactive_chat = self._proactive_chat_function_factory()
+        proactive_chat = self._proactive_chat_function_factory(followup_context)
         async for output in proactive_chat():
             yield output
 

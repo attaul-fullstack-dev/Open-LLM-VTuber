@@ -23,7 +23,10 @@ from src.open_llm_vtuber.conversations.single_conversation import (
 )
 from src.open_llm_vtuber.proactive_chat import (
     ProactiveChatConfig,
+    ProactiveFollowupContext,
     ProactiveStateMachine,
+    format_followup_instruction,
+    message_expects_response,
 )
 from src.open_llm_vtuber.request_latency import RequestLatencyTracker
 from src.open_llm_vtuber.websocket_handler import WebSocketHandler
@@ -400,6 +403,167 @@ class ProactiveGuardTests(unittest.IsolatedAsyncioTestCase):
         clock.advance(45)
         state.proactive_generation_in_progress = True
         self.assertFalse(machine.is_eligible(state))
+
+
+class ProactiveFollowupStateTests(unittest.TestCase):
+    """Deterministic ignored-proactive state; no LLM anywhere in this path."""
+
+    QUESTION = "Sekarang mau apa biar aktingnya berhenti?"
+    STATEMENT = "Gak usah senyum-senyum gitu..."
+
+    def _machine_and_state(self):
+        clock = _Clock()
+        machine = ProactiveStateMachine(
+            ProactiveChatConfig(
+                initial_idle_min_seconds=0,
+                initial_idle_max_seconds=0,
+                followup_idle_min_seconds=10,
+                followup_idle_max_seconds=10,
+            ),
+            monotonic=clock,
+            randint=lambda minimum, _maximum: minimum,
+        )
+        return machine, machine.new_state("chat")
+
+    def test_message_expects_response_detector(self):
+        self.assertTrue(message_expects_response(self.QUESTION))
+        self.assertTrue(message_expects_response("Kok gak jawab?"))
+        self.assertTrue(message_expects_response("Gimana sih"))
+        self.assertFalse(message_expects_response(self.STATEMENT))
+        self.assertFalse(message_expects_response("Lah, aku nanya loh."))
+        self.assertFalse(message_expects_response(None))
+        self.assertFalse(message_expects_response(""))
+
+    def test_proactive_question_ignored_yields_question_context(self):
+        machine, state = self._machine_and_state()
+        machine.record_proactive_sent(state, response_text=self.QUESTION)
+        context = machine.proactive_followup_context(state)
+        self.assertTrue(context.previous_proactive_ignored)
+        self.assertTrue(context.previous_proactive_expected_response)
+        self.assertEqual(context.consecutive_ignored, 1)
+
+    def test_proactive_statement_ignored_is_not_marked_as_question(self):
+        machine, state = self._machine_and_state()
+        machine.record_proactive_sent(state, response_text=self.STATEMENT)
+        context = machine.proactive_followup_context(state)
+        self.assertTrue(context.previous_proactive_ignored)
+        self.assertFalse(context.previous_proactive_expected_response)
+
+    def test_user_reply_clears_ignored_question_state(self):
+        machine, state = self._machine_and_state()
+        machine.record_proactive_sent(state, response_text=self.QUESTION)
+        machine.record_user_activity(state)
+        context = machine.proactive_followup_context(state)
+        self.assertFalse(context.previous_proactive_ignored)
+        self.assertFalse(context.previous_proactive_expected_response)
+        self.assertEqual(context.consecutive_ignored, 0)
+        self.assertIsNone(state.last_proactive_text)
+
+    def test_consecutive_ignored_count_is_exposed(self):
+        machine, state = self._machine_and_state()
+        for index, text in enumerate(
+            [self.QUESTION, self.STATEMENT, "Aku di sini."], start=1
+        ):
+            machine.record_proactive_sent(state, response_text=text)
+            self.assertEqual(
+                machine.proactive_followup_context(state).consecutive_ignored, index
+            )
+
+    def test_followup_context_dict_round_trip(self):
+        machine, state = self._machine_and_state()
+        machine.record_proactive_sent(state, response_text=self.QUESTION)
+        context = machine.proactive_followup_context(state)
+        self.assertEqual(ProactiveFollowupContext.from_dict(context.as_dict()), context)
+        self.assertIsNone(ProactiveFollowupContext.from_dict(None))
+        self.assertIsNone(ProactiveFollowupContext.from_dict("bogus"))
+
+
+class ProactiveFollowupPromptTests(unittest.IsolatedAsyncioTestCase):
+    """Contract: ignored context reaches the proactive prompt, nothing else."""
+
+    def setUp(self):
+        self._old_cwd = os.getcwd()
+        self._temp = tempfile.TemporaryDirectory()
+        os.chdir(self._temp.name)
+        self.conf_uid = "mili-proactive"
+        self.history_uid = create_new_history(self.conf_uid)
+        store_message(self.conf_uid, self.history_uid, "human", "Aku lagi belajar.")
+        store_message(self.conf_uid, self.history_uid, "ai", "Belajar apa?")
+
+    def tearDown(self):
+        os.chdir(self._old_cwd)
+        self._temp.cleanup()
+
+    @staticmethod
+    def _ignored_context(question: bool) -> ProactiveFollowupContext:
+        return ProactiveFollowupContext(
+            previous_proactive_ignored=True,
+            consecutive_ignored=1,
+            previous_proactive_expected_response=question,
+        )
+
+    async def test_ignored_question_reaches_proactive_prompt(self):
+        agent, llm = _make_agent(self.conf_uid, self.history_uid)
+        _ = [
+            output
+            async for output in agent.chat_proactively(
+                followup_context=self._ignored_context(question=True)
+            )
+        ]
+        system = llm.calls[-1]["system"]
+        self.assertIn("Internal follow-up context for this turn only", system)
+        self.assertIn("asked the user a direct question", system)
+        self.assertIn("unanswered question", system)
+        self.assertIn("never repeat the exact same question", system)
+
+    async def test_ignored_statement_does_not_claim_unanswered_question(self):
+        agent, llm = _make_agent(self.conf_uid, self.history_uid)
+        _ = [
+            output
+            async for output in agent.chat_proactively(
+                followup_context=self._ignored_context(question=False)
+            )
+        ]
+        system = llm.calls[-1]["system"]
+        self.assertIn("was a statement, not a question", system)
+        self.assertIn("do NOT claim the user failed to answer", system)
+        self.assertNotIn("asked the user a direct question", system)
+
+    async def test_no_ignored_context_produces_no_followup_block(self):
+        agent, llm = _make_agent(self.conf_uid, self.history_uid)
+        _ = [output async for output in agent.chat_proactively()]
+        self.assertNotIn(
+            "Internal follow-up context for this turn only", llm.calls[-1]["system"]
+        )
+
+    async def test_no_extra_llm_call_for_classification(self):
+        agent, llm = _make_agent(self.conf_uid, self.history_uid)
+        _ = [
+            output
+            async for output in agent.chat_proactively(
+                followup_context=self._ignored_context(question=True)
+            )
+        ]
+        self.assertEqual(len(llm.calls), 1)
+
+    def test_followup_instruction_contract(self):
+        question = format_followup_instruction(self._ignored_context(question=True))
+        self.assertIn("Consecutive proactive messages ignored: 1", question)
+        self.assertIn("mild confusion or teasing", question)
+        self.assertIn("more impatient or annoyed", question)
+        self.assertIn("resigned, sulking", question)
+        self.assertIn("never mention counters, timers", question)
+        statement = format_followup_instruction(self._ignored_context(question=False))
+        self.assertIn("do NOT claim the user failed to answer", statement)
+        answered = format_followup_instruction(
+            ProactiveFollowupContext(
+                previous_proactive_ignored=False,
+                consecutive_ignored=0,
+                previous_proactive_expected_response=True,
+            )
+        )
+        self.assertIsNone(answered)
+        self.assertIsNone(format_followup_instruction(None))
 
 
 if __name__ == "__main__":

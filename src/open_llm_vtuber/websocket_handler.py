@@ -288,6 +288,7 @@ class WebSocketHandler:
                     "ignored_count={}",
                     state.consecutive_ignored_proactive,
                 )
+                followup_context = machine.proactive_followup_context(state)
                 response = await process_single_conversation(
                     context=context,
                     websocket_send=websocket.send_text,
@@ -295,11 +296,14 @@ class WebSocketHandler:
                     user_input="",
                     images=None,
                     session_emoji=str(np.random.choice(EMOJI_LIST)),
-                    metadata={"request_origin": "proactive"},
+                    metadata={
+                        "request_origin": "proactive",
+                        "proactive_followup": followup_context.as_dict(),
+                    },
                 )
                 state.proactive_generation_in_progress = False
                 if response and revision == state.activity_revision:
-                    machine.record_proactive_sent(state)
+                    machine.record_proactive_sent(state, response_text=response)
                 elif revision != state.activity_revision:
                     # User activity arrived after generation had meaningfully
                     # started.  End this scheduler so the user handler can
