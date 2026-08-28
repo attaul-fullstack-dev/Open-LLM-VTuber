@@ -238,3 +238,41 @@ Temporary dev values: set `AVATAR_ACTIVITY_THRESHOLDS` in `avatar-activity-contr
 ## 32. Recommended Stage 3 integration point
 
 When autonomous **emotions** arrive, the natural seam is the same single per-frame hook already introduced here (`applyIdleOffsets` in `LAppModel._update`, before physics). Stage 3 should extend that seam with a separate, clearly-named emotion modulator that blends **facial** parameters (brows/mouth/cheek/eye-smile/form/effect) using the audit §7 recipes + Multiply for eye-open, while this Stage 2 hook continues to own only the tiny head/body/eye **movement** offsets. Keep ownership rules separate (movement hook ≠ emotion hook), keep lip-sync (`ParamA`) and blink (`EyeLOpen/ROpen`) untouched, and let both ride the same render loop.
+---
+
+## 33. Live Verification (post-commit fix round)
+
+Verified on-device (Android) after deployment. Initial field report: "no movement beyond pre-existing idle breathing". Root cause found with runtime instrumentation (a temporary same-origin beacon read from the backend access log) rather than guesses:
+
+### 33.1 Bug found: additive offsets were overwritten mid-update
+
+**Symptom:** controller produced offsets (`mag=1.96`), ids resolved, but nothing visibly moved.
+
+**Root cause:** the per-frame hook was originally placed **before** breath/physics/pose in `LAppModel.update()`. Those stages run `setParameterValueById` (absolute) afterwards, silently wiping the additive offsets every frame.
+
+**Proof (beacon readback):** `pCount=128` (mao_pro), `idxZ=2 / idxX=0 / idxBody=32 / idxEye=11` — every id handle resolves to a real parameter index; `pZ=-18.76` during a hold confirmed the parameter value actually changed in the Cubism model. Rendering path (`doDraw` → `drawModel`) uses the live parameter values, so once the write survived the update chain the motion was visible.
+
+**Fix:** moved the hook to the **end** of `LAppModel.update()`, immediately before `_model.update()` — after breath, physics, lipsync and pose — so nothing can overwrite it (`WebSDK/src/lappmodel.ts`). Also made the model re-link the registry hook when it changes, instead of caching the first hook forever.
+
+### 33.2 Dev-only test values (now reverted)
+
+For live diagnosis the safe defaults were temporarily exaggerated (`IDLE_OFFSET_RANGES` 18/10/14/4/0.6/0.6, quiet 1–2.5s, combined actions, thresholds 5s/15s, on-screen HUD + beacon). After the user confirmed movement, all were reverted to the safe committed values (ranges 9/5.4/6/1.2/0.25, quiet 4–10s/7–16s, thresholds 30s/120s), the HUD and beacon were removed, and a new bundle was deployed.
+
+### 33.3 Files touched in this round
+
+- `WebSDK/src/lappmodel.ts` — hook moved to end of update chain; re-link registry hook on change.
+- `hooks/canvas/use-live2d-idle-behavior.ts` — removed HUD + beacon (kept `window.__idleMotion` dev hook).
+- `components/canvas/live2d.tsx` — removed HUD overlay.
+- `utils/live2d-idle-offsets.ts` — safe defaults restored.
+- `utils/avatar-activity-controller.ts` — thresholds restored to 30s/120s.
+- `tests/live2d-idle-behavior.test.ts` — intensity test now injects explicit safe ranges (deterministic regardless of defaults).
+
+### 33.4 Test results
+
+| Suite | Result |
+|---|---|
+| `live2d-idle-behavior.test.ts` | 16/16 PASS |
+| `avatar-activity-controller.test.ts` | PASS |
+| `subtitle-playback.test.ts` | PASS |
+| `typecheck:web` (Stage 2 files) | no new errors |
+| `npm run build:web` | PASS |
