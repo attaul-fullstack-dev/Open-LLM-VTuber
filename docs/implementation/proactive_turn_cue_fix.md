@@ -240,7 +240,7 @@ cue append (final actual provider request message count):
 
 ## 32. Commit hash
 
-(filled in after commit — see commit message `fix: add ephemeral cue to proactive turns`)
+`8e0efd7` — `fix: add ephemeral cue to proactive turns` (branch `stage6-final-integration`, pushed to origin).
 
 ## 33. Live Android test procedure
 
