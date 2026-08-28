@@ -286,3 +286,13 @@ After on-device confirmation, the user asked for significantly bigger movement a
 - **Intensity:** 50–100% of configured range per event.
 - **Thresholds:** `AVATAR_ACTIVITY_THRESHOLDS` → `idleAfterMs: 5_000`, `longIdleAfterMs: 15_000`.
 - Lip-sync (`ParamA`), blink (`EyeLOpen/ROpen`), expressions, physics and drag remain untouched; speaking/drag/motion suppression and cooldowns unchanged.
+
+## 35. Drag-to-move + deeper zoom
+
+Per user request: move Mili by long-press + drag, and zoom in much closer.
+
+- **Drag-to-move (touch-reliable):** `use-live2d-model.ts` gesture handlers converted from mouse events to **pointer events** (down/move/up/cancel) with pointer capture, so press-hold-drag works on Android/touch reliably (previously only worked with a mouse). Hold >200ms + slight move (or move >5px) = drag; quick tap keeps the existing tap motions. A second finger cancels the drag so pinch-zoom owns it.
+- **Zoom range:** `LAppDefine.ViewMaxScale` 2.0 → **4.5**, `ViewMinScale` 0.8 → 0.5; `use-live2d-resize` MIN/MAX matched.
+- **Pinch-to-zoom:** 2-finger pinch on the canvas zooms smoothly via the view matrix.
+- **Zoom buttons:** the + / reset / − controls now show on **all screen sizes** (were mobile-only).
+- Wheel zoom (desktop) unchanged.
