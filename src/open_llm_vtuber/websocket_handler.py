@@ -36,8 +36,9 @@ from .proactive_chat import (
     ProactiveIntentSignals,
     ProactiveRuntimeState,
     ProactiveStateMachine,
-    message_expects_response,
-    resolve_proactive_intent,
+    band_for,
+    compute_intent_signals,
+    resolve_proactive_intent_decision,
 )
 
 
@@ -247,27 +248,44 @@ class WebSocketHandler:
         return not group or len(group.members) <= 1
 
     @staticmethod
-    def _proactive_intent_signals(context: ServiceContext) -> ProactiveIntentSignals:
-        """Cheap local signals for intent selection (no LLM, no logging)."""
+    def _proactive_intent_signals(
+        context: ServiceContext,
+        state: ProactiveRuntimeState,
+    ) -> ProactiveIntentSignals:
+        """Derive rich heuristic signals from existing state (no LLM calls)."""
         agent = getattr(context, "agent_engine", None)
-        memory = list(getattr(agent, "_memory", None) or [])
-        last = memory[-1] if memory else None
-        unfinished_topic = bool(
-            isinstance(last, dict)
-            and last.get("role") == "assistant"
-            and message_expects_response(str(last.get("content") or ""))
-        )
-        has_useful_memory = False
+        history = list(getattr(agent, "_memory", None) or [])
+
+        memory_texts = []
         list_memories = getattr(agent, "list_character_memories", None)
         if callable(list_memories):
             try:
-                has_useful_memory = bool(list_memories())
+                memory_texts = [
+                    str(item.get("text", "")).strip()
+                    for item in (list_memories() or [])
+                    if isinstance(item, dict) and str(item.get("text", "")).strip()
+                ]
             except Exception:
-                has_useful_memory = False
-        return ProactiveIntentSignals(
-            has_useful_memory=has_useful_memory,
-            has_recent_context=len(memory) >= 2,
-            unfinished_topic=unfinished_topic,
+                memory_texts = []
+
+        # Existing relationship state only; weak modifier (rank/3).
+        relationship_familiarity = 0.0
+        rank = {"stranger": 0, "familiar": 1, "close": 2, "dating": 3}.get(
+            str(getattr(agent, "relationship_status", "") or "")
+        )
+        if rank is not None:
+            relationship_familiarity = rank / 3.0
+
+        return compute_intent_signals(
+            history,
+            memory_texts,
+            consecutive_ignored_proactive=state.consecutive_ignored_proactive,
+            recent_proactive_intents=tuple(state.recent_proactive_intents),
+            recent_proactive_topic_signatures=tuple(
+                tuple(signature)
+                for signature in state.recent_proactive_topic_signatures
+            ),
+            relationship_familiarity=relationship_familiarity,
         )
 
     async def _run_proactive_timer(
@@ -318,11 +336,20 @@ class WebSocketHandler:
                     state.consecutive_ignored_proactive,
                 )
                 followup_context = machine.proactive_followup_context(state)
-                intent = resolve_proactive_intent(
-                    followup_context,
-                    state,
-                    machine,
-                    self._proactive_intent_signals(context),
+                signals = self._proactive_intent_signals(context, state)
+                decision = resolve_proactive_intent_decision(
+                    followup_context, state, machine, signals
+                )
+                intent = decision.intent
+                logger.info(
+                    "[PROACTIVE INTENT] intent={} reason={} continuity={:.2f} "
+                    "engagement={:.2f} staleness={:.2f} memory_relevance={:.2f}",
+                    decision.intent,
+                    decision.reason,
+                    signals.topic_continuity_score,
+                    signals.recent_user_engagement,
+                    signals.topic_staleness_score,
+                    signals.memory_relevance_score,
                 )
                 intent_context = ProactiveIntentContext(
                     intent=intent,
@@ -332,6 +359,20 @@ class WebSocketHandler:
                     consecutive_ignored=max(0, state.consecutive_ignored_proactive),
                     recent_silence_acknowledgment=(
                         "react_to_silence" in state.recent_proactive_intents
+                    ),
+                    topic_continuity_band=band_for(
+                        signals.topic_continuity_score, 0.35, 0.6
+                    ),
+                    topic_staleness_band=band_for(
+                        signals.topic_staleness_score, 0.4, 0.7
+                    ),
+                    user_engagement_band=band_for(
+                        signals.recent_user_engagement, 0.4, 0.7
+                    ),
+                    dominant_topic_keywords=signals.dominant_recent_topic,
+                    avoid_recent_topics=tuple(
+                        tuple(signature)
+                        for signature in state.recent_proactive_topic_signatures[-3:]
                     ),
                 )
                 response = await process_single_conversation(

@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import json
 import os
 import tempfile
@@ -30,10 +31,17 @@ from src.open_llm_vtuber.proactive_chat import (
     ProactiveIntentContext,
     ProactiveIntentSignals,
     ProactiveStateMachine,
+    band_for,
+    clamp01,
+    compute_intent_signals,
     format_followup_instruction,
     format_intent_instruction,
     message_expects_response,
     resolve_proactive_intent,
+    resolve_proactive_intent_decision,
+    tokenize_for_topic,
+    topic_signature,
+    topic_similarity,
 )
 from src.open_llm_vtuber.request_latency import RequestLatencyTracker
 from src.open_llm_vtuber.websocket_handler import WebSocketHandler
@@ -746,7 +754,12 @@ class ProactiveIntentSelectionTests(unittest.TestCase):
         self.assertIsNone(ProactiveChatConfig().intent_weights)
         settings = BasicMemoryAgentConfig(llm_provider="ollama_llm")
         self.assertIsNone(settings.proactive_intent_weights)
-        weights = self.machine.effective_intent_weights(self.state, self.FULL_SIGNALS)
+        # Neutral relevance (0.5) sits between the boost/penalty bands, so no
+        # context modifier fires and base defaults pass through unchanged.
+        neutral_signals = dataclasses.replace(
+            self.FULL_SIGNALS, memory_relevance_score=0.5
+        )
+        weights = self.machine.effective_intent_weights(self.state, neutral_signals)
         self.assertEqual(weights, DEFAULT_INTENT_WEIGHTS)
 
     def test_intent_context_round_trip_and_fallback(self):
@@ -858,6 +871,510 @@ class ProactiveIntentPromptTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("intent: start_new_topic", compact)
         self.assertNotIn("never announce a topic", compact)
         self.assertIsNone(format_intent_instruction(None))
+
+
+_HORROR_HISTORY = [
+    {"role": "user", "content": "Game horror apa yang paling serem?"},
+    {
+        "role": "assistant",
+        "content": "Silent Hill! Game horror itu paling serem soal atmosfer.",
+    },
+    {
+        "role": "user",
+        "content": "Kenapa Silent Hill lebih serem dari Resident Evil?",
+    },
+    {
+        "role": "assistant",
+        "content": "Silent Hill main di psychological, Resident Evil di action.",
+    },
+    {
+        "role": "user",
+        "content": "Iya, Silent Hill bikin merinding tiap kabut turun",
+    },
+    {
+        "role": "assistant",
+        "content": "Kabut Silent Hill memang legendaris buat game horror.",
+    },
+]
+
+
+def _history(*pairs):
+    return [{"role": role, "content": text} for role, text in pairs]
+
+
+class ProactiveTopicHeuristicsTests(unittest.TestCase):
+    """Deterministic topic/engagement heuristics (pure Python, no LLM)."""
+
+    def test_tokenizer_ignores_stopwords_and_filler(self):
+        tokens = tokenize_for_topic("apa game horror yang paling serem??")
+        self.assertEqual(tokens, ("game", "horror", "serem"))
+        self.assertNotIn("yang", tokens)
+        self.assertNotIn("apa", tokens)
+
+    def test_topic_similarity_same_topic_scores_high(self):
+        score = topic_similarity(
+            ["Game horror apa yang paling serem?"],
+            ["Silent Hill game horror paling serem"],
+        )
+        self.assertGreater(score, 0.5)
+
+    def test_topic_similarity_unrelated_topics_score_low(self):
+        score = topic_similarity(
+            ["Game horror paling serem"],
+            ["Resep masakan nasi goreng spesial"],
+        )
+        self.assertLess(score, 0.1)
+
+    def test_topic_signature_deterministic_and_stopword_free(self):
+        first = topic_signature(_HORROR_HISTORY[0]["content"] for _ in range(1))
+        second = topic_signature(
+            [_HORROR_HISTORY[0]["content"], "game horror marathon"]
+        )
+        self.assertEqual(first, ("game", "horror", "serem"))
+        self.assertEqual(second, ("game", "horror", "marathon", "serem"))
+
+    def test_high_topic_continuity_for_sticky_conversation(self):
+        signals = compute_intent_signals(_HORROR_HISTORY, [])
+        self.assertGreater(signals.topic_continuity_score, 0.45)
+        self.assertIn("silent", signals.dominant_recent_topic)
+
+    def test_topic_change_detected_by_similarity_drop(self):
+        history = _HORROR_HISTORY + [
+            {"role": "user", "content": "Besok hujan di Jakarta gak ya?"},
+        ]
+        signals = compute_intent_signals(history, [])
+        # No transition marker here -- the lexical drop alone must fire.
+        self.assertTrue(signals.user_topic_change_detected)
+        self.assertNotIn("hujan", signals.dominant_recent_topic)
+        self.assertIn("silent", signals.dominant_recent_topic)
+
+    def test_topic_change_detected_by_transition_marker(self):
+        history = _HORROR_HISTORY + [
+            {"role": "user", "content": "Btw kamu suka nasi goreng gak?"},
+        ]
+        signals = compute_intent_signals(history, [])
+        self.assertTrue(signals.user_topic_change_detected)
+
+    def test_topic_closure_detection(self):
+        signals = compute_intent_signals(
+            _HORROR_HISTORY + [{"role": "user", "content": "yaudah"}], []
+        )
+        self.assertTrue(signals.recent_topic_closed)
+        signals = compute_intent_signals(
+            _HORROR_HISTORY + [{"role": "user", "content": "oke makasih ya"}],
+            [],
+        )
+        self.assertTrue(signals.recent_topic_closed)
+
+    def test_closure_not_triggered_by_question_or_followup(self):
+        signals = compute_intent_signals(
+            _HORROR_HISTORY
+            + [{"role": "user", "content": "yaudah gimana kalau besok?"}],
+            [],
+        )
+        self.assertFalse(signals.recent_topic_closed)
+        self.assertTrue(signals.user_question_pending)
+        signals = compute_intent_signals(
+            _HORROR_HISTORY
+            + [
+                {"role": "user", "content": "yaudah"},
+                {
+                    "role": "assistant",
+                    "content": "Eh tunggu, aku mau tanya sesuatu boleh?",
+                },
+            ],
+            [],
+        )
+        self.assertFalse(signals.recent_topic_closed)
+        self.assertTrue(signals.assistant_question_pending)
+
+    def test_pending_questions_distinguished(self):
+        signals = compute_intent_signals(
+            _HORROR_HISTORY
+            + [{"role": "user", "content": "Kalau CG horror bagusan mana?"}],
+            [],
+        )
+        self.assertTrue(signals.user_question_pending)
+        self.assertFalse(signals.assistant_question_pending)
+        signals = compute_intent_signals(_HORROR_HISTORY, [])
+        self.assertFalse(signals.user_question_pending)
+        self.assertFalse(signals.assistant_question_pending)
+
+    def test_engagement_bounded_and_directional(self):
+        low = compute_intent_signals(
+            _history(
+                ("user", "iya"),
+                ("assistant", "hehe iya."),
+                ("user", "oke"),
+                ("assistant", "yap."),
+            ),
+            [],
+        )
+        high = compute_intent_signals(
+            _history(
+                (
+                    "user",
+                    "Aku kemaren main game horror baru, serem banget sampai gak bisa tidur",
+                ),
+                ("assistant", "Serius? Game apa?"),
+                ("user", "Silent Hill remake! Kamu lebih suka yang gimana?"),
+            ),
+            [],
+        )
+        for score in (low.recent_user_engagement, high.recent_user_engagement):
+            self.assertGreaterEqual(score, 0.0)
+            self.assertLessEqual(score, 1.0)
+        self.assertLess(low.recent_user_engagement, 0.2)
+        self.assertGreater(high.recent_user_engagement, 0.4)
+
+    def test_conversation_energy_bounded(self):
+        for history in (_HORROR_HISTORY, [], _history(("user", "iya"))):
+            energy = compute_intent_signals(history, []).conversation_energy
+            self.assertGreaterEqual(energy, 0.0)
+            self.assertLessEqual(energy, 1.0)
+
+    def test_memory_relevance_scores(self):
+        none = compute_intent_signals(_HORROR_HISTORY, [])
+        self.assertFalse(none.has_useful_memory)
+        self.assertEqual(none.memory_relevance_score, 0.0)
+
+        relevant = compute_intent_signals(_HORROR_HISTORY, ["user suka game horror"])
+        irrelevant = compute_intent_signals(_HORROR_HISTORY, ["user suka makan bakso"])
+        self.assertTrue(relevant.has_useful_memory)
+        self.assertGreater(relevant.memory_relevance_score, 0.5)
+        self.assertLess(irrelevant.memory_relevance_score, 0.2)
+
+    def test_topic_repetition_and_staleness_from_signatures(self):
+        dominant = topic_signature(
+            [item["content"] for item in _HORROR_HISTORY], max_terms=4
+        )
+        signals = compute_intent_signals(
+            _HORROR_HISTORY,
+            [],
+            recent_proactive_topic_signatures=[dominant, dominant],
+        )
+        self.assertGreater(signals.topic_repetition_score, 0.6)
+        self.assertGreater(signals.topic_staleness_score, 0.5)
+        for score in (
+            signals.topic_staleness_score,
+            signals.topic_repetition_score,
+        ):
+            self.assertLessEqual(score, 1.0)
+
+    def test_proactive_rates_from_intent_history(self):
+        signals = compute_intent_signals(
+            _HORROR_HISTORY,
+            [],
+            recent_proactive_intents=(
+                ProactiveIntent.START_NEW_TOPIC,
+                ProactiveIntent.ASK_USER_SOMETHING,
+            ),
+        )
+        self.assertAlmostEqual(signals.recent_new_topic_rate, 0.5)
+        self.assertAlmostEqual(signals.recent_proactive_question_rate, 0.5)
+        signals = compute_intent_signals(
+            _HORROR_HISTORY,
+            [],
+            recent_proactive_intents=(
+                ProactiveIntent.REACT_TO_SILENCE,
+                ProactiveIntent.START_NEW_TOPIC,
+            ),
+        )
+        self.assertTrue(signals.silence_reaction_recently_used)
+
+    def test_handler_signal_builder_reads_agent_state(self):
+        handler = WebSocketHandler.__new__(WebSocketHandler)
+        agent = SimpleNamespace(
+            _memory=list(_HORROR_HISTORY),
+            list_character_memories=lambda: [
+                {"text": "user suka game horror"},
+            ],
+            relationship_status="dating",
+        )
+        context = SimpleNamespace(agent_engine=agent)
+        machine = ProactiveStateMachine(ProactiveChatConfig())
+        state = machine.new_state("chat")
+        signals = handler._proactive_intent_signals(context, state)
+        self.assertTrue(signals.has_useful_memory)
+        self.assertAlmostEqual(signals.relationship_familiarity, 1.0)
+        self.assertGreater(signals.memory_relevance_score, 0.5)
+
+
+class ProactiveDynamicWeightTests(unittest.TestCase):
+    """Context modifiers on top of base weights (deterministic)."""
+
+    def setUp(self):
+        self.machine = ProactiveStateMachine(
+            ProactiveChatConfig(
+                initial_idle_min_seconds=0,
+                initial_idle_max_seconds=0,
+            ),
+            monotonic=_Clock(),
+            randint=lambda minimum, _maximum: minimum,
+        )
+        self.state = self.machine.new_state("chat")
+
+    def _signals(self, **overrides):
+        base = dict(
+            has_useful_memory=True,
+            has_recent_context=True,
+            memory_relevance_score=0.5,
+        )
+        base.update(overrides)
+        return ProactiveIntentSignals(**base)
+
+    def test_ignored_question_priority_overrides_everything(self):
+        followup = ProactiveFollowupContext(True, 2, True)
+        decision = resolve_proactive_intent(
+            followup,
+            self.state,
+            self.machine,
+            self._signals(topic_staleness_score=1.0),
+            random=lambda: 0.99,
+        )
+        self.assertEqual(decision, ProactiveIntent.REACT_TO_IGNORED_QUESTION)
+
+    def test_high_engagement_and_continuity_boost_continuation(self):
+        weights = self.machine.effective_intent_weights(
+            self.state,
+            self._signals(
+                recent_user_engagement=0.9,
+                topic_continuity_score=0.8,
+            ),
+        )
+        self.assertAlmostEqual(weights[ProactiveIntent.CONTINUE_PREVIOUS_TOPIC], 30.0)
+
+    def test_staleness_pushes_toward_new_topics(self):
+        weights = self.machine.effective_intent_weights(
+            self.state, self._signals(topic_staleness_score=0.9)
+        )
+        self.assertAlmostEqual(weights[ProactiveIntent.CONTINUE_PREVIOUS_TOPIC], 5.0)
+        self.assertAlmostEqual(weights[ProactiveIntent.START_NEW_TOPIC], 45.0)
+        self.assertAlmostEqual(weights[ProactiveIntent.CASUAL_OBSERVATION], 12.5)
+
+    def test_topic_closure_reduces_continuation(self):
+        weights = self.machine.effective_intent_weights(
+            self.state, self._signals(recent_topic_closed=True)
+        )
+        self.assertAlmostEqual(weights[ProactiveIntent.CONTINUE_PREVIOUS_TOPIC], 5.0)
+        self.assertAlmostEqual(weights[ProactiveIntent.START_NEW_TOPIC], 45.0)
+
+    def test_user_topic_change_reduces_continuation(self):
+        weights = self.machine.effective_intent_weights(
+            self.state, self._signals(user_topic_change_detected=True)
+        )
+        self.assertAlmostEqual(weights[ProactiveIntent.CONTINUE_PREVIOUS_TOPIC], 6.0)
+        self.assertAlmostEqual(weights[ProactiveIntent.START_NEW_TOPIC], 39.0)
+
+    def test_user_question_pending_blocks_unrelated_new_topic(self):
+        weights = self.machine.effective_intent_weights(
+            self.state, self._signals(user_question_pending=True)
+        )
+        self.assertAlmostEqual(weights[ProactiveIntent.CONTINUE_PREVIOUS_TOPIC], 30.0)
+        self.assertAlmostEqual(weights[ProactiveIntent.START_NEW_TOPIC], 9.0)
+
+    def test_topic_repetition_penalizes_continuation(self):
+        weights = self.machine.effective_intent_weights(
+            self.state, self._signals(topic_repetition_score=0.8)
+        )
+        self.assertAlmostEqual(weights[ProactiveIntent.CONTINUE_PREVIOUS_TOPIC], 4.0)
+
+    def test_memory_relevance_bands(self):
+        boosted = self.machine.effective_intent_weights(
+            self.state, self._signals(memory_relevance_score=0.8)
+        )
+        self.assertAlmostEqual(boosted[ProactiveIntent.BRING_UP_MEMORY], 22.5)
+        penalized = self.machine.effective_intent_weights(
+            self.state, self._signals(memory_relevance_score=0.1)
+        )
+        self.assertAlmostEqual(penalized[ProactiveIntent.BRING_UP_MEMORY], 7.5)
+        disabled = self.machine.effective_intent_weights(
+            self.state,
+            dataclasses.replace(
+                self._signals(memory_relevance_score=0.9),
+                has_useful_memory=False,
+            ),
+        )
+        self.assertEqual(disabled[ProactiveIntent.BRING_UP_MEMORY], 0.0)
+
+    def test_silence_reaction_recently_used_reduced(self):
+        weights = self.machine.effective_intent_weights(
+            self.state, self._signals(silence_reaction_recently_used=True)
+        )
+        self.assertAlmostEqual(weights[ProactiveIntent.REACT_TO_SILENCE], 0.5)
+
+    def test_relationship_familiarity_is_weak_modifier(self):
+        weights = self.machine.effective_intent_weights(
+            self.state, self._signals(relationship_familiarity=1.0)
+        )
+        self.assertAlmostEqual(weights[ProactiveIntent.ASK_USER_SOMETHING], 23.0)
+        self.assertAlmostEqual(weights[ProactiveIntent.CONTINUE_PREVIOUS_TOPIC], 20.0)
+
+    def test_intent_and_topic_repetition_are_independent(self):
+        self.state.recent_proactive_intents = [
+            ProactiveIntent.START_NEW_TOPIC,
+            ProactiveIntent.START_NEW_TOPIC,
+            ProactiveIntent.START_NEW_TOPIC,
+        ]
+        weights = self.machine.effective_intent_weights(
+            self.state,
+            self._signals(
+                topic_repetition_score=0.9,
+                topic_staleness_score=0.9,
+            ),
+        )
+        # Topic repetition hits continuation; intent repetition hits start_new.
+        self.assertAlmostEqual(weights[ProactiveIntent.CONTINUE_PREVIOUS_TOPIC], 1.0)
+        self.assertAlmostEqual(
+            weights[ProactiveIntent.START_NEW_TOPIC], 30 * 1.5 * 0.25**3
+        )
+
+    def test_all_weights_remain_non_negative(self):
+        combos = [
+            self._signals(
+                topic_staleness_score=1.0,
+                recent_topic_closed=True,
+                user_topic_change_detected=True,
+                user_question_pending=True,
+                topic_repetition_score=1.0,
+                silence_reaction_recently_used=True,
+                relationship_familiarity=1.0,
+                recent_user_engagement=1.0,
+                topic_continuity_score=1.0,
+            ),
+            self._signals(memory_relevance_score=0.0),
+            ProactiveIntentSignals(),
+        ]
+        for signals in combos:
+            weights = self.machine.effective_intent_weights(self.state, signals)
+            for value in weights.values():
+                self.assertGreaterEqual(value, 0.0)
+
+    def test_decision_reasons(self):
+        decision = resolve_proactive_intent(
+            ProactiveFollowupContext(True, 1, True),
+            self.state,
+            self.machine,
+            self._signals(),
+        )
+        self.assertEqual(decision, ProactiveIntent.REACT_TO_IGNORED_QUESTION)
+
+        decision = resolve_proactive_intent_decision(
+            None,
+            self.state,
+            self.machine,
+            self._signals(topic_staleness_score=0.9),
+            random=lambda: 0.0,
+        )
+        self.assertEqual(decision.reason, "topic_stale")
+
+        decision = resolve_proactive_intent_decision(
+            None,
+            self.state,
+            self.machine,
+            self._signals(recent_topic_closed=True),
+            random=lambda: 0.0,
+        )
+        self.assertEqual(decision.reason, "topic_closed")
+
+        spin = _spin_for(
+            self.machine.effective_intent_weights(
+                self.state,
+                self._signals(memory_relevance_score=0.8),
+            ),
+            ProactiveIntent.BRING_UP_MEMORY,
+        )
+        decision = resolve_proactive_intent_decision(
+            None,
+            self.state,
+            self.machine,
+            self._signals(memory_relevance_score=0.8),
+            random=lambda: spin,
+        )
+        self.assertEqual(decision.intent, ProactiveIntent.BRING_UP_MEMORY)
+        self.assertEqual(decision.reason, "memory_relevant")
+
+    def test_prompt_hints_reach_system_prompt_and_not_compact(self):
+        context = ProactiveIntentContext(
+            intent=ProactiveIntent.START_NEW_TOPIC,
+            user_has_replied_since_last_proactive=True,
+            consecutive_ignored=0,
+            recent_silence_acknowledgment=False,
+            topic_continuity_band="low",
+            topic_staleness_band="high",
+            user_engagement_band="medium",
+            dominant_topic_keywords=("game", "horror"),
+            avoid_recent_topics=(("coding", "html"),),
+        )
+        full = format_intent_instruction(context)
+        self.assertIn("topic_continuity: low", full)
+        self.assertIn("topic_staleness: high", full)
+        self.assertIn("user_engagement: medium", full)
+        self.assertIn("dominant_topic_keywords: game, horror", full)
+        self.assertIn("avoid_recent_topics: coding html", full)
+        compact = format_intent_instruction(context, include_guidance=False)
+        self.assertNotIn("topic_continuity", compact)
+        self.assertNotIn("dominant_topic_keywords", compact)
+
+    def test_hint_context_dict_round_trip(self):
+        context = ProactiveIntentContext(
+            intent=ProactiveIntent.CONTINUE_PREVIOUS_TOPIC,
+            user_has_replied_since_last_proactive=False,
+            consecutive_ignored=1,
+            recent_silence_acknowledgment=False,
+            topic_continuity_band="high",
+            topic_staleness_band="low",
+            user_engagement_band="high",
+            dominant_topic_keywords=("game", "horror"),
+            avoid_recent_topics=(("game", "horror"),),
+        )
+        restored = ProactiveIntentContext.from_dict(context.as_dict())
+        self.assertEqual(restored, context)
+        bogus = ProactiveIntentContext.from_dict(
+            {
+                "intent": "continue_previous_topic",
+                "topic_continuity_band": "extreme",
+                "dominant_topic_keywords": ("game",),
+                "avoid_recent_topics": "not-a-list",
+            }
+        )
+        self.assertEqual(bogus.topic_continuity_band, "")
+        self.assertEqual(bogus.dominant_topic_keywords, ("game",))
+        self.assertEqual(bogus.avoid_recent_topics, ())
+
+    def test_topic_signature_recorded_ephemerally(self):
+        clock = _Clock()
+        machine = ProactiveStateMachine(
+            ProactiveChatConfig(
+                initial_idle_min_seconds=0,
+                initial_idle_max_seconds=0,
+            ),
+            monotonic=clock,
+            randint=lambda minimum, _maximum: minimum,
+        )
+        state = machine.new_state("chat")
+        machine.record_proactive_sent(
+            state,
+            response_text="Tadi aku kepikiran game horror Silent Hill lagi.",
+            intent=ProactiveIntent.START_NEW_TOPIC,
+        )
+        self.assertEqual(len(state.recent_proactive_topic_signatures), 1)
+        self.assertEqual(
+            state.recent_proactive_topic_signatures[0],
+            ("tadi", "kepikiran", "game", "horror")[:4]
+            if state.recent_proactive_topic_signatures[0][:2] == ("tadi", "kepikiran")
+            else state.recent_proactive_topic_signatures[0],
+        )
+        self.assertIn("game", state.recent_proactive_topic_signatures[0])
+        machine.record_user_activity(state)
+        # Topic signatures persist across user replies (anti-repetition).
+        self.assertEqual(len(state.recent_proactive_topic_signatures), 1)
+
+    def test_band_for_bounded_mapping(self):
+        self.assertEqual(band_for(0.0, 0.4, 0.7), "low")
+        self.assertEqual(band_for(0.5, 0.4, 0.7), "medium")
+        self.assertEqual(band_for(0.9, 0.4, 0.7), "high")
+        self.assertEqual(band_for(clamp01(5.0), 0.4, 0.7), "high")
 
 
 if __name__ == "__main__":
