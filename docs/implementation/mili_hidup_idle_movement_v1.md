@@ -276,3 +276,13 @@ For live diagnosis the safe defaults were temporarily exaggerated (`IDLE_OFFSET_
 | `subtitle-playback.test.ts` | PASS |
 | `typecheck:web` (Stage 2 files) | no new errors |
 | `npm run build:web` | PASS |
+
+## 34. Tuning per user request (livelier)
+
+After on-device confirmation, the user asked for significantly bigger movement and faster idle thresholds. Final production values:
+
+- **Ranges:** head `AngleX ±16°`, `AngleY ±10°`, `AngleZ ±14°`, body `BodyAngleX ±3.5°`, eyes `EyeBallX/Y ±0.5` (well inside mao_pro's param min/max: Angle ±30, BodyAngle ±10, Eye ±1).
+- **Actions:** combined whole-silhouette turns (head + body + eyes together), e.g. `look_left`, `tilt_right`, `body_lean_left`, with anti-repetition on action ids.
+- **Intensity:** 40–90% of configured range per event.
+- **Thresholds:** `AVATAR_ACTIVITY_THRESHOLDS` → `idleAfterMs: 5_000`, `longIdleAfterMs: 15_000`.
+- Lip-sync (`ParamA`), blink (`EyeLOpen/ROpen`), expressions, physics and drag remain untouched; speaking/drag/motion suppression and cooldowns unchanged.
