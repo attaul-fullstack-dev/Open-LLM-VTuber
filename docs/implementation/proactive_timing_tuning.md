@@ -26,6 +26,25 @@ No proactive follow-up window exceeds **60 seconds**.
 - `src/open_llm_vtuber/config_manager/agent.py` — config schema defaults + `DESCRIPTIONS` docs
 - `tests/test_proactive_chat.py` — updated default-contract + timing assertions, added new timing tests
 
+## ## 3b. Live Verification: conf.yaml Override (IMPORTANT)
+
+After deploying the code change, live testing showed the second proactive was
+still slow (2+ min). Root cause: the running deployment loads timing from
+**`conf.yaml`**, which explicitly overrode the new defaults with the old values:
+
+```
+followup_idle_min_seconds: 90
+followup_idle_max_seconds: 240
+backoff_min_seconds: 180
+backoff_max_seconds: 360
+```
+
+Updated `conf.yaml` to the new values (25/50 and 45/60). `conf.yaml` is
+**untracked** (deliberately excluded in commit `84e27ab`), so it is a
+local-per-deployment override and is not part of the committed patch. The
+committed defaults/schema only take effect when the deployment config does not
+override them.
+
 ## 4. Centralized Timing Location
 
 Two centralized sources, updated identically:
