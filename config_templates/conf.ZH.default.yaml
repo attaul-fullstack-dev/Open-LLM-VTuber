@@ -85,11 +85,11 @@ character_config:
         proactive_enabled: True
         initial_idle_min_seconds: 45
         initial_idle_max_seconds: 90
-        followup_idle_min_seconds: 90
-        followup_idle_max_seconds: 240
+        followup_idle_min_seconds: 25
+        followup_idle_max_seconds: 50
         ignored_before_backoff: 3
-        backoff_min_seconds: 180
-        backoff_max_seconds: 360
+        backoff_min_seconds: 45
+        backoff_max_seconds: 60
         # semantic 由同一次主动对话生成请求选择方向；heuristic 保留 v2 加权选择器。
         proactive_intent_strategy: semantic
 
