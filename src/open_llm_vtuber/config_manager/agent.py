@@ -44,6 +44,14 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
     summary_min_new_messages: int = Field(
         4, gt=0, alias="summary_min_new_messages"
     )
+    proactive_enabled: bool = Field(True, alias="proactive_enabled")
+    initial_idle_min_seconds: int = Field(45, ge=0, alias="initial_idle_min_seconds")
+    initial_idle_max_seconds: int = Field(90, ge=0, alias="initial_idle_max_seconds")
+    followup_idle_min_seconds: int = Field(90, ge=0, alias="followup_idle_min_seconds")
+    followup_idle_max_seconds: int = Field(240, ge=0, alias="followup_idle_max_seconds")
+    ignored_before_backoff: int = Field(3, gt=0, alias="ignored_before_backoff")
+    backoff_min_seconds: int = Field(180, ge=0, alias="backoff_min_seconds")
+    backoff_max_seconds: int = Field(360, ge=0, alias="backoff_max_seconds")
 
     DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
         "llm_provider": Description(
@@ -93,6 +101,38 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
         "summary_min_new_messages": Description(
             en="Minimum newly evicted messages before updating a summary (default: 4)",
             zh="更新摘要前至少新增的被裁剪消息数（默认：4）",
+        ),
+        "proactive_enabled": Description(
+            en="Allow the character to initiate chat after randomized idle periods",
+            zh="允许角色在随机空闲时间后主动发起聊天",
+        ),
+        "initial_idle_min_seconds": Description(
+            en="Minimum initial idle delay before proactive chat (default: 45 seconds)",
+            zh="首次主动聊天前的最短空闲时间（默认：45 秒）",
+        ),
+        "initial_idle_max_seconds": Description(
+            en="Maximum initial idle delay before proactive chat (default: 90 seconds)",
+            zh="首次主动聊天前的最长空闲时间（默认：90 秒）",
+        ),
+        "followup_idle_min_seconds": Description(
+            en="Minimum delay after an ignored proactive message (default: 90 seconds)",
+            zh="主动消息未回复后的最短间隔（默认：90 秒）",
+        ),
+        "followup_idle_max_seconds": Description(
+            en="Maximum delay after an ignored proactive message (default: 240 seconds)",
+            zh="主动消息未回复后的最长间隔（默认：240 秒）",
+        ),
+        "ignored_before_backoff": Description(
+            en="Ignored proactive messages before applying backoff (default: 3)",
+            zh="触发退避前连续未回复的主动消息数（默认：3）",
+        ),
+        "backoff_min_seconds": Description(
+            en="Minimum proactive backoff delay (default: 180 seconds)",
+            zh="主动聊天退避的最短时间（默认：180 秒）",
+        ),
+        "backoff_max_seconds": Description(
+            en="Maximum proactive backoff delay (default: 360 seconds)",
+            zh="主动聊天退避的最长时间（默认：360 秒）",
         ),
     }
 

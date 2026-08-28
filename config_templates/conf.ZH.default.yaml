@@ -81,6 +81,15 @@ character_config:
         summary_max_tokens: 384
         # 一次摘要更新前最少新增的被裁剪消息数。
         summary_min_new_messages: 4
+        # 允许角色在随机空闲时间后主动发起聊天。
+        proactive_enabled: True
+        initial_idle_min_seconds: 45
+        initial_idle_max_seconds: 90
+        followup_idle_min_seconds: 90
+        followup_idle_max_seconds: 240
+        ignored_before_backoff: 3
+        backoff_min_seconds: 180
+        backoff_max_seconds: 360
 
       hume_ai_agent:
         api_key: ''

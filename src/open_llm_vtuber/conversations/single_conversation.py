@@ -55,6 +55,7 @@ async def process_single_conversation(
     # Create TTSTaskManager for this conversation
     tts_manager = TTSTaskManager()
     full_response = ""  # Initialize full_response here
+    proactive = bool((metadata or {}).get("request_origin") == "proactive")
     llm = getattr(context.agent_engine, "_llm", None)
     base_url = str(getattr(llm, "base_url", ""))
     provider = "ollama_cloud" if "ollama.com" in base_url else type(llm).__name__
@@ -62,6 +63,7 @@ async def process_single_conversation(
         websocket_send=websocket_send,
         provider=provider,
         model=str(getattr(llm, "model", "unknown")),
+        request_origin="proactive" if proactive else "user",
         request_id=(metadata or {}).get("latency_request_id") or uuid.uuid4().hex,
         client_user_send_ms=(metadata or {}).get("client_user_send_ms"),
         client_websocket_send_ms=(metadata or {}).get("client_websocket_send_ms"),
@@ -75,43 +77,53 @@ async def process_single_conversation(
         latency.mark("websocket_first_output")
         logger.info(f"New Conversation Chain {session_emoji} started!")
 
-        # Process user input
-        input_text = await process_user_input(
-            user_input, context.asr_engine, websocket_send
-        )
-
-        # Create batch input
-        batch_input = create_batch_input(
-            input_text=input_text,
-            images=images,
-            from_name=context.character_config.human_name,
-            metadata=metadata,
-        )
-
-        # Store user message (check if we should skip storing to history)
-        skip_history = metadata and metadata.get("skip_history", False)
-        if context.history_uid and not skip_history:
-            save_started = time.perf_counter()
-            store_message(
-                conf_uid=context.character_config.conf_uid,
-                history_uid=context.history_uid,
-                role="human",
-                content=input_text,
-                name=context.character_config.human_name,
+        skip_history = bool(metadata and metadata.get("skip_history", False))
+        input_text = ""
+        batch_input = None
+        if proactive:
+            logger.info("Starting proactive assistant turn")
+        else:
+            # Process and persist a real user input exactly as before.
+            input_text = await process_user_input(
+                user_input, context.asr_engine, websocket_send
             )
-            latency.add_history_save((time.perf_counter() - save_started) * 1000)
+            batch_input = create_batch_input(
+                input_text=input_text,
+                images=images,
+                from_name=context.character_config.human_name,
+                metadata=metadata,
+            )
 
-        if skip_history:
-            logger.debug("Skipping storing user input to history (proactive speak)")
+            if context.history_uid and not skip_history:
+                save_started = time.perf_counter()
+                store_message(
+                    conf_uid=context.character_config.conf_uid,
+                    history_uid=context.history_uid,
+                    role="human",
+                    content=input_text,
+                    name=context.character_config.human_name,
+                )
+                latency.add_history_save((time.perf_counter() - save_started) * 1000)
 
-        logger.info("User input received (characters={})", len(input_text))
-        if images:
-            logger.info(f"With {len(images)} images")
+            if skip_history:
+                logger.debug("Skipping storing user input to history")
+
+            logger.info("User input received (characters={})", len(input_text))
+            if images:
+                logger.info(f"With {len(images)} images")
 
         latency.mark("agent_start")
         try:
-            # agent.chat yields Union[SentenceOutput, Dict[str, Any]]
-            agent_output_stream = context.agent_engine.chat(batch_input)
+            if proactive:
+                proactive_chat = getattr(context.agent_engine, "chat_proactively", None)
+                if not callable(proactive_chat):
+                    raise RuntimeError(
+                        "Active conversation agent does not support proactive chat"
+                    )
+                agent_output_stream = proactive_chat()
+            else:
+                # agent.chat yields Union[SentenceOutput, Dict[str, Any]]
+                agent_output_stream = context.agent_engine.chat(batch_input)
 
             async for output_item in agent_output_stream:
                 if (
@@ -197,7 +209,7 @@ async def process_single_conversation(
             )
             latency.add_history_save((time.perf_counter() - save_started) * 1000)
             logger.info("AI response completed (characters={})", len(full_response))
-            if not skip_history:
+            if not skip_history and not proactive:
                 observer = getattr(
                     context.agent_engine,
                     "observe_character_events",

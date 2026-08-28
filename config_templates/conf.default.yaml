@@ -81,6 +81,15 @@ character_config:
         summary_max_tokens: 384
         # Minimum newly evicted messages before one summary update.
         summary_min_new_messages: 4
+        # Let the character initiate chat after randomized idle periods.
+        proactive_enabled: True
+        initial_idle_min_seconds: 45
+        initial_idle_max_seconds: 90
+        followup_idle_min_seconds: 90
+        followup_idle_max_seconds: 240
+        ignored_before_backoff: 3
+        backoff_min_seconds: 180
+        backoff_max_seconds: 360
 
       letta_agent:
         host: 'localhost' # Host address

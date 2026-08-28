@@ -300,6 +300,7 @@ class RequestLatencyTracker:
     )
     client_user_send_ms: Optional[float] = None
     client_websocket_send_ms: Optional[float] = None
+    request_origin: str = "user"
     started_ms: float = field(default_factory=monotonic_ms)
     received_epoch_ms: float = field(default_factory=lambda: time.time() * 1000.0)
 
@@ -671,6 +672,7 @@ class RequestLatencyTracker:
 
         values: dict[str, Any] = {
             "request_id": self.request_id,
+            "request_origin": self.request_origin,
             "provider": self.provider,
             "model": self.model,
             "request_outcome": self._compute_outcome(),

@@ -1388,6 +1388,91 @@ class BasicMemoryAgent(AgentInterface):
 
         return chat_with_memory
 
+    def _proactive_chat_function_factory(
+        self,
+    ) -> Callable[[], AsyncIterator[Union[SentenceOutput, Dict[str, Any]]]]:
+        """Create an assistant-only turn using the normal character context.
+
+        The generation cue is appended to the effective system prompt only for
+        this request.  It never enters ``_memory`` or the persisted transcript.
+        The generated assistant message does enter ``_memory`` normally.
+        """
+
+        @tts_filter(self._tts_preprocessor_config)
+        @display_processor()
+        @actions_extractor(self._live2d_model)
+        @sentence_divider(
+            faster_first_response=self._faster_first_response,
+            segment_method=self._segment_method,
+            valid_tags=["think"],
+        )
+        async def proactive_with_memory() -> AsyncIterator[Union[str, Dict[str, Any]]]:
+            self.reset_interrupt()
+            self.prompt_mode_flag = False
+
+            messages = self._memory.copy()
+            try:
+                prompt_name = self._tool_prompts.get(
+                    "proactive_speak_prompt", "proactive_speak_prompt"
+                )
+                proactive_instruction = prompt_loader.load_util(prompt_name).strip()
+            except Exception as error:
+                logger.warning(
+                    "Proactive prompt unavailable; using safe fallback: type={}",
+                    type(error).__name__,
+                )
+                proactive_instruction = (
+                    "Initiate one natural, context-aware message as the character. "
+                    "Do not mention timers or system behavior."
+                )
+
+            current_system_prompt = "\n\n".join(
+                [
+                    self._relationship_system_prompt(self._system),
+                    "Internal instruction for this turn only:\n"
+                    + proactive_instruction,
+                ]
+            )
+            try:
+                request_messages = await self._prepare_context_with_summary(
+                    messages,
+                    current_system_prompt,
+                    protected_start=len(messages),
+                )
+            except ContextBudgetExceeded as error:
+                logger.warning(
+                    "Proactive generation skipped because context does not fit: {}",
+                    error,
+                )
+                return
+
+            token_stream = self._llm.chat_completion(
+                request_messages,
+                current_system_prompt,
+            )
+            complete_response = ""
+            async for event in token_stream:
+                text_chunk = ""
+                if isinstance(event, dict) and event.get("type") == "text_delta":
+                    text_chunk = event.get("text", "")
+                elif isinstance(event, str):
+                    text_chunk = event
+                if text_chunk:
+                    yield text_chunk
+                    complete_response += text_chunk
+            if complete_response:
+                self._add_message(complete_response, "assistant")
+
+        return proactive_with_memory
+
+    async def chat_proactively(
+        self,
+    ) -> AsyncIterator[Union[SentenceOutput, Dict[str, Any]]]:
+        """Generate one proactive assistant message without a fake user turn."""
+        proactive_chat = self._proactive_chat_function_factory()
+        async for output in proactive_chat():
+            yield output
+
     async def chat(
         self,
         input_data: BatchInput,
