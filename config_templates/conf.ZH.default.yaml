@@ -90,6 +90,8 @@ character_config:
         ignored_before_backoff: 3
         backoff_min_seconds: 180
         backoff_max_seconds: 360
+        # semantic 由同一次主动对话生成请求选择方向；heuristic 保留 v2 加权选择器。
+        proactive_intent_strategy: semantic
 
       hume_ai_agent:
         api_key: ''

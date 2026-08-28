@@ -90,6 +90,9 @@ character_config:
         ignored_before_backoff: 3
         backoff_min_seconds: 180
         backoff_max_seconds: 360
+        # semantic lets the same proactive LLM request choose direction;
+        # heuristic keeps the deterministic Heuristics v2 weighted selector.
+        proactive_intent_strategy: semantic
 
       letta_agent:
         host: 'localhost' # Host address

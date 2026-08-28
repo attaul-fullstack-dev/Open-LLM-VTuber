@@ -32,11 +32,15 @@ from .conversations.single_conversation import process_single_conversation
 from .conversations.conversation_utils import EMOJI_LIST
 from .proactive_chat import (
     ProactiveChatConfig,
+    ProactiveIntent,
     ProactiveIntentContext,
+    ProactiveIntentStrategy,
     ProactiveIntentSignals,
     ProactiveRuntimeState,
     ProactiveStateMachine,
+    ProactiveTurnStrategy,
     band_for,
+    build_semantic_proactive_context,
     compute_intent_signals,
     resolve_proactive_intent_decision,
 )
@@ -133,6 +137,7 @@ class WebSocketHandler:
             ignored_before_backoff=settings.ignored_before_backoff,
             backoff_min_seconds=settings.backoff_min_seconds,
             backoff_max_seconds=settings.backoff_max_seconds,
+            intent_strategy=settings.proactive_intent_strategy,
             intent_weights=settings.proactive_intent_weights,
         )
 
@@ -288,6 +293,37 @@ class WebSocketHandler:
             relationship_familiarity=relationship_familiarity,
         )
 
+    @staticmethod
+    def _proactive_context_from_heuristic_decision(
+        decision,
+        state: ProactiveRuntimeState,
+        signals: ProactiveIntentSignals,
+    ) -> ProactiveIntentContext:
+        """Build the preserved Heuristics v2 prompt hints for one turn."""
+        return ProactiveIntentContext(
+            intent=decision.intent or ProactiveIntent.CASUAL_OBSERVATION,
+            strategy=decision.strategy,
+            user_has_replied_since_last_proactive=(
+                state.consecutive_ignored_proactive == 0
+            ),
+            consecutive_ignored=max(0, state.consecutive_ignored_proactive),
+            recent_silence_acknowledgment=(
+                ProactiveIntent.REACT_TO_SILENCE in state.recent_proactive_intents
+            ),
+            topic_continuity_band=band_for(
+                signals.topic_continuity_score, 0.35, 0.6
+            ),
+            topic_staleness_band=band_for(signals.topic_staleness_score, 0.4, 0.7),
+            user_engagement_band=band_for(
+                signals.recent_user_engagement, 0.4, 0.7
+            ),
+            dominant_topic_keywords=signals.dominant_recent_topic,
+            avoid_recent_topics=tuple(
+                tuple(signature)
+                for signature in state.recent_proactive_topic_signatures[-3:]
+            ),
+        )
+
     async def _run_proactive_timer(
         self,
         client_uid: str,
@@ -336,45 +372,73 @@ class WebSocketHandler:
                     state.consecutive_ignored_proactive,
                 )
                 followup_context = machine.proactive_followup_context(state)
-                signals = self._proactive_intent_signals(context, state)
+                signals = ProactiveIntentSignals()
+                forced_ignored_question = (
+                    followup_context.previous_proactive_ignored
+                    and followup_context.previous_proactive_expected_response
+                )
+                if (
+                    machine.config.intent_strategy
+                    == ProactiveIntentStrategy.HEURISTIC
+                    and not forced_ignored_question
+                ):
+                    signals = self._proactive_intent_signals(context, state)
                 decision = resolve_proactive_intent_decision(
                     followup_context, state, machine, signals
                 )
-                intent = decision.intent
-                logger.info(
-                    "[PROACTIVE INTENT] intent={} reason={} continuity={:.2f} "
-                    "engagement={:.2f} staleness={:.2f} memory_relevance={:.2f}",
-                    decision.intent,
-                    decision.reason,
-                    signals.topic_continuity_score,
-                    signals.recent_user_engagement,
-                    signals.topic_staleness_score,
-                    signals.memory_relevance_score,
-                )
-                intent_context = ProactiveIntentContext(
-                    intent=intent,
-                    user_has_replied_since_last_proactive=(
-                        state.consecutive_ignored_proactive == 0
-                    ),
-                    consecutive_ignored=max(0, state.consecutive_ignored_proactive),
-                    recent_silence_acknowledgment=(
-                        "react_to_silence" in state.recent_proactive_intents
-                    ),
-                    topic_continuity_band=band_for(
-                        signals.topic_continuity_score, 0.35, 0.6
-                    ),
-                    topic_staleness_band=band_for(
-                        signals.topic_staleness_score, 0.4, 0.7
-                    ),
-                    user_engagement_band=band_for(
-                        signals.recent_user_engagement, 0.4, 0.7
-                    ),
-                    dominant_topic_keywords=signals.dominant_recent_topic,
-                    avoid_recent_topics=tuple(
-                        tuple(signature)
-                        for signature in state.recent_proactive_topic_signatures[-3:]
-                    ),
-                )
+                if decision.strategy == ProactiveTurnStrategy.SEMANTIC_AUTO:
+                    try:
+                        intent_context = build_semantic_proactive_context(state)
+                    except Exception as error:
+                        logger.warning(
+                            "Semantic proactive context unavailable; using "
+                            "Heuristics v2 fallback: error_type={}",
+                            type(error).__name__,
+                        )
+                        signals = self._proactive_intent_signals(context, state)
+                        decision = resolve_proactive_intent_decision(
+                            followup_context,
+                            state,
+                            machine,
+                            signals,
+                            strategy=ProactiveIntentStrategy.HEURISTIC,
+                            fallback_reason="semantic_context_construction_failed",
+                        )
+                        intent_context = (
+                            self._proactive_context_from_heuristic_decision(
+                                decision, state, signals
+                            )
+                        )
+                elif decision.strategy == ProactiveTurnStrategy.HEURISTIC:
+                    intent_context = self._proactive_context_from_heuristic_decision(
+                        decision, state, signals
+                    )
+                else:
+                    # Deterministic ignored-question priority.  The follow-up
+                    # block carries the substantive instruction.
+                    intent_context = self._proactive_context_from_heuristic_decision(
+                        decision, state, signals
+                    )
+
+                if decision.strategy == ProactiveTurnStrategy.SEMANTIC_AUTO:
+                    logger.info(
+                        "[PROACTIVE INTENT] strategy=semantic_auto forced=false"
+                    )
+                elif (
+                    decision.strategy
+                    == ProactiveTurnStrategy.FORCED_IGNORED_QUESTION
+                ):
+                    logger.info(
+                        "[PROACTIVE INTENT] "
+                        "strategy=forced_ignored_question forced=true"
+                    )
+                else:
+                    logger.info(
+                        "[PROACTIVE INTENT] strategy={} intent={} reason={}",
+                        decision.strategy,
+                        decision.intent,
+                        decision.reason,
+                    )
                 response = await process_single_conversation(
                     context=context,
                     websocket_send=websocket.send_text,
@@ -391,7 +455,7 @@ class WebSocketHandler:
                 state.proactive_generation_in_progress = False
                 if response and revision == state.activity_revision:
                     machine.record_proactive_sent(
-                        state, response_text=response, intent=intent
+                        state, response_text=response, intent=decision.intent
                     )
                 elif revision != state.activity_revision:
                     # User activity arrived after generation had meaningfully

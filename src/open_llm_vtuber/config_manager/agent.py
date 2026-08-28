@@ -52,6 +52,9 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
     ignored_before_backoff: int = Field(3, gt=0, alias="ignored_before_backoff")
     backoff_min_seconds: int = Field(180, ge=0, alias="backoff_min_seconds")
     backoff_max_seconds: int = Field(360, ge=0, alias="backoff_max_seconds")
+    proactive_intent_strategy: Literal["semantic", "heuristic"] = Field(
+        "semantic", alias="proactive_intent_strategy"
+    )
     proactive_intent_weights: Optional[Dict[str, float]] = Field(
         None, alias="proactive_intent_weights"
     )
@@ -136,6 +139,10 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
         "backoff_max_seconds": Description(
             en="Maximum proactive backoff delay (default: 360 seconds)",
             zh="主动聊天退避的最长时间（默认：360 秒）",
+        ),
+        "proactive_intent_strategy": Description(
+            en="Proactive direction selection: semantic (same generation request) or heuristic (v2 weighted selector)",
+            zh="主动对话方向选择：semantic（同一次生成请求）或 heuristic（v2 加权选择器）",
         ),
         "proactive_intent_weights": Description(
             en="Optional per-intent weight overrides for proactive topic selection (react_to_silence, continue_previous_topic, start_new_topic, ask_user_something, bring_up_memory, casual_observation)",

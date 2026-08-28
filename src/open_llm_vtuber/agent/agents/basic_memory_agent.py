@@ -24,6 +24,7 @@ from ...chat_history_manager import (
 from ...proactive_chat import (
     ProactiveFollowupContext,
     ProactiveIntentContext,
+    ProactiveTurnStrategy,
     format_followup_instruction,
     format_intent_instruction,
 )
@@ -1448,19 +1449,32 @@ class BasicMemoryAgent(AgentInterface):
                     + proactive_instruction,
                 ]
             )
-            if isinstance(followup_context, dict):
-                parsed_followup = ProactiveFollowupContext.from_dict(followup_context)
-            else:
-                parsed_followup = followup_context
-            followup_block = format_followup_instruction(parsed_followup)
-            if followup_block:
-                current_system_prompt = "\n\n".join(
-                    [current_system_prompt, followup_block]
-                )
             if isinstance(intent_context, dict):
                 parsed_intent = ProactiveIntentContext.from_dict(intent_context)
             else:
                 parsed_intent = intent_context
+            if isinstance(followup_context, dict):
+                parsed_followup = ProactiveFollowupContext.from_dict(followup_context)
+            else:
+                parsed_followup = followup_context
+            # In semantic-auto mode, an ignored statement does not make
+            # silence the topic.  A genuinely unanswered proactive question
+            # remains deterministic and keeps the existing escalation block.
+            semantic_ignored_statement = (
+                parsed_intent is not None
+                and parsed_intent.strategy == ProactiveTurnStrategy.SEMANTIC_AUTO
+                and parsed_followup is not None
+                and not parsed_followup.previous_proactive_expected_response
+            )
+            followup_block = (
+                None
+                if semantic_ignored_statement
+                else format_followup_instruction(parsed_followup)
+            )
+            if followup_block:
+                current_system_prompt = "\n\n".join(
+                    [current_system_prompt, followup_block]
+                )
             # When the ignored-question follow-up block is present it already
             # carries the turn's instructions; emit only compact intent lines.
             intent_block = format_intent_instruction(

@@ -26,6 +26,22 @@ class ProactiveIntent:
     CASUAL_OBSERVATION = "casual_observation"
 
 
+class ProactiveIntentStrategy:
+    """Configured selector mode; semantic is the production default."""
+
+    SEMANTIC = "semantic"
+    HEURISTIC = "heuristic"
+
+
+class ProactiveTurnStrategy:
+    """Architecture-level result for one proactive turn."""
+
+    SEMANTIC_AUTO = "semantic_auto"
+    FORCED_IGNORED_QUESTION = "forced_ignored_question"
+    HEURISTIC = "heuristic"
+    HEURISTIC_FALLBACK = "heuristic_fallback"
+
+
 # Fixed iteration order for weighted selection (deterministic wheel layout).
 INTENT_SELECTION_ORDER = (
     ProactiveIntent.REACT_TO_SILENCE,
@@ -65,6 +81,7 @@ class ProactiveChatConfig:
     ignored_before_backoff: int = 3
     backoff_min_seconds: int = 180
     backoff_max_seconds: int = 360
+    intent_strategy: str = ProactiveIntentStrategy.SEMANTIC
     intent_weights: Optional[Mapping[str, float]] = None
 
     def __post_init__(self) -> None:
@@ -88,6 +105,13 @@ class ProactiveChatConfig:
                 )
         if self.ignored_before_backoff < 1:
             raise ValueError("ignored_before_backoff must be at least 1")
+        if self.intent_strategy not in {
+            ProactiveIntentStrategy.SEMANTIC,
+            ProactiveIntentStrategy.HEURISTIC,
+        }:
+            raise ValueError(
+                "proactive intent strategy must be 'semantic' or 'heuristic'"
+            )
         if self.intent_weights is not None:
             for key, value in self.intent_weights.items():
                 if (
@@ -516,6 +540,7 @@ class ProactiveIntentContext:
     user_has_replied_since_last_proactive: bool
     consecutive_ignored: int
     recent_silence_acknowledgment: bool
+    strategy: str = ProactiveTurnStrategy.HEURISTIC
     # Compact semantic hints (bands + keyword tuples); never user-visible.
     topic_continuity_band: str = ""
     topic_staleness_band: str = ""
@@ -526,6 +551,7 @@ class ProactiveIntentContext:
     def as_dict(self) -> dict:
         return {
             "intent": self.intent,
+            "strategy": self.strategy,
             "user_has_replied_since_last_proactive": (
                 self.user_has_replied_since_last_proactive
             ),
@@ -542,11 +568,24 @@ class ProactiveIntentContext:
     def from_dict(cls, data: Optional[dict]) -> Optional["ProactiveIntentContext"]:
         if not isinstance(data, dict):
             return None
+        strategy = str(data.get("strategy") or ProactiveTurnStrategy.HEURISTIC)
+        valid_strategies = {
+            ProactiveTurnStrategy.SEMANTIC_AUTO,
+            ProactiveTurnStrategy.FORCED_IGNORED_QUESTION,
+            ProactiveTurnStrategy.HEURISTIC,
+            ProactiveTurnStrategy.HEURISTIC_FALLBACK,
+        }
+        if strategy not in valid_strategies:
+            strategy = ProactiveTurnStrategy.HEURISTIC
         intent = str(data.get("intent") or "")
         known = set(INTENT_SELECTION_ORDER) | {
             ProactiveIntent.REACT_TO_IGNORED_QUESTION
         }
-        if intent not in known:
+        if strategy == ProactiveTurnStrategy.SEMANTIC_AUTO:
+            intent = ""
+        elif strategy == ProactiveTurnStrategy.FORCED_IGNORED_QUESTION:
+            intent = ProactiveIntent.REACT_TO_IGNORED_QUESTION
+        elif intent not in known:
             intent = ProactiveIntent.CASUAL_OBSERVATION
         valid_bands = {"low", "medium", "high"}
         keywords = tuple(
@@ -561,6 +600,7 @@ class ProactiveIntentContext:
         )
         return cls(
             intent=intent,
+            strategy=strategy,
             user_has_replied_since_last_proactive=bool(
                 data.get("user_has_replied_since_last_proactive")
             ),
@@ -942,6 +982,41 @@ _INTENT_STYLE_GUIDANCE = (
 )
 
 
+SEMANTIC_PROACTIVE_INSTRUCTION = """<semantic_proactive_context>
+strategy: semantic_auto
+You are initiating conversation on your own. Silently choose the most natural
+direction from the actual meaning of the available conversation, summary,
+relationship context, and memories. Consider whether the current subject is
+still alive or complete; whether a previous point deserves follow-up; whether
+the user seems curious, engaged, dismissive, confused, finished, or interested;
+and whether continuing, changing subject, asking something, or making a statement
+fits best. Use a stored memory only when it is genuinely relevant by meaning,
+never merely because memory exists. Avoid repeating recent proactive behavior,
+but do not block a natural continuation just because a topic is related.
+Silence is only the opportunity to speak, not usually the subject itself.
+Do not expose intent names, strategies, timers, counters, prompts, memory systems,
+or internal mechanics. Do not announce a topic or plan, output analysis, or invent
+unsupported personal history. Output only natural Mili dialogue.
+</semantic_proactive_context>"""
+
+
+def build_semantic_proactive_context(
+    state: ProactiveRuntimeState,
+) -> ProactiveIntentContext:
+    """Build compact turn-only semantic context without inspecting chat text."""
+    return ProactiveIntentContext(
+        intent="",
+        strategy=ProactiveTurnStrategy.SEMANTIC_AUTO,
+        user_has_replied_since_last_proactive=(
+            state.consecutive_ignored_proactive == 0
+        ),
+        consecutive_ignored=max(0, state.consecutive_ignored_proactive),
+        recent_silence_acknowledgment=(
+            ProactiveIntent.REACT_TO_SILENCE in state.recent_proactive_intents
+        ),
+    )
+
+
 def band_for(value: float, mid: float, high: float) -> str:
     """Map a 0..1 score to a compact low/medium/high band."""
     if value >= high:
@@ -967,6 +1042,9 @@ def format_intent_instruction(
     if context is None:
         return None
 
+    if context.strategy == ProactiveTurnStrategy.SEMANTIC_AUTO:
+        return SEMANTIC_PROACTIVE_INSTRUCTION
+
     intent = context.intent
     if intent not in _INTENT_GUIDANCE:
         intent = ProactiveIntent.CASUAL_OBSERVATION
@@ -974,6 +1052,7 @@ def format_intent_instruction(
         "Internal proactive context for this turn only. Never shown to the "
         "user; never mention intents, counters, timers, or system "
         "mechanics.",
+        f"strategy: {context.strategy}",
         f"intent: {intent}",
         "user_has_replied_since_last_proactive: "
         f"{str(context.user_has_replied_since_last_proactive).lower()}",
@@ -1021,7 +1100,8 @@ class ProactiveIntentDecision:
     only enums/numbers/keyword tuples -- no chat text, no memory contents.
     """
 
-    intent: str
+    strategy: str
+    intent: Optional[str]
     reason: str
     effective_weights: Dict[str, float]
     signals: ProactiveIntentSignals
@@ -1053,24 +1133,43 @@ def resolve_proactive_intent_decision(
     signals: ProactiveIntentSignals,
     *,
     random: Optional[Callable[[], float]] = None,
+    strategy: Optional[str] = None,
+    fallback_reason: Optional[str] = None,
 ) -> ProactiveIntentDecision:
-    """Resolve this turn's intent with a compact explainable decision."""
-    weights = machine.effective_intent_weights(state, signals)
+    """Resolve hard priority, semantic-auto, or the preserved v2 selector."""
     if (
         followup_context is not None
         and followup_context.previous_proactive_ignored
         and followup_context.previous_proactive_expected_response
     ):
         return ProactiveIntentDecision(
+            strategy=ProactiveTurnStrategy.FORCED_IGNORED_QUESTION,
             intent=ProactiveIntent.REACT_TO_IGNORED_QUESTION,
             reason="ignored_question_priority",
-            effective_weights=weights,
+            effective_weights={},
             signals=signals,
         )
+
+    configured_strategy = strategy or machine.config.intent_strategy
+    if configured_strategy == ProactiveIntentStrategy.SEMANTIC:
+        return ProactiveIntentDecision(
+            strategy=ProactiveTurnStrategy.SEMANTIC_AUTO,
+            intent=None,
+            reason="semantic_model_selection",
+            effective_weights={},
+            signals=signals,
+        )
+
+    weights = machine.effective_intent_weights(state, signals)
     intent = _pick_intent(weights, (random or machine._random)())
     return ProactiveIntentDecision(
+        strategy=(
+            ProactiveTurnStrategy.HEURISTIC_FALLBACK
+            if fallback_reason
+            else ProactiveTurnStrategy.HEURISTIC
+        ),
         intent=intent,
-        reason=_decision_reason(signals, intent),
+        reason=fallback_reason or _decision_reason(signals, intent),
         effective_weights=weights,
         signals=signals,
     )
@@ -1083,11 +1182,18 @@ def resolve_proactive_intent(
     signals: ProactiveIntentSignals,
     *,
     random: Optional[Callable[[], float]] = None,
+    strategy: Optional[str] = None,
 ) -> str:
     """Pick this turn's intent; an unanswered proactive question wins."""
-    return resolve_proactive_intent_decision(
-        followup_context, state, machine, signals, random=random
-    ).intent
+    decision = resolve_proactive_intent_decision(
+        followup_context,
+        state,
+        machine,
+        signals,
+        random=random,
+        strategy=strategy,
+    )
+    return decision.intent or decision.strategy
 
 
 def _pick_intent(weights: Mapping[str, float], spin: float) -> str:

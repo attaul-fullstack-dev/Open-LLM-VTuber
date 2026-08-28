@@ -25,13 +25,17 @@ from src.open_llm_vtuber.conversations.single_conversation import (
 from src.open_llm_vtuber.proactive_chat import (
     DEFAULT_INTENT_WEIGHTS,
     INTENT_SELECTION_ORDER,
+    SEMANTIC_PROACTIVE_INSTRUCTION,
     ProactiveChatConfig,
     ProactiveFollowupContext,
     ProactiveIntent,
     ProactiveIntentContext,
+    ProactiveIntentStrategy,
     ProactiveIntentSignals,
     ProactiveStateMachine,
+    ProactiveTurnStrategy,
     band_for,
+    build_semantic_proactive_context,
     clamp01,
     compute_intent_signals,
     format_followup_instruction,
@@ -409,6 +413,56 @@ class ProactiveGuardTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await timer
 
+    async def test_semantic_context_failure_uses_safe_heuristic_fallback(self):
+        handler = self._handler_with_active_chat()
+        handler.client_contexts["client"].agent_engine = SimpleNamespace(
+            _memory=list(_HORROR_HISTORY),
+            list_character_memories=lambda: [],
+            relationship_status="stranger",
+        )
+        machine = ProactiveStateMachine(
+            ProactiveChatConfig(
+                initial_idle_min_seconds=0,
+                initial_idle_max_seconds=0,
+                followup_idle_min_seconds=100,
+                followup_idle_max_seconds=100,
+            ),
+            monotonic=_Clock(),
+            randint=lambda minimum, _maximum: minimum,
+            random=lambda: 0.0,
+        )
+        state = machine.new_state("chat")
+        generated = asyncio.Event()
+        captured = {}
+
+        async def generate_once(**kwargs):
+            captured.update(kwargs["metadata"]["proactive_intent"])
+            generated.set()
+            return "proactive fallback"
+
+        with (
+            patch(
+                "src.open_llm_vtuber.websocket_handler.build_semantic_proactive_context",
+                side_effect=RuntimeError("synthetic"),
+            ),
+            patch(
+                "src.open_llm_vtuber.websocket_handler.process_single_conversation",
+                new=generate_once,
+            ),
+        ):
+            timer = asyncio.create_task(
+                handler._run_proactive_timer("client", "chat", state, machine)
+            )
+            handler._proactive_timer_tasks["client"] = timer
+            await asyncio.wait_for(generated.wait(), 1)
+            self.assertEqual(
+                captured["strategy"], ProactiveTurnStrategy.HEURISTIC_FALLBACK
+            )
+            self.assertIn(captured["intent"], INTENT_SELECTION_ORDER)
+            timer.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await timer
+
     async def test_generation_flag_prevents_overlap(self):
         clock = _Clock()
         machine = ProactiveStateMachine(
@@ -611,6 +665,7 @@ class ProactiveIntentSelectionTests(unittest.TestCase):
             ProactiveChatConfig(
                 initial_idle_min_seconds=0,
                 initial_idle_max_seconds=0,
+                intent_strategy=ProactiveIntentStrategy.HEURISTIC,
             ),
             monotonic=_Clock(),
             randint=lambda minimum, _maximum: minimum,
@@ -752,8 +807,13 @@ class ProactiveIntentSelectionTests(unittest.TestCase):
 
     def test_old_config_without_intent_weights_still_loads(self):
         self.assertIsNone(ProactiveChatConfig().intent_weights)
+        self.assertEqual(
+            ProactiveChatConfig().intent_strategy,
+            ProactiveIntentStrategy.SEMANTIC,
+        )
         settings = BasicMemoryAgentConfig(llm_provider="ollama_llm")
         self.assertIsNone(settings.proactive_intent_weights)
+        self.assertEqual(settings.proactive_intent_strategy, "semantic")
         # Neutral relevance (0.5) sits between the boost/penalty bands, so no
         # context modifier fires and base defaults pass through unchanged.
         neutral_signals = dataclasses.replace(
@@ -773,6 +833,103 @@ class ProactiveIntentSelectionTests(unittest.TestCase):
         self.assertIsNone(ProactiveIntentContext.from_dict(None))
         fallback = ProactiveIntentContext.from_dict({"intent": "bogus"})
         self.assertEqual(fallback.intent, ProactiveIntent.CASUAL_OBSERVATION)
+
+
+class SemanticProactiveSelectionTests(unittest.TestCase):
+    """Hybrid contract: hard priority, semantic default, v2 fallback."""
+
+    def setUp(self):
+        self.machine = ProactiveStateMachine(
+            ProactiveChatConfig(
+                initial_idle_min_seconds=0,
+                initial_idle_max_seconds=0,
+            ),
+            monotonic=_Clock(),
+            randint=lambda minimum, _maximum: minimum,
+            random=lambda: 0.99,
+        )
+        self.state = self.machine.new_state("chat")
+        self.signals = ProactiveIntentSignals(
+            has_useful_memory=True,
+            has_recent_context=True,
+            topic_continuity_score=1.0,
+            recent_user_engagement=1.0,
+        )
+
+    def test_semantic_is_default_strategy(self):
+        self.assertEqual(
+            self.machine.config.intent_strategy,
+            ProactiveIntentStrategy.SEMANTIC,
+        )
+        decision = resolve_proactive_intent_decision(
+            None, self.state, self.machine, self.signals
+        )
+        self.assertEqual(decision.strategy, ProactiveTurnStrategy.SEMANTIC_AUTO)
+        self.assertIsNone(decision.intent)
+        self.assertEqual(decision.effective_weights, {})
+
+    def test_semantic_normal_turn_bypasses_weighted_wheel(self):
+        with patch.object(
+            self.machine,
+            "effective_intent_weights",
+            side_effect=AssertionError("weighted selector must not run"),
+        ):
+            decision = resolve_proactive_intent_decision(
+                None, self.state, self.machine, self.signals
+            )
+        self.assertEqual(decision.strategy, ProactiveTurnStrategy.SEMANTIC_AUTO)
+
+    def test_ignored_unanswered_question_is_forced_before_semantic(self):
+        followup = ProactiveFollowupContext(True, 2, True)
+        with patch.object(
+            self.machine,
+            "effective_intent_weights",
+            side_effect=AssertionError("weighted selector must not run"),
+        ):
+            decision = resolve_proactive_intent_decision(
+                followup, self.state, self.machine, self.signals
+            )
+        self.assertEqual(
+            decision.strategy, ProactiveTurnStrategy.FORCED_IGNORED_QUESTION
+        )
+        self.assertEqual(decision.intent, ProactiveIntent.REACT_TO_IGNORED_QUESTION)
+        self.assertEqual(decision.reason, "ignored_question_priority")
+
+    def test_explicit_heuristic_strategy_keeps_v2_selector(self):
+        decision = resolve_proactive_intent_decision(
+            None,
+            self.state,
+            self.machine,
+            self.signals,
+            strategy=ProactiveIntentStrategy.HEURISTIC,
+            random=lambda: 0.0,
+        )
+        self.assertEqual(decision.strategy, ProactiveTurnStrategy.HEURISTIC)
+        self.assertIn(decision.intent, INTENT_SELECTION_ORDER)
+        self.assertTrue(decision.effective_weights)
+
+    def test_fallback_reason_is_safe_category_only(self):
+        decision = resolve_proactive_intent_decision(
+            None,
+            self.state,
+            self.machine,
+            self.signals,
+            strategy=ProactiveIntentStrategy.HEURISTIC,
+            fallback_reason="semantic_context_construction_failed",
+            random=lambda: 0.0,
+        )
+        self.assertEqual(decision.strategy, ProactiveTurnStrategy.HEURISTIC_FALLBACK)
+        self.assertEqual(decision.reason, "semantic_context_construction_failed")
+
+    def test_semantic_context_round_trip_has_no_fabricated_intent(self):
+        context = build_semantic_proactive_context(self.state)
+        restored = ProactiveIntentContext.from_dict(context.as_dict())
+        self.assertEqual(restored.strategy, ProactiveTurnStrategy.SEMANTIC_AUTO)
+        self.assertEqual(restored.intent, "")
+
+    def test_invalid_strategy_is_rejected(self):
+        with self.assertRaises(ValueError):
+            ProactiveChatConfig(intent_strategy="lexical-v3")
 
 
 class ProactiveIntentPromptTests(unittest.IsolatedAsyncioTestCase):
@@ -856,6 +1013,42 @@ class ProactiveIntentPromptTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(llm.calls), 1)
 
+    async def test_semantic_context_uses_one_call_and_is_not_persisted(self):
+        machine = ProactiveStateMachine(ProactiveChatConfig())
+        semantic_context = build_semantic_proactive_context(
+            machine.new_state(self.history_uid)
+        )
+        agent, llm = await self._generate(intent_context=semantic_context)
+        self.assertEqual(len(llm.calls), 1)
+        self.assertIn("<semantic_proactive_context>", llm.calls[0]["system"])
+        self.assertIn("strategy: semantic_auto", llm.calls[0]["system"])
+        self.assertEqual(
+            [message["role"] for message in agent._memory],
+            ["user", "assistant", "assistant"],
+        )
+        for message in get_history(self.conf_uid, self.history_uid):
+            self.assertNotIn("semantic_proactive_context", str(message))
+            self.assertNotIn("semantic_auto", str(message))
+
+    async def test_heuristic_context_still_uses_exactly_one_llm_call(self):
+        _agent, llm = await self._generate(
+            intent_context=self._intent_context(ProactiveIntent.START_NEW_TOPIC)
+        )
+        self.assertEqual(len(llm.calls), 1)
+
+    async def test_semantic_ignored_statement_does_not_make_silence_the_topic(self):
+        machine = ProactiveStateMachine(ProactiveChatConfig())
+        semantic_context = build_semantic_proactive_context(
+            machine.new_state(self.history_uid)
+        )
+        _agent, llm = await self._generate(
+            followup_context=ProactiveFollowupContext(True, 1, False),
+            intent_context=semantic_context,
+        )
+        system = llm.calls[0]["system"]
+        self.assertNotIn("previous proactive message was ignored", system.lower())
+        self.assertIn("silence is only the opportunity", system.lower())
+
     def test_intent_instruction_contract(self):
         full = format_intent_instruction(
             self._intent_context(ProactiveIntent.START_NEW_TOPIC)
@@ -871,6 +1064,27 @@ class ProactiveIntentPromptTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("intent: start_new_topic", compact)
         self.assertNotIn("never announce a topic", compact)
         self.assertIsNone(format_intent_instruction(None))
+
+    def test_semantic_instruction_contract_and_size(self):
+        machine = ProactiveStateMachine(ProactiveChatConfig())
+        context = build_semantic_proactive_context(machine.new_state("chat"))
+        prompt = format_intent_instruction(context)
+        self.assertEqual(prompt, SEMANTIC_PROACTIVE_INSTRUCTION)
+        for expected in (
+            "current subject is",
+            "still alive or complete",
+            "curious, engaged, dismissive, confused, finished, or interested",
+            "continuing, changing subject",
+            "stored memory only when it is genuinely relevant",
+            "avoid repeating recent proactive behavior",
+            "silence is only the opportunity",
+            "do not expose intent names",
+            "do not announce a topic or plan",
+            "unsupported personal history",
+            "output only natural mili dialogue",
+        ):
+            self.assertIn(expected, prompt.lower())
+        self.assertLessEqual(len(prompt.split()), 250)
 
 
 _HORROR_HISTORY = [
@@ -1108,6 +1322,7 @@ class ProactiveDynamicWeightTests(unittest.TestCase):
             ProactiveChatConfig(
                 initial_idle_min_seconds=0,
                 initial_idle_max_seconds=0,
+                intent_strategy=ProactiveIntentStrategy.HEURISTIC,
             ),
             monotonic=_Clock(),
             randint=lambda minimum, _maximum: minimum,
