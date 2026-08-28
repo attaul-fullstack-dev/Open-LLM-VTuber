@@ -78,6 +78,28 @@ from ...request_latency import (
     set_latency_phase,
 )
 
+# Request-only bootstrap for a proactive turn on a completely empty chat.
+# Short, model-neutral, and free of internal terminology: it only gives the
+# provider one non-system conversational turn so it actually generates Mili's
+# first message. It is never persisted and never enters history/summary/
+# memory/relationship processing.
+PROACTIVE_EMPTY_CHAT_BOOTSTRAP = "Initiate a natural conversation with the user now."
+
+
+def _has_real_dialogue(messages: list) -> bool:
+    """True when the transcript has at least one real user/assistant turn.
+
+    Global context (persona, relationship, long-term memory) lives in the
+    system prompt and is intentionally not counted here: a new chat may still
+    have all of that and still count as an empty conversation.
+    """
+    return any(
+        isinstance(message, dict)
+        and message.get("role") in ("user", "assistant")
+        and str(message.get("content") or "").strip()
+        for message in messages or ()
+    )
+
 
 class BasicMemoryAgent(AgentInterface):
     """Agent with basic chat memory and tool calling support."""
@@ -1475,6 +1497,27 @@ class BasicMemoryAgent(AgentInterface):
                     error,
                 )
                 return
+
+            # Empty-chat bootstrap: a completely new chat has zero real
+            # conversational turns, so the provider payload would be system-only
+            # and Ollama-style endpoints can complete with no assistant token.
+            # Inject ONE request-only internal user turn so the provider produces
+            # Mili's actual first message. It lives only in this local request
+            # list: it never enters _memory, history, summary, memory parsing,
+            # relationship logic, or the UI.
+            if not _has_real_dialogue(messages):
+                request_messages = [
+                    *request_messages,
+                    {"role": "user", "content": PROACTIVE_EMPTY_CHAT_BOOTSTRAP},
+                ]
+                logger.info(
+                    "Proactive generation: empty_chat_proactive_bootstrap=True, "
+                    "request_message_count_after={}",
+                    len(request_messages),
+                )
+                tracker = get_latency_tracker()
+                if tracker:
+                    tracker.message_count = len(request_messages)
 
             token_stream = self._llm.chat_completion(
                 request_messages,

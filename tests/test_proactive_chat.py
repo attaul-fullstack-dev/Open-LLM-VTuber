@@ -7,7 +7,11 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from src.open_llm_vtuber.agent.agents.basic_memory_agent import BasicMemoryAgent
+from src.open_llm_vtuber.agent.agents.basic_memory_agent import (
+    PROACTIVE_EMPTY_CHAT_BOOTSTRAP,
+    BasicMemoryAgent,
+    _has_real_dialogue,
+)
 from src.open_llm_vtuber.agent.conversation_summary import SummaryState
 from src.open_llm_vtuber.chat_history_manager import (
     create_new_history,
@@ -85,8 +89,22 @@ class _FakeLive2D:
         return []
 
 
-def _make_agent(conf_uid, history_uid):
-    llm = _FakeLLM()
+class _EmptyLLM(_FakeLLM):
+    """Fake provider that completes with an actually empty stream."""
+
+    async def chat_completion(self, messages, system=None, tools=None):
+        self.calls.append(
+            {
+                "messages": [dict(message) for message in messages],
+                "system": system,
+            }
+        )
+        for _ in ():
+            yield ""
+
+
+def _make_agent(conf_uid, history_uid, llm_cls=_FakeLLM):
+    llm = llm_cls()
     agent = BasicMemoryAgent(
         llm=llm,
         system="persona Mili tetap aktif",
@@ -102,6 +120,12 @@ def _make_agent(conf_uid, history_uid):
     )
     agent.set_memory_from_history(conf_uid, history_uid)
     return agent, llm
+
+
+def _make_empty_agent(conf_uid, llm_cls=_FakeLLM):
+    """Fresh history with zero real conversation messages."""
+    history_uid = create_new_history(conf_uid)
+    return _make_agent(conf_uid, history_uid, llm_cls=llm_cls), history_uid
 
 
 class ProactiveTimingTests(unittest.TestCase):
@@ -1590,6 +1614,242 @@ class ProactiveDynamicWeightTests(unittest.TestCase):
         self.assertEqual(band_for(0.5, 0.4, 0.7), "medium")
         self.assertEqual(band_for(0.9, 0.4, 0.7), "high")
         self.assertEqual(band_for(clamp01(5.0), 0.4, 0.7), "high")
+
+
+class ProactiveEmptyChatBootstrapTests(unittest.IsolatedAsyncioTestCase):
+    """Empty-chat proactive generation bootstrap (request-only trigger)."""
+
+    def setUp(self):
+        self._old_cwd = os.getcwd()
+        self._temp = tempfile.TemporaryDirectory()
+        os.chdir(self._temp.name)
+        self.conf_uid = "mili-empty"
+
+    def tearDown(self):
+        os.chdir(self._old_cwd)
+        self._temp.cleanup()
+
+    async def _run(self, agent):
+        return [output async for output in agent.chat_proactively()]
+
+    # TEST 1 — empty proactive chat gets exactly one request-only bootstrap turn
+    async def test_empty_chat_injects_single_bootstrap_turn(self):
+        (agent, llm), history_uid = _make_empty_agent(self.conf_uid)
+        outputs = await self._run(agent)
+
+        self.assertTrue(outputs)
+        self.assertEqual(len(llm.calls), 1)
+        provider_messages = llm.calls[0]["messages"]
+        self.assertEqual(
+            provider_messages[-1],
+            {"role": "user", "content": PROACTIVE_EMPTY_CHAT_BOOTSTRAP},
+        )
+        # Nothing else was in the provider request: only the one bootstrap turn.
+        self.assertEqual(len(provider_messages), 1)
+        self.assertIn("persona Mili tetap aktif", llm.calls[0]["system"])
+        self.assertIn("Internal instruction for this turn only", llm.calls[0]["system"])
+
+    # TEST 2 — ephemeral trigger is never persisted
+    async def test_bootstrap_not_persisted(self):
+        (agent, _llm), history_uid = _make_empty_agent(self.conf_uid)
+        await self._run(agent)
+
+        self.assertEqual([m["role"] for m in agent._memory], ["assistant"])
+        for message in agent._memory:
+            self.assertNotIn(PROACTIVE_EMPTY_CHAT_BOOTSTRAP, str(message.get("content")))
+        persisted = get_history(self.conf_uid, history_uid)
+        self.assertEqual(persisted, [])
+
+    # TEST 3 — normal non-empty proactive chat is untouched
+    async def test_non_empty_proactive_unaffected(self):
+        agent, llm = _make_agent(self.conf_uid, create_new_history(self.conf_uid))
+        store_message(self.conf_uid, agent._summary_history_uid, "human", "Gw suka psychological horror.")
+        store_message(self.conf_uid, agent._summary_history_uid, "ai", "Ya, karena suspense-nya beda.")
+        agent.set_memory_from_history(self.conf_uid, agent._summary_history_uid)
+
+        await self._run(agent)
+
+        provider_messages = llm.calls[0]["messages"]
+        for message in provider_messages:
+            self.assertNotIn(
+                PROACTIVE_EMPTY_CHAT_BOOTSTRAP, str(message.get("content"))
+            )
+        self.assertEqual(provider_messages[-1]["role"], "assistant")
+        self.assertEqual(len(llm.calls), 1)
+
+    # TEST 4 — global long-term memory still reaches the proactive system prompt
+    async def test_global_memory_available_on_empty(self):
+        (agent, llm), _history_uid = _make_empty_agent(self.conf_uid)
+        agent.add_character_memory("user suka Silent Hill", explicit=True)
+        await self._run(agent)
+        self.assertIn("user suka Silent Hill", llm.calls[0]["system"])
+
+    # TEST 5 — relationship context still reaches the proactive system prompt
+    async def test_relationship_available_on_empty(self):
+        (agent, llm), _history_uid = _make_empty_agent(self.conf_uid)
+        agent.set_relationship_status("dating", trigger="synthetic_test_event")
+        await self._run(agent)
+        self.assertIn("dating", llm.calls[0]["system"])
+
+    # TEST 6 — multiple chat isolation: chat A transcript never leaks into B
+    async def test_multiple_chat_isolation(self):
+        conf_a = "mili-empty-a"
+        conf_b = "mili-empty-b"
+        history_a = create_new_history(conf_a)
+        store_message(conf_a, history_a, "human", "Kita bahas Linux kemarin.")
+        store_message(conf_a, history_a, "ai", "Iya, Arch itu ringan.")
+        (agent_a, _llm_a) = _make_agent(conf_a, history_a)
+
+        (agent_b, llm_b), history_b = _make_empty_agent(conf_b)
+        await self._run(agent_b)
+
+        provider_messages = llm_b.calls[0]["messages"]
+        self.assertEqual(
+            provider_messages[-1],
+            {"role": "user", "content": PROACTIVE_EMPTY_CHAT_BOOTSTRAP},
+        )
+        for message in provider_messages:
+            self.assertNotIn("Linux", str(message.get("content")))
+            self.assertNotIn("Arch", str(message.get("content")))
+        self.assertEqual([m["role"] for m in agent_b._memory], ["assistant"])
+        self.assertEqual(len(agent_a._memory), 2)
+        self.assertEqual(get_history(conf_b, history_b), [])
+
+    # TEST 7 — a later user reply sees Mili's proactive message as context
+    async def test_user_reply_sees_proactive_message(self):
+        (agent, llm), _history_uid = _make_empty_agent(self.conf_uid)
+        await self._run(agent)
+        self.assertEqual(len(llm.calls), 1)
+
+        batch = create_batch_input("Aku masih di sini.", None, "User")
+        _ = [output async for output in agent.chat(batch)]
+        self.assertEqual(len(llm.calls), 2)
+        next_request = llm.calls[-1]["messages"]
+        self.assertTrue(
+            any(
+                message["role"] == "assistant"
+                and "Kok jadi sepi" in str(message["content"])
+                for message in next_request
+            )
+        )
+        self.assertTrue(
+            any(
+                message["role"] == "user"
+                and "Aku masih di sini" in str(message["content"])
+                for message in next_request
+            )
+        )
+        for message in next_request:
+            self.assertNotIn(
+                PROACTIVE_EMPTY_CHAT_BOOTSTRAP, str(message.get("content"))
+            )
+
+    # TEST 8 — exactly one provider call for every proactive path
+    async def test_provider_call_count_is_one(self):
+        (agent_empty, llm_empty), _h = _make_empty_agent(self.conf_uid)
+        await self._run(agent_empty)
+        self.assertEqual(len(llm_empty.calls), 1)
+
+        agent_normal, llm_normal = _make_agent(
+            self.conf_uid, create_new_history(self.conf_uid)
+        )
+        store_message(self.conf_uid, agent_normal._summary_history_uid, "human", "Halo")
+        store_message(self.conf_uid, agent_normal._summary_history_uid, "ai", "Hai")
+        agent_normal.set_memory_from_history(self.conf_uid, agent_normal._summary_history_uid)
+        await self._run(agent_normal)
+        self.assertEqual(len(llm_normal.calls), 1)
+
+        agent_ignored, llm_ignored = _make_agent(
+            self.conf_uid, create_new_history(self.conf_uid)
+        )
+        store_message(self.conf_uid, agent_ignored._summary_history_uid, "human", "Halo")
+        store_message(self.conf_uid, agent_ignored._summary_history_uid, "ai", "Kamu suka game horror?")
+        agent_ignored.set_memory_from_history(self.conf_uid, agent_ignored._summary_history_uid)
+        outputs = [
+            output
+            async for output in agent_ignored.chat_proactively(
+                followup_context=ProactiveFollowupContext(
+                    previous_proactive_ignored=True,
+                    consecutive_ignored=1,
+                    previous_proactive_expected_response=True,
+                )
+            )
+        ]
+        self.assertTrue(outputs)
+        self.assertEqual(len(llm_ignored.calls), 1)
+
+    # TEST 9 — bootstrap appears nowhere beyond the one provider request
+    async def test_no_fake_user_anywhere(self):
+        (agent, llm), _history_uid = _make_empty_agent(self.conf_uid)
+        await self._run(agent)
+
+        self.assertFalse(
+            any(
+                PROACTIVE_EMPTY_CHAT_BOOTSTRAP in str(m.get("content") or "")
+                for m in agent._memory
+            )
+        )
+        self.assertFalse(
+            PROACTIVE_EMPTY_CHAT_BOOTSTRAP in agent._summary_state.text
+        )
+        self.assertFalse(
+            any(
+                PROACTIVE_EMPTY_CHAT_BOOTSTRAP in str(m.get("content") or "")
+                for m in llm.calls[0]["messages"][:-1]
+            )
+        )
+
+    # TEST 10 — a genuinely empty provider stream still reports empty response
+    async def test_empty_stream_still_empty(self):
+        (agent, llm), _history_uid = _make_empty_agent(self.conf_uid, llm_cls=_EmptyLLM)
+        outputs = await self._run(agent)
+
+        self.assertEqual(outputs, [])
+        # The bootstrap was still sent, but no assistant text is fabricated.
+        self.assertEqual(len(llm.calls), 1)
+        self.assertEqual(
+            llm.calls[0]["messages"][-1]["content"],
+            PROACTIVE_EMPTY_CHAT_BOOTSTRAP,
+        )
+        self.assertEqual(agent._memory, [])
+
+    # TEST 12 — semantic_auto remains authoritative on an empty proactive turn
+    async def test_semantic_auto_still_used_on_empty(self):
+        (agent, llm), _history_uid = _make_empty_agent(self.conf_uid)
+        intent_context = ProactiveIntentContext(
+            intent="",
+            strategy=ProactiveTurnStrategy.SEMANTIC_AUTO,
+            user_has_replied_since_last_proactive=True,
+            consecutive_ignored=0,
+            recent_silence_acknowledgment=False,
+        )
+        outputs = [
+            output async for output in agent.chat_proactively(
+                intent_context=intent_context
+            )
+        ]
+        self.assertTrue(outputs)
+        self.assertEqual(len(llm.calls), 1)
+        self.assertIn("strategy: semantic_auto", llm.calls[0]["system"])
+        self.assertIn(
+            SEMANTIC_PROACTIVE_INSTRUCTION.splitlines()[0],
+            llm.calls[0]["system"],
+        )
+
+    def test_has_real_dialogue_helper(self):
+        self.assertFalse(_has_real_dialogue([]))
+        self.assertFalse(
+            _has_real_dialogue([{"role": "system", "content": "x"}])
+        )
+        self.assertFalse(
+            _has_real_dialogue([{"role": "user", "content": "  "}])
+        )
+        self.assertTrue(
+            _has_real_dialogue([{"role": "user", "content": "Halo"}])
+        )
+        self.assertTrue(
+            _has_real_dialogue([{"role": "assistant", "content": "Hai"}])
+        )
 
 
 if __name__ == "__main__":
