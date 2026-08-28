@@ -78,27 +78,17 @@ from ...request_latency import (
     set_latency_phase,
 )
 
-# Request-only bootstrap for a proactive turn on a completely empty chat.
-# Short, model-neutral, and free of internal terminology: it only gives the
-# provider one non-system conversational turn so it actually generates Mili's
-# first message. It is never persisted and never enters history/summary/
-# memory/relationship processing.
-PROACTIVE_EMPTY_CHAT_BOOTSTRAP = "Initiate a natural conversation with the user now."
-
-
-def _has_real_dialogue(messages: list) -> bool:
-    """True when the transcript has at least one real user/assistant turn.
-
-    Global context (persona, relationship, long-term memory) lives in the
-    system prompt and is intentionally not counted here: a new chat may still
-    have all of that and still count as an empty conversation.
-    """
-    return any(
-        isinstance(message, dict)
-        and message.get("role") in ("user", "assistant")
-        and str(message.get("content") or "").strip()
-        for message in messages or ()
-    )
+# Request-only cue for every proactive turn. Proactive generation is a
+# system-initiated turn, so the provider request never contains a *current*
+# user turn from the real conversation; the transcript is always history.
+# Some OpenAI-compatible providers (observed: Ollama Cloud) can complete a
+# stream with zero assistant tokens when the request ends on an assistant
+# message (e.g. after Mili's first proactive message, or after any normal
+# user/assistant exchange). This short, model-neutral, request-only user turn
+# gives the provider a current generation cue. It is appended after context
+# selection, before the provider call, and is never persisted: it never enters
+# _memory, history, summary, memory parsing, relationship logic, or the UI.
+PROACTIVE_TURN_CUE = "Continue the conversation naturally on your own."
 
 
 class BasicMemoryAgent(AgentInterface):
@@ -1498,26 +1488,27 @@ class BasicMemoryAgent(AgentInterface):
                 )
                 return
 
-            # Empty-chat bootstrap: a completely new chat has zero real
-            # conversational turns, so the provider payload would be system-only
-            # and Ollama-style endpoints can complete with no assistant token.
-            # Inject ONE request-only internal user turn so the provider produces
-            # Mili's actual first message. It lives only in this local request
-            # list: it never enters _memory, history, summary, memory parsing,
+            # Ephemeral proactive turn cue: proactive generation is a
+            # system-initiated turn, so there is never a *current* user turn in
+            # the transcript (all of it is history). Some OpenAI-compatible
+            # providers complete with an empty stream when the request ends on
+            # an assistant message and no current user cue exists. Inject ONE
+            # request-only internal user turn so the provider produces the new
+            # assistant message. It lives only in this local request list: it
+            # never enters _memory, history, summary, memory parsing,
             # relationship logic, or the UI.
-            if not _has_real_dialogue(messages):
-                request_messages = [
-                    *request_messages,
-                    {"role": "user", "content": PROACTIVE_EMPTY_CHAT_BOOTSTRAP},
-                ]
-                logger.info(
-                    "Proactive generation: empty_chat_proactive_bootstrap=True, "
-                    "request_message_count_after={}",
-                    len(request_messages),
-                )
-                tracker = get_latency_tracker()
-                if tracker:
-                    tracker.message_count = len(request_messages)
+            request_messages = [
+                *request_messages,
+                {"role": "user", "content": PROACTIVE_TURN_CUE},
+            ]
+            logger.info(
+                "Proactive generation: proactive_turn_cue=True, "
+                "request_message_count_after={}",
+                len(request_messages),
+            )
+            tracker = get_latency_tracker()
+            if tracker:
+                tracker.message_count = len(request_messages)
 
             token_stream = self._llm.chat_completion(
                 request_messages,

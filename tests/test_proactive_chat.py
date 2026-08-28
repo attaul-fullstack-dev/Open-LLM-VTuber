@@ -8,9 +8,8 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from src.open_llm_vtuber.agent.agents.basic_memory_agent import (
-    PROACTIVE_EMPTY_CHAT_BOOTSTRAP,
+    PROACTIVE_TURN_CUE,
     BasicMemoryAgent,
-    _has_real_dialogue,
 )
 from src.open_llm_vtuber.agent.conversation_summary import SummaryState
 from src.open_llm_vtuber.chat_history_manager import (
@@ -101,6 +100,33 @@ class _EmptyLLM(_FakeLLM):
         )
         for _ in ():
             yield ""
+
+
+class _GemmaLikeLLM(_FakeLLM):
+    """Simulates the observed Ollama Cloud / gemma4:31b-cloud behavior.
+
+    A request whose final conversational message is an assistant turn (no
+    current user cue) completes with an empty stream; a request whose final
+    message is the ephemeral proactive turn cue produces assistant content.
+    This deterministically reproduces the live regression: the second
+    proactive turn (history ending with an assistant message) used to get an
+    empty response before the cue fix, and succeeds after it.
+    """
+
+    async def chat_completion(self, messages, system=None, tools=None):
+        self.calls.append(
+            {
+                "messages": [dict(message) for message in messages],
+                "system": system,
+            }
+        )
+        if messages and messages[-1].get("role") == "assistant":
+            for _ in ():
+                yield ""
+            return
+        # Distinct per call: _add_message deduplicates identical adjacent
+        # assistant turns, so consecutive proactive turns need unique text.
+        yield f"Proactive lanjutan yang natural, bagian {len(self.calls)}."
 
 
 def _make_agent(conf_uid, history_uid, llm_cls=_FakeLLM):
@@ -242,7 +268,22 @@ class ProactivePipelineTests(unittest.IsolatedAsyncioTestCase):
                 "Conversation context from earlier messages"
             )
         )
-        self.assertEqual(llm.calls[0]["messages"][-1]["role"], "assistant")
+        # The request now ends with exactly one current proactive turn cue; the
+        # summary + historical turns stay untouched in front of it.
+        self.assertEqual(
+            llm.calls[0]["messages"][-1],
+            {"role": "user", "content": PROACTIVE_TURN_CUE},
+        )
+        self.assertEqual(
+            llm.calls[0]["messages"].count(
+                {"role": "user", "content": PROACTIVE_TURN_CUE}
+            ),
+            1,
+        )
+        self.assertEqual(
+            [message["role"] for message in llm.calls[0]["messages"][1:-1]],
+            ["user", "assistant"],
+        )
         self.assertIn("persona Mili tetap aktif", llm.calls[0]["system"])
         self.assertIn("Internal instruction for this turn only", llm.calls[0]["system"])
 
@@ -1616,14 +1657,16 @@ class ProactiveDynamicWeightTests(unittest.TestCase):
         self.assertEqual(band_for(clamp01(5.0), 0.4, 0.7), "high")
 
 
-class ProactiveEmptyChatBootstrapTests(unittest.IsolatedAsyncioTestCase):
-    """Empty-chat proactive generation bootstrap (request-only trigger)."""
+class ProactiveTurnCueTests(unittest.IsolatedAsyncioTestCase):
+    """Proactive turn cue: one request-only user turn on every proactive
+    generation so the provider always has a current generation cue. Covers the
+    original empty-chat bootstrap AND the assistant-history follow-up case."""
 
     def setUp(self):
         self._old_cwd = os.getcwd()
         self._temp = tempfile.TemporaryDirectory()
         os.chdir(self._temp.name)
-        self.conf_uid = "mili-empty"
+        self.conf_uid = "mili-cue"
 
     def tearDown(self):
         os.chdir(self._old_cwd)
@@ -1632,8 +1675,8 @@ class ProactiveEmptyChatBootstrapTests(unittest.IsolatedAsyncioTestCase):
     async def _run(self, agent):
         return [output async for output in agent.chat_proactively()]
 
-    # TEST 1 — empty proactive chat gets exactly one request-only bootstrap turn
-    async def test_empty_chat_injects_single_bootstrap_turn(self):
+    # TEST 1 — empty proactive chat gets exactly one request-only cue turn
+    async def test_empty_chat_injects_single_cue(self):
         (agent, llm), history_uid = _make_empty_agent(self.conf_uid)
         outputs = await self._run(agent)
 
@@ -1642,26 +1685,70 @@ class ProactiveEmptyChatBootstrapTests(unittest.IsolatedAsyncioTestCase):
         provider_messages = llm.calls[0]["messages"]
         self.assertEqual(
             provider_messages[-1],
-            {"role": "user", "content": PROACTIVE_EMPTY_CHAT_BOOTSTRAP},
+            {"role": "user", "content": PROACTIVE_TURN_CUE},
         )
-        # Nothing else was in the provider request: only the one bootstrap turn.
+        # Nothing else was in the provider request: only the one cue turn.
         self.assertEqual(len(provider_messages), 1)
         self.assertIn("persona Mili tetap aktif", llm.calls[0]["system"])
         self.assertIn("Internal instruction for this turn only", llm.calls[0]["system"])
 
-    # TEST 2 — ephemeral trigger is never persisted
-    async def test_bootstrap_not_persisted(self):
+    # TEST 2 — ephemeral cue is never persisted
+    async def test_cue_not_persisted(self):
         (agent, _llm), history_uid = _make_empty_agent(self.conf_uid)
         await self._run(agent)
 
         self.assertEqual([m["role"] for m in agent._memory], ["assistant"])
         for message in agent._memory:
-            self.assertNotIn(PROACTIVE_EMPTY_CHAT_BOOTSTRAP, str(message.get("content")))
+            self.assertNotIn(PROACTIVE_TURN_CUE, str(message.get("content")))
         persisted = get_history(self.conf_uid, history_uid)
         self.assertEqual(persisted, [])
 
-    # TEST 3 — normal non-empty proactive chat is untouched
-    async def test_non_empty_proactive_unaffected(self):
+    # TEST 2b — second proactive after first assistant history still succeeds
+    # (the live regression: request used to end on an assistant message).
+    async def test_second_proactive_after_first_assistant(self):
+        (agent, llm), _history_uid = _make_empty_agent(
+            self.conf_uid, llm_cls=_GemmaLikeLLM
+        )
+        first_outputs = await self._run(agent)
+        self.assertTrue(first_outputs)
+        self.assertEqual(len(llm.calls), 1)
+
+        # History is now [assistant: <first proactive>]. Without the cue the
+        # provider-shaped fake completes empty; with the cue it must succeed.
+        second_outputs = await self._run(agent)
+        self.assertTrue(second_outputs)
+        self.assertEqual(len(llm.calls), 2)
+        provider_messages = llm.calls[1]["messages"]
+        self.assertEqual(
+            provider_messages[-1],
+            {"role": "user", "content": PROACTIVE_TURN_CUE},
+        )
+        self.assertEqual(provider_messages[0]["role"], "assistant")
+        # History stays assistant-only; the cue never persists.
+        self.assertEqual(
+            [m["role"] for m in agent._memory], ["assistant", "assistant"]
+        )
+        for message in agent._memory:
+            self.assertNotIn(PROACTIVE_TURN_CUE, str(message.get("content")))
+
+    # TEST 2c — repeated consecutive proactive turns never come back empty
+    async def test_repeated_proactive_turns_never_empty(self):
+        (agent, llm), _history_uid = _make_empty_agent(
+            self.conf_uid, llm_cls=_GemmaLikeLLM
+        )
+        for _ in range(3):
+            outputs = await self._run(agent)
+            self.assertTrue(outputs)
+        self.assertEqual(len(llm.calls), 3)
+        for call in llm.calls:
+            self.assertEqual(call["messages"][-1]["content"], PROACTIVE_TURN_CUE)
+        self.assertEqual(
+            [m["role"] for m in agent._memory],
+            ["assistant", "assistant", "assistant"],
+        )
+
+    # TEST 3 — normal non-empty proactive chat keeps history, gets one cue
+    async def test_non_empty_proactive_gets_single_cue(self):
         agent, llm = _make_agent(self.conf_uid, create_new_history(self.conf_uid))
         store_message(self.conf_uid, agent._summary_history_uid, "human", "Gw suka psychological horror.")
         store_message(self.conf_uid, agent._summary_history_uid, "ai", "Ya, karena suspense-nya beda.")
@@ -1669,13 +1756,53 @@ class ProactiveEmptyChatBootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         await self._run(agent)
 
-        provider_messages = llm.calls[0]["messages"]
-        for message in provider_messages:
-            self.assertNotIn(
-                PROACTIVE_EMPTY_CHAT_BOOTSTRAP, str(message.get("content"))
-            )
-        self.assertEqual(provider_messages[-1]["role"], "assistant")
         self.assertEqual(len(llm.calls), 1)
+        provider_messages = llm.calls[0]["messages"]
+        # Historical roles are untouched and in order.
+        self.assertEqual(
+            [m["role"] for m in provider_messages],
+            ["user", "assistant", "user"],
+        )
+        # Exactly one current request cue at the end.
+        self.assertEqual(
+            provider_messages[-1],
+            {"role": "user", "content": PROACTIVE_TURN_CUE},
+        )
+        self.assertEqual(
+            provider_messages.count(
+                {"role": "user", "content": PROACTIVE_TURN_CUE}
+            ),
+            1,
+        )
+        # Memory gains the generated assistant turn; the cue never persists.
+        self.assertEqual(
+            [m["role"] for m in agent._memory],
+            ["user", "assistant", "assistant"],
+        )
+        for message in agent._memory:
+            self.assertNotIn(PROACTIVE_TURN_CUE, str(message.get("content")))
+
+    # TEST 5 — a historical user message is NOT mistaken for the current cue
+    async def test_historical_user_message_not_current_cue(self):
+        # Synthetic setup: transcript ends with an unanswered user message.
+        agent, llm = _make_agent(self.conf_uid, create_new_history(self.conf_uid))
+        store_message(self.conf_uid, agent._summary_history_uid, "human", "Kamu suka game horror?")
+        agent.set_memory_from_history(self.conf_uid, agent._summary_history_uid)
+
+        await self._run(agent)
+
+        self.assertEqual(len(llm.calls), 1)
+        provider_messages = llm.calls[0]["messages"]
+        # The historical user question is kept, and a current cue is still
+        # appended because the transcript is history, never the current turn.
+        self.assertEqual(
+            [m["role"] for m in provider_messages], ["user", "user"]
+        )
+        self.assertEqual(
+            provider_messages[-1],
+            {"role": "user", "content": PROACTIVE_TURN_CUE},
+        )
+        self.assertEqual(provider_messages[0]["content"], "Kamu suka game horror?")
 
     # TEST 4 — global long-term memory still reaches the proactive system prompt
     async def test_global_memory_available_on_empty(self):
@@ -1684,7 +1811,7 @@ class ProactiveEmptyChatBootstrapTests(unittest.IsolatedAsyncioTestCase):
         await self._run(agent)
         self.assertIn("user suka Silent Hill", llm.calls[0]["system"])
 
-    # TEST 5 — relationship context still reaches the proactive system prompt
+    # TEST 5b — relationship context still reaches the proactive system prompt
     async def test_relationship_available_on_empty(self):
         (agent, llm), _history_uid = _make_empty_agent(self.conf_uid)
         agent.set_relationship_status("dating", trigger="synthetic_test_event")
@@ -1693,8 +1820,8 @@ class ProactiveEmptyChatBootstrapTests(unittest.IsolatedAsyncioTestCase):
 
     # TEST 6 — multiple chat isolation: chat A transcript never leaks into B
     async def test_multiple_chat_isolation(self):
-        conf_a = "mili-empty-a"
-        conf_b = "mili-empty-b"
+        conf_a = "mili-cue-a"
+        conf_b = "mili-cue-b"
         history_a = create_new_history(conf_a)
         store_message(conf_a, history_a, "human", "Kita bahas Linux kemarin.")
         store_message(conf_a, history_a, "ai", "Iya, Arch itu ringan.")
@@ -1706,7 +1833,7 @@ class ProactiveEmptyChatBootstrapTests(unittest.IsolatedAsyncioTestCase):
         provider_messages = llm_b.calls[0]["messages"]
         self.assertEqual(
             provider_messages[-1],
-            {"role": "user", "content": PROACTIVE_EMPTY_CHAT_BOOTSTRAP},
+            {"role": "user", "content": PROACTIVE_TURN_CUE},
         )
         for message in provider_messages:
             self.assertNotIn("Linux", str(message.get("content")))
@@ -1740,9 +1867,7 @@ class ProactiveEmptyChatBootstrapTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         for message in next_request:
-            self.assertNotIn(
-                PROACTIVE_EMPTY_CHAT_BOOTSTRAP, str(message.get("content"))
-            )
+            self.assertNotIn(PROACTIVE_TURN_CUE, str(message.get("content")))
 
     # TEST 8 — exactly one provider call for every proactive path
     async def test_provider_call_count_is_one(self):
@@ -1778,23 +1903,21 @@ class ProactiveEmptyChatBootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(outputs)
         self.assertEqual(len(llm_ignored.calls), 1)
 
-    # TEST 9 — bootstrap appears nowhere beyond the one provider request
+    # TEST 9 — cue appears nowhere beyond the one provider request
     async def test_no_fake_user_anywhere(self):
         (agent, llm), _history_uid = _make_empty_agent(self.conf_uid)
         await self._run(agent)
 
         self.assertFalse(
             any(
-                PROACTIVE_EMPTY_CHAT_BOOTSTRAP in str(m.get("content") or "")
+                PROACTIVE_TURN_CUE in str(m.get("content") or "")
                 for m in agent._memory
             )
         )
-        self.assertFalse(
-            PROACTIVE_EMPTY_CHAT_BOOTSTRAP in agent._summary_state.text
-        )
+        self.assertFalse(PROACTIVE_TURN_CUE in agent._summary_state.text)
         self.assertFalse(
             any(
-                PROACTIVE_EMPTY_CHAT_BOOTSTRAP in str(m.get("content") or "")
+                PROACTIVE_TURN_CUE in str(m.get("content") or "")
                 for m in llm.calls[0]["messages"][:-1]
             )
         )
@@ -1805,11 +1928,11 @@ class ProactiveEmptyChatBootstrapTests(unittest.IsolatedAsyncioTestCase):
         outputs = await self._run(agent)
 
         self.assertEqual(outputs, [])
-        # The bootstrap was still sent, but no assistant text is fabricated.
+        # The cue was still sent, but no assistant text is fabricated.
         self.assertEqual(len(llm.calls), 1)
         self.assertEqual(
             llm.calls[0]["messages"][-1]["content"],
-            PROACTIVE_EMPTY_CHAT_BOOTSTRAP,
+            PROACTIVE_TURN_CUE,
         )
         self.assertEqual(agent._memory, [])
 
@@ -1836,19 +1959,48 @@ class ProactiveEmptyChatBootstrapTests(unittest.IsolatedAsyncioTestCase):
             llm.calls[0]["system"],
         )
 
-    def test_has_real_dialogue_helper(self):
-        self.assertFalse(_has_real_dialogue([]))
-        self.assertFalse(
-            _has_real_dialogue([{"role": "system", "content": "x"}])
+    # TEST 12b — forced ignored-question stays authoritative with the cue present
+    async def test_forced_ignored_question_with_cue(self):
+        (agent, llm), _history_uid = _make_empty_agent(self.conf_uid)
+        store_message(
+            self.conf_uid, agent._summary_history_uid, "ai", "Kamu lebih suka yang mana?"
         )
-        self.assertFalse(
-            _has_real_dialogue([{"role": "user", "content": "  "}])
+        agent.set_memory_from_history(self.conf_uid, agent._summary_history_uid)
+
+        outputs = [
+            output
+            async for output in agent.chat_proactively(
+                followup_context=ProactiveFollowupContext(
+                    previous_proactive_ignored=True,
+                    consecutive_ignored=1,
+                    previous_proactive_expected_response=True,
+                )
+            )
+        ]
+        self.assertTrue(outputs)
+        self.assertEqual(len(llm.calls), 1)
+        provider_messages = llm.calls[0]["messages"]
+        self.assertEqual(
+            provider_messages[-1],
+            {"role": "user", "content": PROACTIVE_TURN_CUE},
         )
-        self.assertTrue(
-            _has_real_dialogue([{"role": "user", "content": "Halo"}])
-        )
-        self.assertTrue(
-            _has_real_dialogue([{"role": "assistant", "content": "Hai"}])
+        # The forced ignored-question system block is present, and the generic
+        # cue itself carries no ignored-question wording.
+        self.assertIn("was ignored by the user", llm.calls[0]["system"])
+        self.assertNotIn("ignored", PROACTIVE_TURN_CUE)
+
+    # TEST 15 — the cue appears exactly once per request, even with memory present
+    async def test_cue_exactly_once_with_memory(self):
+        (agent, llm), _history_uid = _make_empty_agent(self.conf_uid)
+        agent.add_character_memory("user suka Silent Hill", explicit=True)
+        await self._run(agent)
+
+        provider_messages = llm.calls[0]["messages"]
+        self.assertEqual(
+            provider_messages.count(
+                {"role": "user", "content": PROACTIVE_TURN_CUE}
+            ),
+            1,
         )
 
 
