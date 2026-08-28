@@ -76,11 +76,11 @@ class ProactiveChatConfig:
     enabled: bool = True
     initial_idle_min_seconds: int = 45
     initial_idle_max_seconds: int = 90
-    followup_idle_min_seconds: int = 90
-    followup_idle_max_seconds: int = 240
+    followup_idle_min_seconds: int = 25
+    followup_idle_max_seconds: int = 50
     ignored_before_backoff: int = 3
-    backoff_min_seconds: int = 180
-    backoff_max_seconds: int = 360
+    backoff_min_seconds: int = 45
+    backoff_max_seconds: int = 60
     intent_strategy: str = ProactiveIntentStrategy.SEMANTIC
     intent_weights: Optional[Mapping[str, float]] = None
 

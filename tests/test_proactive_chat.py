@@ -182,21 +182,63 @@ class ProactiveTimingTests(unittest.TestCase):
         self.assertEqual(state.activity_revision, 1)
 
     def test_followup_and_three_ignored_backoff_ranges(self):
-        state = self.machine.new_state("chat-a")
-        self.machine.record_proactive_sent(state)
+        # Dedicated machine whose mocked randint returns values inside the new
+        # ranges so the delay assertions reflect the configured bounds.
+        values = iter([60, 30, 40, 55])
+        machine = ProactiveStateMachine(
+            ProactiveChatConfig(),
+            monotonic=self.clock,
+            randint=lambda _minimum, _maximum: next(values),
+        )
+        state = machine.new_state("chat-a")
+
+        # First ignored follow-up must be inside 25--50s.
+        machine.record_proactive_sent(state)
         first_delay = state.next_proactive_eligible_at - self.clock()
-        self.assertGreaterEqual(first_delay, 90)
-        self.assertLessEqual(first_delay, 240)
+        self.assertGreaterEqual(first_delay, 25)
+        self.assertLessEqual(first_delay, 50)
 
-        self.machine.record_proactive_sent(state)
+        # Second ignored follow-up must also be inside 25--50s.
+        machine.record_proactive_sent(state)
         second_delay = state.next_proactive_eligible_at - self.clock()
-        self.assertGreaterEqual(second_delay, 90)
-        self.assertLessEqual(second_delay, 240)
+        self.assertGreaterEqual(second_delay, 25)
+        self.assertLessEqual(second_delay, 50)
 
-        self.machine.record_proactive_sent(state)
+        # After 3 consecutive ignored, backoff must be inside 45--60s and must
+        # never exceed 60s.
+        machine.record_proactive_sent(state)
         backoff = state.next_proactive_eligible_at - self.clock()
-        self.assertGreaterEqual(backoff, 180)
-        self.assertLessEqual(backoff, 360)
+        self.assertGreaterEqual(backoff, 45)
+        self.assertLessEqual(backoff, 60)
+
+    def test_initial_proactive_min_max_unchanged(self):
+        # The first proactive after user inactivity must remain exactly 45--90s.
+        values = iter([45, 90])
+        for expected_delay in (45, 90):
+            clock = _Clock()
+            machine = ProactiveStateMachine(
+                ProactiveChatConfig(),
+                monotonic=clock,
+                randint=lambda _minimum, _maximum: next(values),
+            )
+            state = machine.new_state("chat-a")
+            initial_delay = state.next_proactive_eligible_at - clock()
+            self.assertEqual(initial_delay, expected_delay)
+            self.assertGreaterEqual(initial_delay, 45)
+            self.assertLessEqual(initial_delay, 90)
+
+    def test_no_followup_window_exceeds_60s(self):
+        cfg = ProactiveChatConfig()
+        for label, minimum, maximum in (
+            ("initial", cfg.initial_idle_min_seconds, cfg.initial_idle_max_seconds),
+            ("followup", cfg.followup_idle_min_seconds, cfg.followup_idle_max_seconds),
+            ("backoff", cfg.backoff_min_seconds, cfg.backoff_max_seconds),
+        ):
+            # The spec targets follow-up/backoff windows; both must cap at 60s
+            # so no proactive follow-up is ever pushed out beyond a minute.
+            if label != "initial":
+                self.assertLessEqual(maximum, 60, f"{label} window exceeds 60s")
+                self.assertLessEqual(minimum, maximum)
 
     def test_new_chat_runtime_state_is_independent(self):
         state_a = self.machine.new_state("chat-a")
@@ -229,7 +271,7 @@ class ProactiveTimingTests(unittest.TestCase):
                 settings.backoff_min_seconds,
                 settings.backoff_max_seconds,
             ),
-            (45, 90, 90, 240, 3, 180, 360),
+            (45, 90, 25, 50, 3, 45, 60),
         )
 
 
