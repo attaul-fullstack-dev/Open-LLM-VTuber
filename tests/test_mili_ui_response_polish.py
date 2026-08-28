@@ -19,7 +19,8 @@ class MiliEmojiPersonaContractTests(unittest.TestCase):
         lowered = persona.lower()
         self.assertIn("sesekali memakai emoji", lowered)
         self.assertIn("biasanya gunakan 0--1 emoji", lowered)
-        self.assertIn("sebagian besar pesan", lowered)
+        self.assertIn("cukup sering agar terasa", lowered)
+        self.assertIn("jangan sampai muncul di setiap jawaban", lowered)
         self.assertIn("jangan menempelkan emoji secara mekanis", lowered)
         self.assertIn("jangan memakai rangkaian emoji", lowered)
 
