@@ -63,7 +63,7 @@ class ToolExecutor:
                 tool_input = {}
 
             if not tool_id or not tool_name:
-                logger.error(f"Invalid Dict tool call structure: {call}")
+                logger.error("Invalid dict tool call structure (content omitted)")
                 result_content = "Error: Invalid tool call structure from LLM."
                 is_error = True
                 parse_error = True
@@ -171,7 +171,7 @@ class ToolExecutor:
                 parse_error,
             ) = self.parse_tool_call(call)
 
-            logger.info(f"Executing tool: {call}")
+            logger.info("Executing tool '{}' (input omitted)", tool_name or "unknown")
 
             if parse_error:
                 logger.warning(
@@ -281,9 +281,7 @@ class ToolExecutor:
             if tool_name == "stagehand_navigate" and not is_error:
                 live_view_data = metadata.get("liveViewData", {})
                 if live_view_data:
-                    logger.info(
-                        f"Found live view data for stagehand_navigate: {live_view_data}"
-                    )
+                    logger.info("Found live view data for stagehand_navigate")
                     status_update["browser_view"] = live_view_data
 
             yield status_update
@@ -353,20 +351,15 @@ class ToolExecutor:
                 if not is_error:
                     logger.info(f"Tool '{tool_name}' executed successfully.")
                     if content_items:
-                        logger.info(f"Content items from tool '{tool_name}':")
-                        for item in content_items:
-                            item_type = item.get("type", "unknown")
-                            logger.info(f"  Type: {item_type}")
-                            for key, value in item.items():
-                                if (
-                                    key != "type" and key != "data"
-                                ):  # Avoid logging large data
-                                    log_value = (
-                                        f"(length: {len(value)})"
-                                        if isinstance(value, str) and len(value) > 100
-                                        else value
-                                    )
-                                    logger.info(f"    {key}: {log_value}")
+                        item_types = [
+                            item.get("type", "unknown") for item in content_items
+                        ]
+                        logger.info(
+                            "Tool '{}' returned {} content item(s), types={}",
+                            tool_name,
+                            len(content_items),
+                            item_types,
+                        )
 
             except (ValueError, RuntimeError, ConnectionError) as e:
                 logger.exception(f"Error executing tool '{tool_name}': {e}")

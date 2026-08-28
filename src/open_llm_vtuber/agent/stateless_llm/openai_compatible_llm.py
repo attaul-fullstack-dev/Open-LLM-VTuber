@@ -9,6 +9,7 @@ from openai import (
     AsyncOpenAI,
     APIError,
     APIConnectionError,
+    APITimeoutError,
     RateLimitError,
     NotGiven,
     NOT_GIVEN,
@@ -16,9 +17,16 @@ from openai import (
 from openai.types.chat import ChatCompletionChunk
 from openai.types.chat.chat_completion_chunk import ChoiceDeltaToolCall
 from loguru import logger
+import time
 
 from .stateless_llm_interface import StatelessLLMInterface
 from ...mcpp.types import ToolCallObject
+from ...request_latency import (
+    build_attempt_tracking_http_client,
+    describe_provider_config,
+    get_latency_phase,
+    get_latency_tracker,
+)
 
 
 class AsyncLLM(StatelessLLMInterface):
@@ -30,6 +38,8 @@ class AsyncLLM(StatelessLLMInterface):
         organization_id: str = "z",
         project_id: str = "z",
         temperature: float = 1.0,
+        top_p: float | None = None,
+        max_tokens: int | None = None,
     ):
         """
         Initializes an instance of the `AsyncLLM` class.
@@ -41,20 +51,35 @@ class AsyncLLM(StatelessLLMInterface):
         - project_id (str, optional): The project ID for the OpenAI API. Defaults to "z".
         - llm_api_key (str, optional): The API key for the OpenAI API. Defaults to "z".
         - temperature (float, optional): What sampling temperature to use, between 0 and 2. Defaults to 1.0.
+        - top_p (float, optional): Nucleus sampling probability. Omitted when unset.
+        - max_tokens (int, optional): Maximum output tokens. Omitted when unset.
         """
         self.base_url = base_url
         self.model = model
         self.temperature = temperature
+        self.top_p = top_p
+        self.max_tokens = max_tokens
         self.client = AsyncOpenAI(
             base_url=base_url,
             organization=organization_id,
             project=project_id,
             api_key=llm_api_key,
+            http_client=build_attempt_tracking_http_client(),
         )
         self.support_tools = True
 
+        provider_config = describe_provider_config(self.client)
         logger.info(
-            f"Initialized AsyncLLM with the parameters: {self.base_url}, {self.model}"
+            "Initialized AsyncLLM: base_url={}, model={}, temperature={}, "
+            "top_p={}, max_tokens={}, provider_client_timeout_s={}, "
+            "provider_max_retries={}",
+            self.base_url,
+            self.model,
+            self.temperature,
+            self.top_p,
+            self.max_tokens,
+            provider_config.get("provider_client_timeout_s"),
+            provider_config.get("provider_max_retries"),
         )
 
     async def chat_completion(
@@ -81,6 +106,11 @@ class AsyncLLM(StatelessLLMInterface):
         - APIError: For other API-related errors
         """
         stream = None
+        tracker = get_latency_tracker()
+        latency_phase = get_latency_phase()
+        call_started_ms = time.perf_counter() * 1000
+        first_chunk_seen = False
+        first_content_seen = False
         # Tool call related state variables
         accumulated_tool_calls = {}
         in_tool_call = False
@@ -93,27 +123,51 @@ class AsyncLLM(StatelessLLMInterface):
                     {"role": "system", "content": system},
                     *messages,
                 ]
-            logger.debug(f"Messages: {messages_with_system}")
+            logger.debug(
+                "Preparing chat request: model={}, messages={}, system_present={}",
+                self.model,
+                len(messages_with_system),
+                bool(system),
+            )
 
             available_tools = tools if self.support_tools else NOT_GIVEN
 
+            if tracker and latency_phase == "chat":
+                tracker.provider_prepare_started()
+            request_params: Dict[str, Any] = {
+                "messages": messages_with_system,
+                "model": self.model,
+                "stream": True,
+                "temperature": self.temperature,
+                "tools": available_tools,
+            }
+            if self.top_p is not None:
+                request_params["top_p"] = self.top_p
+            if self.max_tokens is not None:
+                request_params["max_tokens"] = self.max_tokens
+            if tracker and latency_phase == "chat":
+                tracker.provider_prepare_done()
+                tracker.provider_started()
             stream: AsyncStream[
                 ChatCompletionChunk
-            ] = await self.client.chat.completions.create(
-                messages=messages_with_system,
-                model=self.model,
-                stream=True,
-                temperature=self.temperature,
-                tools=available_tools,
-            )
+            ] = await self.client.chat.completions.create(**request_params)
+            if tracker and latency_phase == "chat":
+                tracker.provider_headers_received()
+            tool_count = len(tools or []) if self.support_tools else 0
             logger.debug(
-                f"Tool Support: {self.support_tools}, Available tools: {available_tools}"
+                "Tool support enabled={}, available_tool_count={}",
+                self.support_tools,
+                tool_count,
             )
 
             async for chunk in stream:
                 # Guard against chunks with missing choices field (e.g., from OpenWebUI)
                 if not chunk.choices:
                     continue
+
+                if tracker and latency_phase == "chat" and not first_chunk_seen:
+                    first_chunk_seen = True
+                    tracker.provider_first_chunk()
 
                 if self.support_tools:
                     has_tool_calls = (
@@ -123,7 +177,8 @@ class AsyncLLM(StatelessLLMInterface):
 
                     if has_tool_calls:
                         logger.debug(
-                            f"Tool calls detected in chunk: {chunk.choices[0].delta.tool_calls}"
+                            "Tool call chunks detected (count={})",
+                            len(chunk.choices[0].delta.tool_calls),
                         )
                         in_tool_call = True
                         # Process tool calls in the current chunk
@@ -170,7 +225,10 @@ class AsyncLLM(StatelessLLMInterface):
                     elif in_tool_call and not has_tool_calls:
                         in_tool_call = False
                         # Convert accumulated tool calls to the required format and output
-                        logger.info(f"Complete tool calls: {accumulated_tool_calls}")
+                        logger.info(
+                            "Tool calls completed (count={})",
+                            len(accumulated_tool_calls),
+                        )
 
                         # Use the from_dict method to create a ToolCallObject instance from a dictionary
                         complete_tool_calls = [
@@ -187,11 +245,24 @@ class AsyncLLM(StatelessLLMInterface):
                     continue
                 elif chunk.choices[0].delta.content is None:
                     chunk.choices[0].delta.content = ""
-                yield chunk.choices[0].delta.content
+                content = chunk.choices[0].delta.content
+                if content:
+                    if tracker and latency_phase == "chat" and not first_content_seen:
+                        first_content_seen = True
+                        await tracker.provider_first_token()
+                    if tracker and latency_phase == "chat":
+                        tracker.output_chars += len(content)
+                yield content
+
+            if tracker and latency_phase == "chat":
+                tracker.provider_stream_completed()
 
             # If stream ends while still in a tool call, make sure to yield the tool call
             if in_tool_call and accumulated_tool_calls:
-                logger.info(f"Final tool call at stream end: {accumulated_tool_calls}")
+                logger.info(
+                    "Final tool calls completed at stream end (count={})",
+                    len(accumulated_tool_calls),
+                )
 
                 # Create a ToolCallObject instance from a dictionary using the from_dict method.
                 complete_tool_calls = [
@@ -201,16 +272,28 @@ class AsyncLLM(StatelessLLMInterface):
 
                 yield complete_tool_calls
 
+        except APITimeoutError as e:
+            logger.error(
+                f"Error calling the chat endpoint: Timeout. Failed to connect to the LLM API. \nCheck the configurations and the reachability of the LLM backend. \nSee the logs for details. \nTroubleshooting with documentation: https://open-llm-vtuber.github.io/docs/faq#%E9%81%87%E5%88%B0-error-calling-the-chat-endpoint-%E9%94%99%E8%AF%AF%E6%80%8E%E4%B9%88%E5%8A%9E \n{e.__cause__}"
+            )
+            if tracker and latency_phase == "chat":
+                tracker.record_provider_error("timeout")
+            yield "Error calling the chat endpoint: Timeout. Failed to connect to the LLM API. Check the configurations and the reachability of the LLM backend. See the logs for details."
+
         except APIConnectionError as e:
             logger.error(
                 f"Error calling the chat endpoint: Connection error. Failed to connect to the LLM API. \nCheck the configurations and the reachability of the LLM backend. \nSee the logs for details. \nTroubleshooting with documentation: https://open-llm-vtuber.github.io/docs/faq#%E9%81%87%E5%88%B0-error-calling-the-chat-endpoint-%E9%94%99%E8%AF%AF%E6%80%8E%E4%B9%88%E5%8A%9E \n{e.__cause__}"
             )
+            if tracker and latency_phase == "chat":
+                tracker.record_provider_error("connection_error")
             yield "Error calling the chat endpoint: Connection error. Failed to connect to the LLM API. Check the configurations and the reachability of the LLM backend. See the logs for details. Troubleshooting with documentation: [https://open-llm-vtuber.github.io/docs/faq#%E9%81%87%E5%88%B0-error-calling-the-chat-endpoint-%E9%94%99%E8%AF%AF%E6%80%8E%E4%B9%88%E5%8A%9E]"
 
         except RateLimitError as e:
             logger.error(
                 f"Error calling the chat endpoint: Rate limit exceeded: {e.response}"
             )
+            if tracker and latency_phase == "chat":
+                tracker.record_provider_error("rate_limit")
             yield "Error calling the chat endpoint: Rate limit exceeded. Please try again later. See the logs for details."
 
         except APIError as e:
@@ -224,11 +307,21 @@ class AsyncLLM(StatelessLLMInterface):
             logger.error(f"LLM API: Error occurred: {e}")
             logger.info(f"Base URL: {self.base_url}")
             logger.info(f"Model: {self.model}")
-            logger.info(f"Messages: {messages}")
+            logger.info("Message count: {}", len(messages))
             logger.info(f"temperature: {self.temperature}")
+            if tracker and latency_phase == "chat":
+                tracker.record_provider_error("api_error")
             yield "Error calling the chat endpoint: Error occurred while generating response. See the logs for details."
 
         finally:
+            if tracker:
+                if latency_phase == "chat":
+                    tracker.provider_finished()
+                elif latency_phase == "summary":
+                    tracker.add_summary(
+                        time.perf_counter() * 1000 - call_started_ms,
+                        triggered=True,
+                    )
             # make sure the stream is properly closed
             # so when interrupted, no more tokens will being generated.
             if stream:

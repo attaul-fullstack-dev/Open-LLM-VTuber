@@ -64,6 +64,11 @@ async def handle_conversation_trigger(
         )
     elif msg_type == "text-input":
         user_input = data.get("text", "")
+        metadata = {
+            "latency_request_id": data.get("request_id"),
+            "client_user_send_ms": data.get("client_user_send_ms"),
+            "client_websocket_send_ms": data.get("client_websocket_send_ms"),
+        }
     else:  # mic-audio-end
         user_input = received_data_buffers[client_uid]
         received_data_buffers[client_uid] = np.array([])

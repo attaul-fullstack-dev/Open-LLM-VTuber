@@ -92,12 +92,12 @@ async def handle_sentence_output(
     """Handle sentence output type with optional translation support"""
     full_response = ""
     async for display_text, tts_text, actions in output:
-        logger.debug(f"🏃 Processing output: '''{tts_text}'''...")
+        logger.debug("Processing TTS output (characters={})", len(tts_text))
 
         if translate_engine:
             if len(re.sub(r'[\s.,!?，。！？\'"』」）】\s]+', "", tts_text)):
                 tts_text = translate_engine.translate(tts_text)
-            logger.info(f"🏃 Text after translation: '''{tts_text}'''...")
+            logger.info("TTS translation completed (characters={})", len(tts_text))
         else:
             logger.debug("🚫 No translation engine available. Skipping translation.")
 
@@ -118,6 +118,8 @@ async def handle_audio_output(
     websocket_send: WebSocketSend,
 ) -> str:
     """Process and send AudioOutput directly to the client"""
+    from ..request_latency import get_latency_tracker
+
     full_response = ""
     async for audio_path, display_text, transcript, actions in output:
         full_response += transcript
@@ -126,6 +128,9 @@ async def handle_audio_output(
             display_text=display_text,
             actions=actions.to_dict() if actions else None,
         )
+        tracker = get_latency_tracker()
+        if tracker:
+            audio_payload["request_id"] = tracker.request_id
         await websocket_send(json.dumps(audio_payload))
     return full_response
 
@@ -140,7 +145,6 @@ async def send_conversation_start_signals(websocket_send: WebSocketSend) -> None
             }
         )
     )
-    await websocket_send(json.dumps({"type": "full-text", "text": "Thinking..."}))
 
 
 async def process_user_input(
@@ -166,13 +170,23 @@ async def finalize_conversation_turn(
     broadcast_ctx: Optional[BroadcastContext] = None,
 ) -> None:
     """Finalize a conversation turn"""
+    from ..request_latency import get_latency_tracker
+
+    tracker = get_latency_tracker()
     if tts_manager.task_list:
         await asyncio.gather(*tts_manager.task_list)
         await websocket_send(json.dumps({"type": "backend-synth-complete"}))
 
+        if tracker:
+            tracker.mark("playback_start")
         response = await message_handler.wait_for_response(
             client_uid, "frontend-playback-complete"
         )
+        if tracker:
+            tracker.mark("playback_end")
+            tracker.add_playback_wait(
+                tracker.phase_duration("playback_start", "playback_end") or 0.0
+            )
 
         if not response:
             logger.warning(f"No playback completion response from {client_uid}")

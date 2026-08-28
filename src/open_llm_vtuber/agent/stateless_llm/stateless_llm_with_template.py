@@ -136,7 +136,7 @@ class AsyncLLMWithTemplate(StatelessLLMInterface):
         - RateLimitError: When a 429 status code is received
         - APIError: For other API-related errors
         """
-        logger.debug(f"Messages: {messages}")
+        logger.debug("Preparing templated completion: messages={}", len(messages))
         bos_token = "<|begin_of_text|>"
         stream = None
         try:
@@ -172,7 +172,7 @@ class AsyncLLMWithTemplate(StatelessLLMInterface):
             logger.error(f"LLM API WITH TEMPLATE: Error occurred: {e}")
             logger.info(f"Base URL: {self.base_url}")
             logger.info(f"Model: {self.model}")
-            logger.info(f"Messages: {messages}")
+            logger.info("Message count: {}", len(messages))
             logger.info(f"temperature: {self.temperature}")
             yield "Error calling the chat endpoint: Error occurred while generating response. See the logs for details."
         finally:

@@ -68,6 +68,28 @@ character_config:
         # 'Plus' 意味着它包含了通过 OpenAI API 调用工具的能力。
         use_mcpp: False
         mcp_enabled_servers: ["time", "ddg-search"] # 启用的 MCP 服务器
+        # 将最近对话保留在当前模型的上下文窗口内。
+        context_management_enabled: True
+        # 可选的模型上下文上限覆盖值；null 使用集中式模型元数据/回退值。
+        context_window_override: null
+        # 除最大输出 token 外，额外保留的输入安全余量。
+        context_safety_margin: 1024
+        # 仅在上下文裁剪发生时增量总结旧轮次。
+        rolling_summary_enabled: True
+        # 紧凑摘要的目标/硬上限（保守估算 token）。
+        summary_target_tokens: 320
+        summary_max_tokens: 384
+        # 一次摘要更新前最少新增的被裁剪消息数。
+        summary_min_new_messages: 4
+        # 允许角色在随机空闲时间后主动发起聊天。
+        proactive_enabled: True
+        initial_idle_min_seconds: 45
+        initial_idle_max_seconds: 90
+        followup_idle_min_seconds: 90
+        followup_idle_max_seconds: 240
+        ignored_before_backoff: 3
+        backoff_min_seconds: 180
+        backoff_max_seconds: 360
 
       hume_ai_agent:
         api_key: ''
@@ -126,9 +148,12 @@ character_config:
         verbose: False # 是否输出详细信息
 
       ollama_llm:
-        base_url: 'http://localhost:11434/v1' # 基础 URL
+        base_url: 'http://localhost:11434/v1' # Ollama Cloud 请使用 'https://ollama.com/v1'
+        llm_api_key: 'default_api_key' # Ollama Cloud 请使用 '${OLLAMA_API_KEY}'；本地会忽略。
         model: 'qwen2.5:latest' # 使用的模型
         temperature: 1.0 # 温度，介于 0 到 2 之间
+        top_p: null # 可选的核采样概率
+        max_tokens: null # 可选的最大输出 token 数
         # 不活动后模型在内存中保留的时间（秒）
         # 设置为 -1 表示模型将永远保留在内存中（即使退出 open llm vtuber 之后也是）
         keep_alive: -1
@@ -160,14 +185,19 @@ character_config:
         temperature: 0.7 # 注意，DeepSeek 的温度范围是 0 到 1
 
       mistral_llm:
-        llm_api_key: 'Your Mistral API key' # Mistral API 密钥
+        llm_api_key: '${MISTRAL_API_KEY}' # 从环境变量读取；conf.yaml 仍可覆盖。
         model: 'pixtral-large-latest' # 使用的模型
         temperature: 1.0 # 温度，介于 0 到 2 之间
+        # 可选的 Mistral 生成参数。删除后将使用服务商默认值。
+        top_p: 0.9 # 取值范围 0 到 1
+        max_tokens: 384 # 最大输出 token 数
 
       groq_llm:
-        llm_api_key: 'your groq API key' # Groq API 密钥
-        model: 'llama-3.3-70b-versatile' # 使用的模型
-        temperature: 1.0 # 温度，介于 0 到 2 之间
+        llm_api_key: '${GROQ_API_KEY}' # 从环境变量读取；conf.yaml 仍可覆盖。
+        model: 'openai/gpt-oss-20b' # 使用的模型
+        temperature: 0.8 # 温度，介于 0 到 2 之间
+        top_p: 0.9 # 取值范围 0 到 1
+        max_tokens: 384 # 最大输出 token 数
 
   # === 自动语音识别 ===
   asr_config:

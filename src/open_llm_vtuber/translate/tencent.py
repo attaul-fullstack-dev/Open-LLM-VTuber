@@ -114,7 +114,10 @@ class TencentTranslate(TranslateInterface):
                 url="https://" + self.host, headers=headers, data=payload
             )
             res = response.json()
-            logger.info(f"Request successful: {res}")
+            logger.info(
+                "Translation request successful (response_chars={})",
+                len(json.dumps(res)),
+            )
             return res.get("Response", {}).get("TargetText", "Translation failed")
         except Exception as e:
             logger.critical(f"API call error: {e}")

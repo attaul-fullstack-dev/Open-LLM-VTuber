@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+import time
 import uuid
 from datetime import datetime
 from typing import List, Optional, Dict
@@ -63,7 +64,9 @@ class TTSTaskManager:
             return
 
         logger.debug(
-            f"🏃Queuing TTS task for: '''{tts_text}''' (by {display_text.name})"
+            "Queuing TTS task (characters={}, speaker_set={})",
+            len(tts_text),
+            bool(display_text.name),
         )
 
         # Get current sequence number
@@ -120,11 +123,16 @@ class TTSTaskManager:
         sequence_number: int,
     ) -> None:
         """Queue a silent audio payload"""
+        from ..request_latency import get_latency_tracker
+
         audio_payload = prepare_audio_payload(
             audio_path=None,
             display_text=display_text,
             actions=actions,
         )
+        tracker = get_latency_tracker()
+        if tracker:
+            audio_payload["request_id"] = tracker.request_id
         await self._payload_queue.put((audio_payload, sequence_number))
 
     async def _process_tts(
@@ -137,14 +145,24 @@ class TTSTaskManager:
         sequence_number: int,
     ) -> None:
         """Process TTS generation and queue the result for ordered delivery"""
+        from ..request_latency import get_latency_tracker
+
+        tracker = get_latency_tracker()
         audio_file_path = None
+        synthesis_started = time.perf_counter()
         try:
             audio_file_path = await self._generate_audio(tts_engine, tts_text)
+            if tracker:
+                tracker.add_tts_synthesis(
+                    (time.perf_counter() - synthesis_started) * 1000
+                )
             payload = prepare_audio_payload(
                 audio_path=audio_file_path,
                 display_text=display_text,
                 actions=actions,
             )
+            if tracker:
+                payload["request_id"] = tracker.request_id
             # Queue the payload with its sequence number
             await self._payload_queue.put((payload, sequence_number))
 
@@ -156,6 +174,8 @@ class TTSTaskManager:
                 display_text=display_text,
                 actions=actions,
             )
+            if tracker:
+                payload["request_id"] = tracker.request_id
             await self._payload_queue.put((payload, sequence_number))
 
         finally:
@@ -165,7 +185,7 @@ class TTSTaskManager:
 
     async def _generate_audio(self, tts_engine: TTSInterface, text: str) -> str:
         """Generate audio file from text"""
-        logger.debug(f"🏃Generating audio for '''{text}'''...")
+        logger.debug("Generating TTS audio (characters={})", len(text))
         return await tts_engine.async_generate_audio(
             text=text,
             file_name_no_ext=f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{str(uuid.uuid4())[:8]}",

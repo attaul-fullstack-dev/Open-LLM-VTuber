@@ -178,7 +178,7 @@ def init_webtool_routes(default_context_cache: ServiceContext) -> APIRouter:
             text = await default_context_cache.asr_engine.async_transcribe_np(
                 audio_array
             )
-            logger.info(f"Transcription result: {text}")
+            logger.info("Transcription completed (characters={})", len(text))
             return {"text": text}
 
         except ValueError as e:
@@ -211,7 +211,7 @@ def init_webtool_routes(default_context_cache: ServiceContext) -> APIRouter:
                 if not text:
                     continue
 
-                logger.info(f"Received text for TTS: {text}")
+                logger.info("Received text for TTS (characters={})", len(text))
 
                 # Split text into sentences
                 sentences = [s.strip() for s in text.split(".") if s.strip()]
@@ -227,7 +227,9 @@ def init_webtool_routes(default_context_cache: ServiceContext) -> APIRouter:
                             )
                         )
                         logger.info(
-                            f"Generated audio for sentence: {sentence} at: {audio_path}"
+                            "Generated TTS audio (characters={}, file_created={})",
+                            len(sentence),
+                            bool(audio_path),
                         )
 
                         await websocket.send_json(

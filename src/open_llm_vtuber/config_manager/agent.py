@@ -33,6 +33,25 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
     segment_method: Literal["regex", "pysbd"] = Field("pysbd", alias="segment_method")
     use_mcpp: Optional[bool] = Field(False, alias="use_mcpp")
     mcp_enabled_servers: Optional[List[str]] = Field([], alias="mcp_enabled_servers")
+    context_management_enabled: bool = Field(True, alias="context_management_enabled")
+    context_window_override: Optional[int] = Field(
+        None, gt=0, alias="context_window_override"
+    )
+    context_safety_margin: int = Field(1024, ge=0, alias="context_safety_margin")
+    rolling_summary_enabled: bool = Field(True, alias="rolling_summary_enabled")
+    summary_target_tokens: int = Field(320, gt=0, alias="summary_target_tokens")
+    summary_max_tokens: int = Field(384, gt=0, alias="summary_max_tokens")
+    summary_min_new_messages: int = Field(
+        4, gt=0, alias="summary_min_new_messages"
+    )
+    proactive_enabled: bool = Field(True, alias="proactive_enabled")
+    initial_idle_min_seconds: int = Field(45, ge=0, alias="initial_idle_min_seconds")
+    initial_idle_max_seconds: int = Field(90, ge=0, alias="initial_idle_max_seconds")
+    followup_idle_min_seconds: int = Field(90, ge=0, alias="followup_idle_min_seconds")
+    followup_idle_max_seconds: int = Field(240, ge=0, alias="followup_idle_max_seconds")
+    ignored_before_backoff: int = Field(3, gt=0, alias="ignored_before_backoff")
+    backoff_min_seconds: int = Field(180, ge=0, alias="backoff_min_seconds")
+    backoff_max_seconds: int = Field(360, ge=0, alias="backoff_max_seconds")
 
     DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
         "llm_provider": Description(
@@ -54,6 +73,66 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
         "mcp_enabled_servers": Description(
             en="List of MCP servers to enable for the agent",
             zh="为智能体启用 MCP 服务器列表",
+        ),
+        "context_management_enabled": Description(
+            en="Trim only the request context when conversation history exceeds the model budget (default: True)",
+            zh="当对话历史超过模型预算时，仅裁剪请求上下文（默认：True）",
+        ),
+        "context_window_override": Description(
+            en="Optional context-window token limit override for the active model",
+            zh="当前模型可选的上下文窗口 token 上限覆盖值",
+        ),
+        "context_safety_margin": Description(
+            en="Tokens reserved as a safety margin in addition to output tokens (default: 1024)",
+            zh="除输出 token 外额外保留的安全余量（默认：1024）",
+        ),
+        "rolling_summary_enabled": Description(
+            en="Incrementally summarize old turns only when context trimming occurs (default: True)",
+            zh="仅在上下文裁剪发生时增量总结旧轮次（默认：True）",
+        ),
+        "summary_target_tokens": Description(
+            en="Target size for each compact rolling summary (default: 320 estimated tokens)",
+            zh="滚动摘要的目标大小（默认：约 320 token）",
+        ),
+        "summary_max_tokens": Description(
+            en="Hard estimated-token cap for stored conversation summaries (default: 384)",
+            zh="存储的对话摘要估算 token 硬上限（默认：384）",
+        ),
+        "summary_min_new_messages": Description(
+            en="Minimum newly evicted messages before updating a summary (default: 4)",
+            zh="更新摘要前至少新增的被裁剪消息数（默认：4）",
+        ),
+        "proactive_enabled": Description(
+            en="Allow the character to initiate chat after randomized idle periods",
+            zh="允许角色在随机空闲时间后主动发起聊天",
+        ),
+        "initial_idle_min_seconds": Description(
+            en="Minimum initial idle delay before proactive chat (default: 45 seconds)",
+            zh="首次主动聊天前的最短空闲时间（默认：45 秒）",
+        ),
+        "initial_idle_max_seconds": Description(
+            en="Maximum initial idle delay before proactive chat (default: 90 seconds)",
+            zh="首次主动聊天前的最长空闲时间（默认：90 秒）",
+        ),
+        "followup_idle_min_seconds": Description(
+            en="Minimum delay after an ignored proactive message (default: 90 seconds)",
+            zh="主动消息未回复后的最短间隔（默认：90 秒）",
+        ),
+        "followup_idle_max_seconds": Description(
+            en="Maximum delay after an ignored proactive message (default: 240 seconds)",
+            zh="主动消息未回复后的最长间隔（默认：240 秒）",
+        ),
+        "ignored_before_backoff": Description(
+            en="Ignored proactive messages before applying backoff (default: 3)",
+            zh="触发退避前连续未回复的主动消息数（默认：3）",
+        ),
+        "backoff_min_seconds": Description(
+            en="Minimum proactive backoff delay (default: 180 seconds)",
+            zh="主动聊天退避的最短时间（默认：180 秒）",
+        ),
+        "backoff_max_seconds": Description(
+            en="Maximum proactive backoff delay (default: 360 seconds)",
+            zh="主动聊天退避的最长时间（默认：360 秒）",
         ),
     }
 

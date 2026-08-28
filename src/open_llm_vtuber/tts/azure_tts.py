@@ -87,13 +87,13 @@ class TTSEngine(TTSInterface):
         # check if the text is empty or not a string
         if not isinstance(text, str):
             logger.warning("AzureTTS: The text cannot be non-string.")
-            logger.warning(f"Received type: {type(text)} and value: {text}")
+            logger.warning("Received invalid TTS input type: {}", type(text))
             return
         text = text.strip()
 
         if text.strip() == "":
             logger.warning("AzureTTS: There is no text to speak.")
-            logger.info(f"Received text: {text}")
+            logger.info("Received empty TTS text")
             return
 
         # Wrap the text with SSML to adjust pitch and rate
@@ -121,7 +121,7 @@ class TTSEngine(TTSInterface):
         ):
             if on_speak_end_callback is not None:
                 on_speak_end_callback()
-            logger.info(f">> Speech synthesized for text [{text}]")
+            logger.info("Speech synthesized (characters={})", len(text))
         elif speech_synthesis_result.reason == speechsdk.ResultReason.Canceled:
             cancellation_details = speech_synthesis_result.cancellation_details
             logger.info(f"Speech synthesis canceled: {cancellation_details.reason}")

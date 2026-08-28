@@ -2,9 +2,30 @@ import os
 import re
 import json
 import uuid
+import threading
 from datetime import datetime
 from typing import Literal, List, TypedDict, Optional
 from loguru import logger
+
+
+_history_locks: dict[str, threading.RLock] = {}
+_history_locks_guard = threading.Lock()
+
+
+def _get_history_lock(filepath: str) -> threading.RLock:
+    with _history_locks_guard:
+        return _history_locks.setdefault(filepath, threading.RLock())
+
+
+def _write_history_atomic(filepath: str, history_data: list) -> None:
+    temporary_path = f"{filepath}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(temporary_path, "w", encoding="utf-8") as file:
+            json.dump(history_data, file, ensure_ascii=False, indent=2)
+        os.replace(temporary_path, filepath)
+    finally:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
 
 
 class HistoryMessage(TypedDict):
@@ -78,6 +99,8 @@ def create_new_history(conf_uid: str) -> str:
             {
                 "role": "metadata",
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "relationship_status": "stranger",
+                "relationship_reason": "default",
             }
         ]
         with open(filepath, "w", encoding="utf-8") as f:
@@ -118,32 +141,32 @@ def store_message(
     filepath = _get_safe_history_path(conf_uid, history_uid)
     logger.debug(f"Storing {role} message to {filepath}")
 
-    history_data = []
-    if os.path.exists(filepath):
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                history_data = json.load(f)
-        except Exception:
-            logger.error(f"Failed to load history file: {filepath}")
-            pass
+    lock = _get_history_lock(filepath)
+    with lock:
+        history_data = []
+        if os.path.exists(filepath):
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    history_data = json.load(f)
+            except Exception:
+                logger.error(f"Failed to load history file: {filepath}")
+                pass
 
-    now_str = datetime.now().isoformat(timespec="seconds")
-    new_item = {
-        "role": role,
-        "timestamp": now_str,
-        "content": content,
-    }
+        now_str = datetime.now().isoformat(timespec="seconds")
+        new_item = {
+            "role": role,
+            "timestamp": now_str,
+            "content": content,
+        }
 
-    # Add optional display information if provided
-    if name is not None:
-        new_item["name"] = name
-    if avatar is not None:
-        new_item["avatar"] = avatar
+        # Add optional display information if provided
+        if name is not None:
+            new_item["name"] = name
+        if avatar is not None:
+            new_item["avatar"] = avatar
 
-    history_data.append(new_item)
-
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(history_data, f, ensure_ascii=False, indent=2)
+        history_data.append(new_item)
+        _write_history_atomic(filepath, history_data)
     logger.debug(f"Successfully stored {role} message")
 
 
@@ -181,29 +204,87 @@ def update_metadate(conf_uid: str, history_uid: str, metadata: dict) -> bool:
         return False
 
     try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            history_data = json.load(f)
+        lock = _get_history_lock(filepath)
+        with lock:
+            with open(filepath, "r", encoding="utf-8") as f:
+                history_data = json.load(f)
 
-        if history_data and history_data[0]["role"] == "metadata":
-            # Update existing metadata while preserving other fields
-            history_data[0].update(metadata)
-        else:
-            # Create new metadata with timestamp if none exists
-            new_metadata = {
-                "role": "metadata",
-                "timestamp": datetime.now().isoformat(timespec="seconds"),
-            }
-            new_metadata.update(metadata)  # Add new fields
-            history_data.insert(0, new_metadata)
+            if history_data and history_data[0]["role"] == "metadata":
+                # Update existing metadata while preserving other fields
+                history_data[0].update(metadata)
+            else:
+                # Create new metadata with timestamp if none exists
+                new_metadata = {
+                    "role": "metadata",
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                }
+                new_metadata.update(metadata)  # Add new fields
+                history_data.insert(0, new_metadata)
 
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(history_data, f, ensure_ascii=False, indent=2)
+            _write_history_atomic(filepath, history_data)
 
         logger.debug(f"Updated metadata for history {history_uid}")
         return True
     except Exception as e:
         logger.error(f"Failed to set metadata: {e}")
     return False
+
+
+def update_summary_metadata(
+    conf_uid: str,
+    history_uid: str,
+    *,
+    expected_summarized_through: int,
+    conversation_summary: str,
+    summarized_through: int,
+    summary_updated_at: str,
+) -> bool:
+    """Atomically advance one conversation summary without stale overwrites."""
+    if not conf_uid or not history_uid:
+        return False
+
+    filepath = _get_safe_history_path(conf_uid, history_uid)
+    if not os.path.exists(filepath):
+        return False
+
+    lock = _get_history_lock(filepath)
+    try:
+        with lock:
+            with open(filepath, "r", encoding="utf-8") as file:
+                history_data = json.load(file)
+            metadata = (
+                history_data[0]
+                if history_data and history_data[0].get("role") == "metadata"
+                else None
+            )
+            current_through = int(
+                (metadata or {}).get("summary_through_message_index", 0) or 0
+            )
+            if current_through != expected_summarized_through:
+                logger.warning(
+                    "Skipped stale summary update: expected_through={}, current_through={}",
+                    expected_summarized_through,
+                    current_through,
+                )
+                return False
+            if metadata is None:
+                metadata = {
+                    "role": "metadata",
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                }
+                history_data.insert(0, metadata)
+            metadata.update(
+                {
+                    "conversation_summary": conversation_summary,
+                    "summary_through_message_index": summarized_through,
+                    "summary_updated_at": summary_updated_at,
+                }
+            )
+            _write_history_atomic(filepath, history_data)
+        return True
+    except Exception as error:
+        logger.error("Failed to persist conversation summary: {}", error)
+        return False
 
 
 def get_history(conf_uid: str, history_uid: str) -> List[HistoryMessage]:
@@ -276,12 +357,22 @@ def get_history_list(conf_uid: str) -> List[dict]:
                         empty_history_uids.append(history_uid)
                         continue
 
+                    metadata = (
+                        messages[0]
+                        if messages and messages[0].get("role") == "metadata"
+                        else {}
+                    )
                     latest_message = actual_messages[-1]
                     history_info = {
                         "uid": history_uid,
                         "latest_message": latest_message,
                         "timestamp": (
                             latest_message["timestamp"] if latest_message else None
+                        ),
+                        "title": (
+                            str(metadata.get("title", "")).strip()
+                            if metadata
+                            else ""
                         ),
                     }
                     histories.append(history_info)

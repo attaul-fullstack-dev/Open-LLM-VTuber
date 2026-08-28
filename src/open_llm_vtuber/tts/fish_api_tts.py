@@ -34,7 +34,10 @@ class TTSEngine(TTSInterface):
         """
 
         logger.info(
-            f"\nFish TTS API initialized with api key: {api_key} baseurl: {base_url} reference_id: {reference_id}, latency: {latency}"
+            "Fish TTS API initialized (base_url={}, reference_id={}, latency={}, credential=[REDACTED])",
+            base_url,
+            reference_id,
+            latency,
         )
 
         self.reference_id = reference_id

@@ -254,8 +254,10 @@ async def handle_group_member_turn(
     )
 
     logger.info(
-        f"AI {context.character_config.character_name} "
-        f"(client {current_member_uid}) receiving context:\n{new_context}"
+        "AI {} (client {}) receiving context (chars={})",
+        context.character_config.character_name,
+        current_member_uid,
+        len(new_context),
     )
 
     full_response = await process_member_response(
@@ -287,7 +289,9 @@ async def handle_group_member_turn(
     if full_response:
         ai_message = f"{context.character_config.character_name}: {full_response}"
         state.conversation_history.append(ai_message)
-        logger.info(f"Appended complete response: {ai_message}")
+        logger.info(
+            "Appended complete response (chars={})", len(full_response)
+        )
 
         for member_uid in group_members:
             member_context = client_contexts[member_uid]
@@ -316,10 +320,6 @@ async def broadcast_thinking_state(
     await broadcast_func(
         group_members,
         {"type": "control", "text": "conversation-chain-start"},
-    )
-    await broadcast_func(
-        group_members,
-        {"type": "full-text", "text": "Thinking..."},
     )
 
 
@@ -359,7 +359,11 @@ async def process_member_response(
                 and output_item.get("type") == "tool_call_status"
             ):
                 if broadcast_func and group_members:
-                    logger.debug(f"Broadcasting tool status update: {output_item}")
+                    logger.debug(
+                        "Broadcasting tool status update (name={}, status={})",
+                        output_item.get("tool_name", "unknown"),
+                        output_item.get("status", "unknown"),
+                    )
                     output_item["name"] = context.character_config.character_name
                     await broadcast_func(group_members, output_item)
                 else:

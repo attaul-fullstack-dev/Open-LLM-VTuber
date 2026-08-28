@@ -197,7 +197,7 @@ class BiliBiliLivePlatform(LivePlatformInterface):
         try:
             message = {"type": "text-input", "text": text}
             await self._websocket.send(json.dumps(message))
-            logger.info(f"Sent danmaku to VTuber: {text}")
+            logger.info("Sent danmaku to VTuber (chars={})", len(text))
             return True
         except Exception as e:
             logger.error(f"Error sending message to proxy: {e}")
@@ -220,15 +220,12 @@ class BiliBiliLivePlatform(LivePlatformInterface):
                     message = await self._websocket.recv()
                     data = json.loads(message)
 
-                    # Log received message (truncate audio data for readability)
-                    if "audio" in data:
-                        log_data = data.copy()
-                        log_data["audio"] = (
-                            f"[Audio data, length: {len(data['audio'])}]"
-                        )
-                        logger.debug(f"Received message from VTuber: {log_data}")
-                    else:
-                        logger.debug(f"Received message from VTuber: {data}")
+                    # Log received message metadata only (never payload content)
+                    logger.debug(
+                        "Received message from VTuber (type={}, text_chars={})",
+                        data.get("type", "unknown"),
+                        len(data.get("text", "") or ""),
+                    )
 
                     # Process the message
                     await self.handle_incoming_messages(data)
@@ -278,7 +275,12 @@ class BiliBiliLivePlatform(LivePlatformInterface):
                 client: The BiliBili Live client
                 message: The danmaku message
             """
-            logger.debug(f"[Room {client.room_id}] {message.uname}: {message.msg}")
+            logger.debug(
+                "[Room {}] danmaku from {} (chars={})",
+                client.room_id,
+                message.uname,
+                len(message.msg or ""),
+            )
             asyncio.create_task(self.platform._handle_danmaku(message.msg))
 
         def _on_heartbeat(

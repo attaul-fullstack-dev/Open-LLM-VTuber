@@ -68,6 +68,28 @@ character_config:
         # 'Plus' means that it has the ability to call tools by using OpenAI API.
         use_mcpp: True
         mcp_enabled_servers: ["time", "ddg-search"] # Enabled MCP servers
+        # Keep recent turns within the active model's context window.
+        context_management_enabled: True
+        # Optional model context limit override; null uses centralized model metadata/fallback.
+        context_window_override: null
+        # Extra input safety margin in tokens, in addition to max output tokens.
+        context_safety_margin: 1024
+        # Incrementally summarize old turns only when context trimming occurs.
+        rolling_summary_enabled: True
+        # Compact summary target/hard cap in conservatively estimated tokens.
+        summary_target_tokens: 320
+        summary_max_tokens: 384
+        # Minimum newly evicted messages before one summary update.
+        summary_min_new_messages: 4
+        # Let the character initiate chat after randomized idle periods.
+        proactive_enabled: True
+        initial_idle_min_seconds: 45
+        initial_idle_max_seconds: 90
+        followup_idle_min_seconds: 90
+        followup_idle_max_seconds: 240
+        ignored_before_backoff: 3
+        backoff_min_seconds: 180
+        backoff_max_seconds: 360
 
       letta_agent:
         host: 'localhost' # Host address
@@ -127,9 +149,12 @@ character_config:
         verbose: False
 
       ollama_llm:
-        base_url: 'http://localhost:11434/v1'
+        base_url: 'http://localhost:11434/v1' # Use 'https://ollama.com/v1' for Ollama Cloud.
+        llm_api_key: 'default_api_key' # Use '${OLLAMA_API_KEY}' for Ollama Cloud; ignored locally.
         model: 'qwen2.5:latest'
         temperature: 1.0 # value between 0 to 2
+        top_p: null # optional nucleus sampling probability
+        max_tokens: null # optional maximum output tokens
         # seconds to keep the model in memory after inactivity. 
         # set to -1 to keep the model in memory forever (even after exiting open llm vtuber)
         keep_alive: -1
@@ -161,14 +186,19 @@ character_config:
         temperature: 0.7 # note that deepseek's temperature ranges from 0 to 1
       
       mistral_llm:
-        llm_api_key: 'Your Mistral API key'
+        llm_api_key: '${MISTRAL_API_KEY}' # Loaded from the environment; conf.yaml may still override it.
         model: 'pixtral-large-latest'
         temperature: 1.0 # value between 0 to 2
+        # Optional Mistral generation controls. Remove them to use provider defaults.
+        top_p: 0.9 # value between 0 and 1
+        max_tokens: 384 # maximum output tokens
 
       groq_llm:
-        llm_api_key: 'your groq API key'
-        model: 'llama-3.3-70b-versatile'
-        temperature: 1.0 # value between 0 to 2
+        llm_api_key: '${GROQ_API_KEY}' # Loaded from the environment; conf.yaml may still override it.
+        model: 'openai/gpt-oss-20b'
+        temperature: 0.8 # value between 0 to 2
+        top_p: 0.9 # value between 0 and 1
+        max_tokens: 384 # maximum output tokens
 
   # === Automatic Speech Recognition ===
   asr_config:

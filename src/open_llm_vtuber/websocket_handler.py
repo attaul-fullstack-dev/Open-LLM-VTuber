@@ -20,12 +20,20 @@ from .chat_history_manager import (
     get_history,
     delete_history,
     get_history_list,
+    update_metadate,
 )
 from .config_manager.utils import scan_config_alts_directory, scan_bg_directory
 from .conversations.conversation_handler import (
     handle_conversation_trigger,
     handle_group_interrupt,
     handle_individual_interrupt,
+)
+from .conversations.single_conversation import process_single_conversation
+from .conversations.conversation_utils import EMOJI_LIST
+from .proactive_chat import (
+    ProactiveChatConfig,
+    ProactiveRuntimeState,
+    ProactiveStateMachine,
 )
 
 
@@ -38,6 +46,13 @@ class MessageType(Enum):
         "fetch-and-set-history",
         "create-new-history",
         "delete-history",
+        "reset-relationship",
+        "compact-conversation",
+        "rename-history",
+        "fetch-character-memory",
+        "delete-character-memory",
+        "reset-character-memory",
+        "reset-character-state",
     ]
     CONVERSATION = ["mic-audio-end", "text-input", "ai-speak-signal"]
     CONFIG = ["fetch-configs", "switch-config"]
@@ -58,6 +73,28 @@ class WSMessage(TypedDict, total=False):
     display_text: Optional[dict]
 
 
+def create_locked_send_text(websocket: WebSocket):
+    """Serialize all ``send_text`` calls on one connection.
+
+    Multiple coroutines write to the same WebSocket: the background
+    conversation task, the TTS payload sender task, and the receive loop
+    (interrupts/errors). When the transport write buffer is paused (slow
+    client, large audio payloads), two concurrent drains race inside
+    websockets' legacy protocol and its bare ``assert waiter is None or
+    waiter.cancelled()`` raises ``AssertionError`` with an empty message.
+    Serializing sends removes that race without reordering messages beyond
+    the lock itself.
+    """
+    send_lock = asyncio.Lock()
+    original_send_text = websocket.send_text
+
+    async def locked_send_text(message: str) -> None:
+        async with send_lock:
+            await original_send_text(message)
+
+    return locked_send_text
+
+
 class WebSocketHandler:
     """Handles WebSocket connections and message routing"""
 
@@ -69,9 +106,223 @@ class WebSocketHandler:
         self.current_conversation_tasks: Dict[str, Optional[asyncio.Task]] = {}
         self.default_context_cache = default_context_cache
         self.received_data_buffers: Dict[str, np.ndarray] = {}
+        self._proactive_timer_tasks: Dict[str, asyncio.Task] = {}
+        self._proactive_states: Dict[str, Dict[str, ProactiveRuntimeState]] = {}
+        self._proactive_machines: Dict[str, ProactiveStateMachine] = {}
+        self._proactive_maintenance: set[str] = set()
 
         # Message handlers mapping
         self._message_handlers = self._init_message_handlers()
+
+    @staticmethod
+    def _proactive_config(context: ServiceContext) -> ProactiveChatConfig:
+        settings = (
+            context.character_config.agent_config.agent_settings.basic_memory_agent
+        )
+        return ProactiveChatConfig(
+            enabled=settings.proactive_enabled,
+            initial_idle_min_seconds=settings.initial_idle_min_seconds,
+            initial_idle_max_seconds=settings.initial_idle_max_seconds,
+            followup_idle_min_seconds=settings.followup_idle_min_seconds,
+            followup_idle_max_seconds=settings.followup_idle_max_seconds,
+            ignored_before_backoff=settings.ignored_before_backoff,
+            backoff_min_seconds=settings.backoff_min_seconds,
+            backoff_max_seconds=settings.backoff_max_seconds,
+        )
+
+    async def _cancel_proactive_timer(self, client_uid: str) -> None:
+        task = self._proactive_timer_tasks.pop(client_uid, None)
+        if not task or task.done() or task is asyncio.current_task():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def _pause_proactive_for_maintenance(self, client_uid: str) -> None:
+        self._proactive_maintenance.add(client_uid)
+        await self._cancel_proactive_timer(client_uid)
+
+    async def _resume_proactive_after_maintenance(
+        self, client_uid: str, context: ServiceContext
+    ) -> None:
+        self._proactive_maintenance.discard(client_uid)
+        await self._activate_proactive_for_history(client_uid, context.history_uid)
+
+    async def _activate_proactive_for_history(
+        self,
+        client_uid: str,
+        history_uid: Optional[str],
+        *,
+        user_activity: bool = True,
+    ) -> None:
+        """Start one efficient randomized timer for the active chat."""
+        await self._cancel_proactive_timer(client_uid)
+        if not history_uid or client_uid not in self.client_connections:
+            return
+        context = self.client_contexts.get(client_uid)
+        if not context:
+            return
+        try:
+            machine = self._proactive_machines.get(client_uid)
+            config = self._proactive_config(context)
+            if machine is None or machine.config != config:
+                machine = ProactiveStateMachine(config)
+                self._proactive_machines[client_uid] = machine
+        except (AttributeError, ValueError) as error:
+            logger.warning(
+                "Proactive chat disabled because configuration is invalid: type={}",
+                type(error).__name__,
+            )
+            return
+        if not machine.config.enabled:
+            return
+
+        states = self._proactive_states.setdefault(client_uid, {})
+        state = states.get(history_uid)
+        if state is None:
+            state = machine.new_state(history_uid)
+            states[history_uid] = state
+        elif user_activity:
+            machine.record_user_activity(state)
+
+        self._proactive_timer_tasks[client_uid] = asyncio.create_task(
+            self._run_proactive_timer(client_uid, history_uid, state, machine),
+            name=f"proactive-chat-{client_uid}-{history_uid}",
+        )
+
+    async def _record_user_activity(self, client_uid: str) -> None:
+        """Reset idle/backoff state and give user input priority over a timer."""
+        context = self.client_contexts.get(client_uid)
+        history_uid = context.history_uid if context else None
+        machine = self._proactive_machines.get(client_uid)
+        state = (
+            self._proactive_states.get(client_uid, {}).get(history_uid)
+            if history_uid
+            else None
+        )
+        if machine and state:
+            generation_was_in_progress = state.proactive_generation_in_progress
+            machine.record_user_activity(state)
+            state.proactive_generation_in_progress = generation_was_in_progress
+
+        task = self._proactive_timer_tasks.pop(client_uid, None)
+        if task and not task.done() and task is not asyncio.current_task():
+            # Before generation begins, cancellation is immediate.  Once the
+            # provider/TTS turn has started, wait for that single turn instead
+            # of overlapping two LLM streams on the same session agent.
+            if state and state.proactive_generation_in_progress:
+                try:
+                    await asyncio.shield(task)
+                except Exception:
+                    pass
+            else:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+    def _proactive_conditions_allow(
+        self,
+        client_uid: str,
+        history_uid: str,
+    ) -> bool:
+        context = self.client_contexts.get(client_uid)
+        websocket = self.client_connections.get(client_uid)
+        if (
+            not context
+            or not websocket
+            or context.history_uid != history_uid
+            or client_uid in self._proactive_maintenance
+        ):
+            return False
+        group = self.chat_group_manager.get_client_group(client_uid)
+        return not group or len(group.members) <= 1
+
+    async def _run_proactive_timer(
+        self,
+        client_uid: str,
+        history_uid: str,
+        state: ProactiveRuntimeState,
+        machine: ProactiveStateMachine,
+    ) -> None:
+        """Sleep until randomized eligibility, then generate at most one turn."""
+        current_task = asyncio.current_task()
+        try:
+            while self._proactive_conditions_allow(client_uid, history_uid):
+                await asyncio.sleep(machine.seconds_until_eligible(state))
+                if not self._proactive_conditions_allow(client_uid, history_uid):
+                    return
+
+                active = self.current_conversation_tasks.get(client_uid)
+                if active and not active.done() and active is not current_task:
+                    try:
+                        await asyncio.shield(active)
+                    except Exception:
+                        pass
+                    if not self._proactive_conditions_allow(client_uid, history_uid):
+                        return
+                    # Do not speak immediately after a long response/TTS turn.
+                    machine.record_user_activity(state)
+                    continue
+
+                if not machine.is_eligible(state):
+                    continue
+
+                context = self.client_contexts[client_uid]
+                websocket = self.client_connections[client_uid]
+                revision = state.activity_revision
+                state.proactive_generation_in_progress = True
+                self.current_conversation_tasks[client_uid] = current_task
+                # Yield once before any conversation/provider work.  A user
+                # input arriving on the same event-loop turn increments the
+                # revision and wins without starting proactive generation.
+                await asyncio.sleep(0)
+                if revision != state.activity_revision:
+                    state.proactive_generation_in_progress = False
+                    return
+                logger.info(
+                    "Proactive chat generation started: request_origin=proactive, "
+                    "ignored_count={}",
+                    state.consecutive_ignored_proactive,
+                )
+                response = await process_single_conversation(
+                    context=context,
+                    websocket_send=websocket.send_text,
+                    client_uid=client_uid,
+                    user_input="",
+                    images=None,
+                    session_emoji=str(np.random.choice(EMOJI_LIST)),
+                    metadata={"request_origin": "proactive"},
+                )
+                state.proactive_generation_in_progress = False
+                if response and revision == state.activity_revision:
+                    machine.record_proactive_sent(state)
+                elif revision != state.activity_revision:
+                    # User activity arrived after generation had meaningfully
+                    # started.  End this scheduler so the user handler can
+                    # install a fresh timer after starting the reply turn.
+                    return
+                else:
+                    # Empty/cancelled work or user activity gets a fresh idle
+                    # period and never increments the ignored counter.
+                    machine.record_user_activity(state)
+        except asyncio.CancelledError:
+            state.proactive_generation_in_progress = False
+            raise
+        except Exception as error:
+            state.proactive_generation_in_progress = False
+            logger.warning(
+                "Proactive generation failed safely: type={}",
+                type(error).__name__,
+            )
+        finally:
+            if self.current_conversation_tasks.get(client_uid) is current_task:
+                self.current_conversation_tasks.pop(client_uid, None)
+            if self._proactive_timer_tasks.get(client_uid) is current_task:
+                self._proactive_timer_tasks.pop(client_uid, None)
 
     def _init_message_handlers(self) -> Dict[str, Callable]:
         """Initialize message type to handler mapping"""
@@ -83,6 +334,13 @@ class WebSocketHandler:
             "fetch-and-set-history": self._handle_fetch_history,
             "create-new-history": self._handle_create_history,
             "delete-history": self._handle_delete_history,
+            "reset-relationship": self._handle_reset_relationship,
+            "compact-conversation": self._handle_compact_conversation,
+            "rename-history": self._handle_rename_history,
+            "fetch-character-memory": self._handle_fetch_character_memory,
+            "delete-character-memory": self._handle_delete_character_memory,
+            "reset-character-memory": self._handle_reset_character_memory,
+            "reset-character-state": self._handle_reset_character_state,
             "interrupt-signal": self._handle_interrupt,
             "mic-audio-data": self._handle_audio_data,
             "mic-audio-end": self._handle_conversation_trigger,
@@ -111,6 +369,12 @@ class WebSocketHandler:
             Exception: If initialization fails
         """
         try:
+            # Serialize all sends on this connection (see create_locked_send_text
+            # for the race this prevents). Shadowing the instance method keeps
+            # every later ``websocket.send_text(...)`` call -- including the one
+            # passed into the service context -- behind the same lock.
+            websocket.send_text = create_locked_send_text(websocket)
+
             session_service_context = await self._init_service_context(
                 websocket.send_text, client_uid
             )
@@ -267,6 +531,7 @@ class WebSocketHandler:
             "invitee_uid" if operation == "add-client-to-group" else "target_uid"
         )
 
+        await self._cancel_proactive_timer(client_uid)
         await handle_group_operation(
             operation=operation,
             client_uid=client_uid,
@@ -275,9 +540,14 @@ class WebSocketHandler:
             client_connections=self.client_connections,
             send_group_update=self.send_group_update,
         )
+        context = self.client_contexts.get(client_uid)
+        group = self.chat_group_manager.get_client_group(client_uid)
+        if context and (not group or len(group.members) <= 1):
+            await self._activate_proactive_for_history(client_uid, context.history_uid)
 
     async def handle_disconnect(self, client_uid: str) -> None:
         """Handle client disconnection"""
+        await self._cancel_proactive_timer(client_uid)
         group = self.chat_group_manager.get_client_group(client_uid)
         if group:
             await handle_group_interrupt(
@@ -300,6 +570,9 @@ class WebSocketHandler:
         self.client_connections.pop(client_uid, None)
         self.client_contexts.pop(client_uid, None)
         self.received_data_buffers.pop(client_uid, None)
+        self._proactive_states.pop(client_uid, None)
+        self._proactive_machines.pop(client_uid, None)
+        self._proactive_maintenance.discard(client_uid)
         if client_uid in self.current_conversation_tasks:
             task = self.current_conversation_tasks[client_uid]
             if task and not task.done():
@@ -316,10 +589,14 @@ class WebSocketHandler:
 
     async def _cleanup_failed_connection(self, client_uid: str) -> None:
         """Clean up failed connection data"""
+        await self._cancel_proactive_timer(client_uid)
         self.client_connections.pop(client_uid, None)
         self.client_contexts.pop(client_uid, None)
         self.received_data_buffers.pop(client_uid, None)
         self.chat_group_manager.client_group_map.pop(client_uid, None)
+        self._proactive_states.pop(client_uid, None)
+        self._proactive_machines.pop(client_uid, None)
+        self._proactive_maintenance.discard(client_uid)
 
         if client_uid in self.current_conversation_tasks:
             task = self.current_conversation_tasks[client_uid]
@@ -408,6 +685,7 @@ class WebSocketHandler:
         if not history_uid:
             return
 
+        await self._cancel_proactive_timer(client_uid)
         context = self.client_contexts[client_uid]
         # Update history_uid in service context
         context.history_uid = history_uid
@@ -427,11 +705,15 @@ class WebSocketHandler:
         await websocket.send_text(
             json.dumps({"type": "history-data", "messages": messages})
         )
+        # Selecting history is activity.  Reconnect therefore starts a fresh
+        # idle period and never replays timers/messages from the old socket.
+        await self._activate_proactive_for_history(client_uid, history_uid)
 
     async def _handle_create_history(
         self, websocket: WebSocket, client_uid: str, data: WSMessage
     ) -> None:
         """Handle creation of new chat history"""
+        await self._cancel_proactive_timer(client_uid)
         context = self.client_contexts[client_uid]
         history_uid = create_new_history(context.character_config.conf_uid)
         if history_uid:
@@ -448,6 +730,7 @@ class WebSocketHandler:
                     }
                 )
             )
+            await self._activate_proactive_for_history(client_uid, history_uid)
 
     async def _handle_delete_history(
         self, websocket: WebSocket, client_uid: str, data: dict
@@ -457,6 +740,7 @@ class WebSocketHandler:
         if not history_uid:
             return
 
+        await self._cancel_proactive_timer(client_uid)
         context = self.client_contexts[client_uid]
         success = delete_history(
             context.character_config.conf_uid,
@@ -472,7 +756,165 @@ class WebSocketHandler:
             )
         )
         if history_uid == context.history_uid:
+            context.agent_engine.set_memory_from_history(
+                conf_uid=context.character_config.conf_uid,
+                history_uid=history_uid,
+            )
             context.history_uid = None
+        self._proactive_states.get(client_uid, {}).pop(history_uid, None)
+        if context.history_uid:
+            await self._activate_proactive_for_history(client_uid, context.history_uid)
+
+    async def _handle_reset_relationship(
+        self, websocket: WebSocket, client_uid: str, data: WSMessage
+    ) -> None:
+        """Reset Mili's relationship for ALL conversations (character-level)."""
+        await self._pause_proactive_for_maintenance(client_uid)
+        context = self.client_contexts[client_uid]
+        try:
+            reset = getattr(context.agent_engine, "reset_relationship", None)
+            success = bool(context.history_uid and callable(reset) and reset())
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "relationship-reset",
+                        "success": success,
+                        "history_uid": context.history_uid,
+                    }
+                )
+            )
+        finally:
+            await self._resume_proactive_after_maintenance(client_uid, context)
+
+    async def _handle_compact_conversation(
+        self, websocket: WebSocket, client_uid: str, data: WSMessage
+    ) -> None:
+        """Manually compact the active conversation now (rolling-summary path)."""
+        await self._pause_proactive_for_maintenance(client_uid)
+        context = self.client_contexts[client_uid]
+        try:
+            compact = getattr(context.agent_engine, "compact_conversation", None)
+            success, error = False, None
+            if context.history_uid and callable(compact):
+                success, error = await compact()
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "compact-result",
+                        "success": success,
+                        "history_uid": context.history_uid,
+                        "error": error,
+                    }
+                )
+            )
+        finally:
+            await self._resume_proactive_after_maintenance(client_uid, context)
+
+    async def _handle_rename_history(
+        self, websocket: WebSocket, client_uid: str, data: dict
+    ) -> None:
+        """Persist a manual conversation title in history metadata."""
+        history_uid = data.get("history_uid")
+        title = str(data.get("title", "") or "").strip()
+        context = self.client_contexts[client_uid]
+        success = bool(
+            history_uid
+            and title
+            and update_metadate(
+                context.character_config.conf_uid,
+                history_uid,
+                {"title": title},
+            )
+        )
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "type": "history-renamed",
+                    "success": success,
+                    "history_uid": history_uid,
+                    "title": title if success else None,
+                }
+            )
+        )
+
+    async def _handle_fetch_character_memory(
+        self, websocket: WebSocket, client_uid: str, data: WSMessage
+    ) -> None:
+        """Return Mili's stored long-term facts (text + timestamp only)."""
+        context = self.client_contexts[client_uid]
+        memories = getattr(
+            context.agent_engine, "list_character_memories", lambda: []
+        )()
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "type": "character-memory",
+                    "memories": memories,
+                }
+            )
+        )
+
+    async def _handle_delete_character_memory(
+        self, websocket: WebSocket, client_uid: str, data: dict
+    ) -> None:
+        """Forget one stored long-term fact (by text)."""
+        await self._pause_proactive_for_maintenance(client_uid)
+        context = self.client_contexts[client_uid]
+        try:
+            text = str(data.get("text", "") or "")
+            remove = getattr(context.agent_engine, "remove_character_memory", None)
+            success = bool(text and callable(remove) and remove(text))
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "character-memory-deleted",
+                        "success": success,
+                        "text": text,
+                    }
+                )
+            )
+        finally:
+            await self._resume_proactive_after_maintenance(client_uid, context)
+
+    async def _handle_reset_character_memory(
+        self, websocket: WebSocket, client_uid: str, data: WSMessage
+    ) -> None:
+        """Clear all of Mili's long-term memory (relationship untouched)."""
+        await self._pause_proactive_for_maintenance(client_uid)
+        context = self.client_contexts[client_uid]
+        try:
+            reset = getattr(context.agent_engine, "reset_character_memory", None)
+            success = bool(callable(reset) and reset())
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "character-memory-reset",
+                        "success": success,
+                    }
+                )
+            )
+        finally:
+            await self._resume_proactive_after_maintenance(client_uid, context)
+
+    async def _handle_reset_character_state(
+        self, websocket: WebSocket, client_uid: str, data: WSMessage
+    ) -> None:
+        """Reset relationship to stranger and clear memory; transcripts stay."""
+        await self._pause_proactive_for_maintenance(client_uid)
+        context = self.client_contexts[client_uid]
+        try:
+            reset = getattr(context.agent_engine, "reset_character_state", None)
+            success = bool(callable(reset) and reset())
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "character-state-reset",
+                        "success": success,
+                    }
+                )
+            )
+        finally:
+            await self._resume_proactive_after_maintenance(client_uid, context)
 
     async def _handle_audio_data(
         self, websocket: WebSocket, client_uid: str, data: WSMessage
@@ -480,6 +922,7 @@ class WebSocketHandler:
         """Handle incoming audio data"""
         audio_data = data.get("audio", [])
         if audio_data:
+            await self._record_user_activity(client_uid)
             self.received_data_buffers[client_uid] = np.append(
                 self.received_data_buffers[client_uid],
                 np.array(audio_data, dtype=np.float32),
@@ -501,6 +944,7 @@ class WebSocketHandler:
                     pass
                 elif len(audio_bytes) > 1024:
                     # Detected audio activity (voice)
+                    await self._record_user_activity(client_uid)
                     self.received_data_buffers[client_uid] = np.append(
                         self.received_data_buffers[client_uid],
                         np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32),
@@ -513,8 +957,11 @@ class WebSocketHandler:
         self, websocket: WebSocket, client_uid: str, data: WSMessage
     ) -> None:
         """Handle triggers that start a conversation"""
+        msg_type = data.get("type", "")
+        if msg_type in {"text-input", "mic-audio-end"}:
+            await self._record_user_activity(client_uid)
         await handle_conversation_trigger(
-            msg_type=data.get("type", ""),
+            msg_type=msg_type,
             data=data,
             client_uid=client_uid,
             context=self.client_contexts[client_uid],
@@ -526,6 +973,14 @@ class WebSocketHandler:
             current_conversation_tasks=self.current_conversation_tasks,
             broadcast_to_group=self.broadcast_to_group,
         )
+        if msg_type in {"text-input", "mic-audio-end"}:
+            context = self.client_contexts.get(client_uid)
+            if context:
+                await self._activate_proactive_for_history(
+                    client_uid,
+                    context.history_uid,
+                    user_activity=False,
+                )
 
     async def _handle_fetch_configs(
         self, websocket: WebSocket, client_uid: str, data: WSMessage
@@ -543,8 +998,14 @@ class WebSocketHandler:
         """Handle switching to a different configuration"""
         config_file_name = data.get("file")
         if config_file_name:
+            await self._pause_proactive_for_maintenance(client_uid)
             context = self.client_contexts[client_uid]
-            await context.handle_config_switch(websocket, config_file_name)
+            try:
+                await context.handle_config_switch(websocket, config_file_name)
+                self._proactive_machines.pop(client_uid, None)
+                self._proactive_states.pop(client_uid, None)
+            finally:
+                await self._resume_proactive_after_maintenance(client_uid, context)
 
     async def _handle_fetch_backgrounds(
         self, websocket: WebSocket, client_uid: str, data: WSMessage
