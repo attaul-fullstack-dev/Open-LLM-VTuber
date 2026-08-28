@@ -39,6 +39,7 @@ from ...character_state import (
     reset_character_state as reset_persisted_character_state,
     set_character_relationship,
 )
+from ...character_memory_commands import parse_memory_command
 from ..transformers import (
     sentence_divider,
     actions_extractor,
@@ -70,29 +71,11 @@ from ..relationship_context import (
     detect_relationship_update,
     normalize_relationship_status,
 )
-import re
 import time
 from ...request_latency import (
     get_latency_tracker,
     reset_latency_phase,
     set_latency_phase,
-)
-
-# Conservative, local-only character memory triggers. No LLM classifier and no
-# extra API call per message. Only explicit user requests are honored:
-#   - Remember:  "Ingat ya, makanan favoritku ramen."
-#                "Jangan lupa kalau aku suka kopi."
-#   - Forget:    "Lupakan kalau makanan favoritku ramen."
-_MEMORY_REMEMBER = re.compile(
-    r"(?:tolong\s+)?(?:ingat|catat)\s+(?:ya|yah|dong|deh|dulu|kalau)?\s*[,:]?\s*|"
-    r"jangan\s+lupa\s+(?:ya|yah|dong|deh)?\s*[,:]?\s*",
-    re.IGNORECASE,
-)
-_MEMORY_FORGET = re.compile(
-    r"(?:tolong\s+)?lupakan\s+(?:ya|yah|dong|deh)?\s*"
-    r"(?:kalau|soal|tentang|yang\s+kamu\s+ingat)?\s+|"
-    r"hapus\s+dari\s+ingatan\s+",
-    re.IGNORECASE,
 )
 
 
@@ -484,25 +467,21 @@ class BasicMemoryAgent(AgentInterface):
         """Honor explicit remember/forget requests with cheap local rules."""
         if not self._character_conf_uid:
             return False
-        text = (user_text or "").strip()
-        if not text:
+        result = parse_memory_command(user_text)
+        if result.action == "none" or not result.payload:
             return False
-        forget_match = _MEMORY_FORGET.match(text)
-        if forget_match:
-            target = text[forget_match.end():].strip(" .,!?;:，。！？；：")
-            if len(target) >= 3:
-                return self.remove_character_memory(target)
-        remember_match = _MEMORY_REMEMBER.match(text)
-        if remember_match:
-            raw = text[remember_match.end():].strip()
-            content = raw.strip(" .,!?;:，。！？；：")
-            if (
-                len(content) >= 4
-                and not raw.endswith("?")
-                and not raw.endswith("？")
-            ):
-                return self.add_character_memory(content, explicit=True)
-        return False
+        if result.action == "forget":
+            success = self.remove_character_memory(result.payload)
+        else:
+            success = self.add_character_memory(result.payload, explicit=True)
+        logger.info(
+            "Character memory command: memory_command={}, matched_trigger={}, "
+            "success={}",
+            result.action,
+            result.matched_trigger,
+            success,
+        )
+        return success
 
     def observe_character_events(
         self,
