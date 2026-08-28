@@ -7,11 +7,50 @@ their existing persistence rules; idle timestamps never enter those stores.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import random
 import re
 import time
-from typing import Callable, Optional
+from typing import Callable, Dict, List, Mapping, Optional
+
+
+class ProactiveIntent:
+    """Lightweight proactive behavior intents (internal only, never shown)."""
+
+    REACT_TO_IGNORED_QUESTION = "react_to_ignored_question"
+    REACT_TO_SILENCE = "react_to_silence"
+    CONTINUE_PREVIOUS_TOPIC = "continue_previous_topic"
+    START_NEW_TOPIC = "start_new_topic"
+    ASK_USER_SOMETHING = "ask_user_something"
+    BRING_UP_MEMORY = "bring_up_memory"
+    CASUAL_OBSERVATION = "casual_observation"
+
+
+# Fixed iteration order for weighted selection (deterministic wheel layout).
+INTENT_SELECTION_ORDER = (
+    ProactiveIntent.REACT_TO_SILENCE,
+    ProactiveIntent.CONTINUE_PREVIOUS_TOPIC,
+    ProactiveIntent.START_NEW_TOPIC,
+    ProactiveIntent.ASK_USER_SOMETHING,
+    ProactiveIntent.BRING_UP_MEMORY,
+    ProactiveIntent.CASUAL_OBSERVATION,
+)
+
+# react_to_ignored_question is priority-driven and intentionally excluded
+# from weighted selection.
+DEFAULT_INTENT_WEIGHTS: Dict[str, float] = {
+    ProactiveIntent.REACT_TO_SILENCE: 5,
+    ProactiveIntent.CONTINUE_PREVIOUS_TOPIC: 20,
+    ProactiveIntent.START_NEW_TOPIC: 30,
+    ProactiveIntent.ASK_USER_SOMETHING: 20,
+    ProactiveIntent.BRING_UP_MEMORY: 15,
+    ProactiveIntent.CASUAL_OBSERVATION: 10,
+}
+
+# Per recent occurrence, a repeated intent's weight is multiplied down so
+# selections stay varied.  Silence acknowledgment decays extra fast.
+_INTENT_REPEAT_PENALTY = 0.25
+_SILENCE_REPEAT_PENALTY = 0.1
 
 
 @dataclass(frozen=True)
@@ -26,6 +65,7 @@ class ProactiveChatConfig:
     ignored_before_backoff: int = 3
     backoff_min_seconds: int = 180
     backoff_max_seconds: int = 360
+    intent_weights: Optional[Mapping[str, float]] = None
 
     def __post_init__(self) -> None:
         ranges = (
@@ -48,6 +88,16 @@ class ProactiveChatConfig:
                 )
         if self.ignored_before_backoff < 1:
             raise ValueError("ignored_before_backoff must be at least 1")
+        if self.intent_weights is not None:
+            for key, value in self.intent_weights.items():
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or value < 0
+                ):
+                    raise ValueError(
+                        f"Invalid proactive intent weight for {key!r}: {value!r}"
+                    )
 
 
 # Sentence-initial interrogatives (Indonesian + English) used as a fallback
@@ -107,6 +157,56 @@ class ProactiveFollowupContext:
         )
 
 
+@dataclass(frozen=True)
+class ProactiveIntentContext:
+    """Internal-only proactive intent signal for one generation turn."""
+
+    intent: str
+    user_has_replied_since_last_proactive: bool
+    consecutive_ignored: int
+    recent_silence_acknowledgment: bool
+
+    def as_dict(self) -> dict:
+        return {
+            "intent": self.intent,
+            "user_has_replied_since_last_proactive": (
+                self.user_has_replied_since_last_proactive
+            ),
+            "consecutive_ignored": self.consecutive_ignored,
+            "recent_silence_acknowledgment": self.recent_silence_acknowledgment,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Optional[dict]) -> Optional["ProactiveIntentContext"]:
+        if not isinstance(data, dict):
+            return None
+        intent = str(data.get("intent") or "")
+        known = set(INTENT_SELECTION_ORDER) | {
+            ProactiveIntent.REACT_TO_IGNORED_QUESTION
+        }
+        if intent not in known:
+            intent = ProactiveIntent.CASUAL_OBSERVATION
+        return cls(
+            intent=intent,
+            user_has_replied_since_last_proactive=bool(
+                data.get("user_has_replied_since_last_proactive")
+            ),
+            consecutive_ignored=int(data.get("consecutive_ignored") or 0),
+            recent_silence_acknowledgment=bool(
+                data.get("recent_silence_acknowledgment")
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class ProactiveIntentSignals:
+    """Cheap local context signals that adjust intent selection weights."""
+
+    has_useful_memory: bool = False
+    has_recent_context: bool = False
+    unfinished_topic: bool = False
+
+
 @dataclass
 class ProactiveRuntimeState:
     """Per-connection, per-chat state; never persisted."""
@@ -118,6 +218,8 @@ class ProactiveRuntimeState:
     consecutive_ignored_proactive: int = 0
     proactive_generation_in_progress: bool = False
     activity_revision: int = 0
+    # Ephemeral anti-repetition memory of recent intents (not persisted).
+    recent_proactive_intents: List[str] = field(default_factory=list)
     # Text and expected-reply flag of the most recent successfully sent
     # proactive message.  Cleared whenever the user responds.
     last_proactive_text: Optional[str] = None
@@ -170,6 +272,123 @@ def format_followup_instruction(
     )
 
 
+_INTENT_GUIDANCE: Dict[str, str] = {
+    ProactiveIntent.REACT_TO_IGNORED_QUESTION: (
+        "Follow the unanswered-question priority: react naturally to being "
+        "ignored after asking something."
+    ),
+    ProactiveIntent.REACT_TO_SILENCE: (
+        "The user went quiet with no question pending; notice it lightly at "
+        "most and never demand a reply or reuse stock silence phrases."
+    ),
+    ProactiveIntent.CONTINUE_PREVIOUS_TOPIC: (
+        "Continue something from the recent conversation naturally, as if "
+        "the thought just came back."
+    ),
+    ProactiveIntent.START_NEW_TOPIC: (
+        "Bring up a subject of your own choosing (curiosity, hypotheticals, "
+        "daily life, games, stories, movies, tech, food, places, or the "
+        "user's known interests); just start talking, never announce a "
+        "topic or offer options."
+    ),
+    ProactiveIntent.ASK_USER_SOMETHING: (
+        "Ask something you are genuinely curious about, spontaneously."
+    ),
+    ProactiveIntent.BRING_UP_MEMORY: (
+        "Naturally recall something you already know about the user; never "
+        "expose memory metadata, IDs, or internal terminology."
+    ),
+    ProactiveIntent.CASUAL_OBSERVATION: (
+        "A short thought or remark that does not require a reply."
+    ),
+}
+
+_INTENT_STYLE_GUIDANCE = (
+    "You are initiating by your own choice: 1-3 short sentences of "
+    "conversational Indonesian; a question is optional. Never claim "
+    "specific past personal events (finishing a book or movie, going "
+    "somewhere, what a friend said) unless the conversation supports them; "
+    "saying you were just thinking about something or remember discussing "
+    "something is fine."
+)
+
+
+def format_intent_instruction(
+    context: Optional[ProactiveIntentContext],
+    *,
+    include_guidance: bool = True,
+) -> Optional[str]:
+    """Internal system-prompt block steering this proactive turn's intent.
+
+    Returns ``None`` when there is no intent context.  The block is internal
+    only: never shown verbatim to the user and never persisted to history.
+    When ``include_guidance`` is False (e.g. the ignored-question follow-up
+    block already carries the turn's instructions), only the compact context
+    lines are emitted to avoid duplicating guidance tokens.
+    """
+    if context is None:
+        return None
+
+    intent = context.intent
+    if intent not in _INTENT_GUIDANCE:
+        intent = ProactiveIntent.CASUAL_OBSERVATION
+    lines = [
+        "Internal proactive context for this turn only. Never shown to the "
+        "user; never mention intents, counters, timers, or system "
+        "mechanics.",
+        f"intent: {intent}",
+        "user_has_replied_since_last_proactive: "
+        f"{str(context.user_has_replied_since_last_proactive).lower()}",
+        f"consecutive_ignored: {context.consecutive_ignored}",
+        "recent_silence_acknowledgment: "
+        f"{str(context.recent_silence_acknowledgment).lower()}",
+    ]
+    if include_guidance:
+        lines.extend(
+            [
+                f"Intent for this turn: {_INTENT_GUIDANCE[intent]}",
+                _INTENT_STYLE_GUIDANCE,
+            ]
+        )
+    return "\n".join(lines)
+
+
+def resolve_proactive_intent(
+    followup_context: Optional[ProactiveFollowupContext],
+    state: ProactiveRuntimeState,
+    machine: "ProactiveStateMachine",
+    signals: ProactiveIntentSignals,
+    *,
+    random: Optional[Callable[[], float]] = None,
+) -> str:
+    """Pick this turn's intent; an unanswered proactive question wins."""
+    if (
+        followup_context is not None
+        and followup_context.previous_proactive_ignored
+        and followup_context.previous_proactive_expected_response
+    ):
+        return ProactiveIntent.REACT_TO_IGNORED_QUESTION
+    return machine.select_proactive_intent(state, signals, random=random)
+
+
+def _pick_intent(weights: Mapping[str, float], spin: float) -> str:
+    """Deterministic weighted wheel over a fixed intent order."""
+    ordered = [
+        (key, float(weights[key]))
+        for key in INTENT_SELECTION_ORDER
+        if float(weights.get(key, 0.0)) > 0.0
+    ]
+    if not ordered:
+        return ProactiveIntent.CASUAL_OBSERVATION
+    total = sum(weight for _, weight in ordered)
+    cursor = spin * total
+    for key, weight in ordered:
+        cursor -= weight
+        if cursor < 0:
+            return key
+    return ordered[-1][0]
+
+
 class ProactiveStateMachine:
     """Pure timing/state transitions with injectable clock and randomness."""
 
@@ -179,10 +398,12 @@ class ProactiveStateMachine:
         *,
         monotonic: Callable[[], float] = time.monotonic,
         randint: Callable[[int, int], int] = random.randint,
+        random: Callable[[], float] = random.random,
     ) -> None:
         self.config = config
         self._monotonic = monotonic
         self._randint = randint
+        self._random = random
 
     def _delay(self, minimum: int, maximum: int) -> float:
         return float(self._randint(minimum, maximum))
@@ -217,6 +438,7 @@ class ProactiveStateMachine:
         state: ProactiveRuntimeState,
         *,
         response_text: Optional[str] = None,
+        intent: Optional[str] = None,
     ) -> None:
         now = self._monotonic()
         state.last_proactive_monotonic = now
@@ -224,6 +446,9 @@ class ProactiveStateMachine:
         state.proactive_generation_in_progress = False
         state.last_proactive_text = response_text or None
         state.last_proactive_expected_response = message_expects_response(response_text)
+        if intent:
+            state.recent_proactive_intents.append(intent)
+            del state.recent_proactive_intents[:-3]
         if state.consecutive_ignored_proactive >= self.config.ignored_before_backoff:
             minimum = self.config.backoff_min_seconds
             maximum = self.config.backoff_max_seconds
@@ -249,6 +474,54 @@ class ProactiveStateMachine:
                 ignored and state.last_proactive_expected_response
             ),
         )
+
+    def select_proactive_intent(
+        self,
+        state: ProactiveRuntimeState,
+        signals: ProactiveIntentSignals,
+        *,
+        random: Optional[Callable[[], float]] = None,
+    ) -> str:
+        """Weighted, anti-repetitive local intent pick (no LLM involved)."""
+        return _pick_intent(
+            self.effective_intent_weights(state, signals),
+            (random or self._random)(),
+        )
+
+    def effective_intent_weights(
+        self,
+        state: ProactiveRuntimeState,
+        signals: ProactiveIntentSignals,
+    ) -> Dict[str, float]:
+        """Resolve context-aware, anti-repetition-adjusted intent weights."""
+        merged = dict(DEFAULT_INTENT_WEIGHTS)
+        if self.config.intent_weights:
+            for key, value in self.config.intent_weights.items():
+                if key in merged:
+                    merged[key] = float(value)
+        if not signals.has_useful_memory:
+            merged[ProactiveIntent.BRING_UP_MEMORY] = 0.0
+        if not signals.has_recent_context:
+            merged[ProactiveIntent.CONTINUE_PREVIOUS_TOPIC] = 0.0
+            for key in (
+                ProactiveIntent.START_NEW_TOPIC,
+                ProactiveIntent.ASK_USER_SOMETHING,
+                ProactiveIntent.CASUAL_OBSERVATION,
+            ):
+                merged[key] *= 1.5
+        if signals.unfinished_topic:
+            merged[ProactiveIntent.CONTINUE_PREVIOUS_TOPIC] *= 2.0
+        recent = state.recent_proactive_intents[-3:]
+        for key in merged:
+            occurrences = recent.count(key)
+            if occurrences:
+                penalty = (
+                    _SILENCE_REPEAT_PENALTY
+                    if key == ProactiveIntent.REACT_TO_SILENCE
+                    else _INTENT_REPEAT_PENALTY
+                )
+                merged[key] *= penalty**occurrences
+        return merged
 
     def seconds_until_eligible(self, state: ProactiveRuntimeState) -> float:
         return max(0.0, state.next_proactive_eligible_at - self._monotonic())

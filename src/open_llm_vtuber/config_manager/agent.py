@@ -52,6 +52,9 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
     ignored_before_backoff: int = Field(3, gt=0, alias="ignored_before_backoff")
     backoff_min_seconds: int = Field(180, ge=0, alias="backoff_min_seconds")
     backoff_max_seconds: int = Field(360, ge=0, alias="backoff_max_seconds")
+    proactive_intent_weights: Optional[Dict[str, float]] = Field(
+        None, alias="proactive_intent_weights"
+    )
 
     DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
         "llm_provider": Description(
@@ -133,6 +136,10 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
         "backoff_max_seconds": Description(
             en="Maximum proactive backoff delay (default: 360 seconds)",
             zh="主动聊天退避的最长时间（默认：360 秒）",
+        ),
+        "proactive_intent_weights": Description(
+            en="Optional per-intent weight overrides for proactive topic selection (react_to_silence, continue_previous_topic, start_new_topic, ask_user_something, bring_up_memory, casual_observation)",
+            zh="主动话题选择的意图权重覆盖（可选）",
         ),
     }
 

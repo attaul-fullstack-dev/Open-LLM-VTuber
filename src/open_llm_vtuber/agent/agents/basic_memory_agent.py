@@ -23,7 +23,9 @@ from ...chat_history_manager import (
 )
 from ...proactive_chat import (
     ProactiveFollowupContext,
+    ProactiveIntentContext,
     format_followup_instruction,
+    format_intent_instruction,
 )
 from ...character_state import (
     CharacterState,
@@ -1397,6 +1399,9 @@ class BasicMemoryAgent(AgentInterface):
         followup_context: Optional[
             Union[Dict[str, Any], ProactiveFollowupContext]
         ] = None,
+        intent_context: Optional[
+            Union[Dict[str, Any], ProactiveIntentContext]
+        ] = None,
     ) -> Callable[[], AsyncIterator[Union[SentenceOutput, Dict[str, Any]]]]:
         """Create an assistant-only turn using the normal character context.
 
@@ -1452,6 +1457,19 @@ class BasicMemoryAgent(AgentInterface):
                 current_system_prompt = "\n\n".join(
                     [current_system_prompt, followup_block]
                 )
+            if isinstance(intent_context, dict):
+                parsed_intent = ProactiveIntentContext.from_dict(intent_context)
+            else:
+                parsed_intent = intent_context
+            # When the ignored-question follow-up block is present it already
+            # carries the turn's instructions; emit only compact intent lines.
+            intent_block = format_intent_instruction(
+                parsed_intent, include_guidance=followup_block is None
+            )
+            if intent_block:
+                current_system_prompt = "\n\n".join(
+                    [current_system_prompt, intent_block]
+                )
             try:
                 request_messages = await self._prepare_context_with_summary(
                     messages,
@@ -1489,9 +1507,14 @@ class BasicMemoryAgent(AgentInterface):
         followup_context: Optional[
             Union[Dict[str, Any], ProactiveFollowupContext]
         ] = None,
+        intent_context: Optional[
+            Union[Dict[str, Any], ProactiveIntentContext]
+        ] = None,
     ) -> AsyncIterator[Union[SentenceOutput, Dict[str, Any]]]:
         """Generate one proactive assistant message without a fake user turn."""
-        proactive_chat = self._proactive_chat_function_factory(followup_context)
+        proactive_chat = self._proactive_chat_function_factory(
+            followup_context, intent_context
+        )
         async for output in proactive_chat():
             yield output
 

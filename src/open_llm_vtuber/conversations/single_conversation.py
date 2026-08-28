@@ -121,7 +121,8 @@ async def process_single_conversation(
                         "Active conversation agent does not support proactive chat"
                     )
                 agent_output_stream = proactive_chat(
-                    followup_context=(metadata or {}).get("proactive_followup")
+                    followup_context=(metadata or {}).get("proactive_followup"),
+                    intent_context=(metadata or {}).get("proactive_intent"),
                 )
             else:
                 # agent.chat yields Union[SentenceOutput, Dict[str, Any]]

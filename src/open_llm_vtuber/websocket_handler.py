@@ -32,8 +32,12 @@ from .conversations.single_conversation import process_single_conversation
 from .conversations.conversation_utils import EMOJI_LIST
 from .proactive_chat import (
     ProactiveChatConfig,
+    ProactiveIntentContext,
+    ProactiveIntentSignals,
     ProactiveRuntimeState,
     ProactiveStateMachine,
+    message_expects_response,
+    resolve_proactive_intent,
 )
 
 
@@ -128,6 +132,7 @@ class WebSocketHandler:
             ignored_before_backoff=settings.ignored_before_backoff,
             backoff_min_seconds=settings.backoff_min_seconds,
             backoff_max_seconds=settings.backoff_max_seconds,
+            intent_weights=settings.proactive_intent_weights,
         )
 
     async def _cancel_proactive_timer(self, client_uid: str) -> None:
@@ -241,6 +246,30 @@ class WebSocketHandler:
         group = self.chat_group_manager.get_client_group(client_uid)
         return not group or len(group.members) <= 1
 
+    @staticmethod
+    def _proactive_intent_signals(context: ServiceContext) -> ProactiveIntentSignals:
+        """Cheap local signals for intent selection (no LLM, no logging)."""
+        agent = getattr(context, "agent_engine", None)
+        memory = list(getattr(agent, "_memory", None) or [])
+        last = memory[-1] if memory else None
+        unfinished_topic = bool(
+            isinstance(last, dict)
+            and last.get("role") == "assistant"
+            and message_expects_response(str(last.get("content") or ""))
+        )
+        has_useful_memory = False
+        list_memories = getattr(agent, "list_character_memories", None)
+        if callable(list_memories):
+            try:
+                has_useful_memory = bool(list_memories())
+            except Exception:
+                has_useful_memory = False
+        return ProactiveIntentSignals(
+            has_useful_memory=has_useful_memory,
+            has_recent_context=len(memory) >= 2,
+            unfinished_topic=unfinished_topic,
+        )
+
     async def _run_proactive_timer(
         self,
         client_uid: str,
@@ -289,6 +318,22 @@ class WebSocketHandler:
                     state.consecutive_ignored_proactive,
                 )
                 followup_context = machine.proactive_followup_context(state)
+                intent = resolve_proactive_intent(
+                    followup_context,
+                    state,
+                    machine,
+                    self._proactive_intent_signals(context),
+                )
+                intent_context = ProactiveIntentContext(
+                    intent=intent,
+                    user_has_replied_since_last_proactive=(
+                        state.consecutive_ignored_proactive == 0
+                    ),
+                    consecutive_ignored=max(0, state.consecutive_ignored_proactive),
+                    recent_silence_acknowledgment=(
+                        "react_to_silence" in state.recent_proactive_intents
+                    ),
+                )
                 response = await process_single_conversation(
                     context=context,
                     websocket_send=websocket.send_text,
@@ -299,11 +344,14 @@ class WebSocketHandler:
                     metadata={
                         "request_origin": "proactive",
                         "proactive_followup": followup_context.as_dict(),
+                        "proactive_intent": intent_context.as_dict(),
                     },
                 )
                 state.proactive_generation_in_progress = False
                 if response and revision == state.activity_revision:
-                    machine.record_proactive_sent(state, response_text=response)
+                    machine.record_proactive_sent(
+                        state, response_text=response, intent=intent
+                    )
                 elif revision != state.activity_revision:
                     # User activity arrived after generation had meaningfully
                     # started.  End this scheduler so the user handler can

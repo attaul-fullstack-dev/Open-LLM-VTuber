@@ -22,11 +22,18 @@ from src.open_llm_vtuber.conversations.single_conversation import (
     process_single_conversation,
 )
 from src.open_llm_vtuber.proactive_chat import (
+    DEFAULT_INTENT_WEIGHTS,
+    INTENT_SELECTION_ORDER,
     ProactiveChatConfig,
     ProactiveFollowupContext,
+    ProactiveIntent,
+    ProactiveIntentContext,
+    ProactiveIntentSignals,
     ProactiveStateMachine,
     format_followup_instruction,
+    format_intent_instruction,
     message_expects_response,
+    resolve_proactive_intent,
 )
 from src.open_llm_vtuber.request_latency import RequestLatencyTracker
 from src.open_llm_vtuber.websocket_handler import WebSocketHandler
@@ -564,6 +571,293 @@ class ProactiveFollowupPromptTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(answered)
         self.assertIsNone(format_followup_instruction(None))
+
+
+def _spin_for(weights, target):
+    """Deterministic rng value that lands inside ``target``'s wheel bucket."""
+    ordered = [
+        (key, float(weights[key]))
+        for key in INTENT_SELECTION_ORDER
+        if float(weights.get(key, 0.0)) > 0.0
+    ]
+    total = sum(weight for _, weight in ordered)
+    cursor = 0.0
+    for key, weight in ordered:
+        if key == target:
+            return (cursor + weight / 2) / total
+        cursor += weight
+    return None
+
+
+class ProactiveIntentSelectionTests(unittest.TestCase):
+    """Deterministic weighted intent selection (no LLM involved)."""
+
+    FULL_SIGNALS = ProactiveIntentSignals(
+        has_useful_memory=True,
+        has_recent_context=True,
+        unfinished_topic=False,
+    )
+
+    def setUp(self):
+        self.machine = ProactiveStateMachine(
+            ProactiveChatConfig(
+                initial_idle_min_seconds=0,
+                initial_idle_max_seconds=0,
+            ),
+            monotonic=_Clock(),
+            randint=lambda minimum, _maximum: minimum,
+            random=lambda: 0.0,
+        )
+        self.state = self.machine.new_state("chat")
+
+    def test_unanswered_question_priority_beats_random_selection(self):
+        followup = ProactiveFollowupContext(
+            previous_proactive_ignored=True,
+            consecutive_ignored=2,
+            previous_proactive_expected_response=True,
+        )
+        intent = resolve_proactive_intent(
+            followup,
+            self.state,
+            self.machine,
+            self.FULL_SIGNALS,
+            random=lambda: 0.99,
+        )
+        self.assertEqual(intent, ProactiveIntent.REACT_TO_IGNORED_QUESTION)
+
+    def test_ignored_statement_uses_weighted_selection(self):
+        followup = ProactiveFollowupContext(
+            previous_proactive_ignored=True,
+            consecutive_ignored=1,
+            previous_proactive_expected_response=False,
+        )
+        spin = _spin_for(
+            self.machine.effective_intent_weights(self.state, self.FULL_SIGNALS),
+            ProactiveIntent.START_NEW_TOPIC,
+        )
+        intent = resolve_proactive_intent(
+            followup,
+            self.state,
+            self.machine,
+            self.FULL_SIGNALS,
+            random=lambda: spin,
+        )
+        self.assertEqual(intent, ProactiveIntent.START_NEW_TOPIC)
+
+    def test_every_weighted_intent_can_be_selected(self):
+        cases = {
+            ProactiveIntent.REACT_TO_SILENCE: self.FULL_SIGNALS,
+            ProactiveIntent.CONTINUE_PREVIOUS_TOPIC: self.FULL_SIGNALS,
+            ProactiveIntent.START_NEW_TOPIC: self.FULL_SIGNALS,
+            ProactiveIntent.ASK_USER_SOMETHING: self.FULL_SIGNALS,
+            ProactiveIntent.BRING_UP_MEMORY: self.FULL_SIGNALS,
+            ProactiveIntent.CASUAL_OBSERVATION: self.FULL_SIGNALS,
+        }
+        for expected, signals in cases.items():
+            with self.subTest(intent=expected):
+                weights = self.machine.effective_intent_weights(self.state, signals)
+                spin = _spin_for(weights, expected)
+                self.assertIsNotNone(spin, f"{expected} has zero weight")
+                self.assertEqual(
+                    self.machine.select_proactive_intent(
+                        self.state, signals, random=lambda: spin
+                    ),
+                    expected,
+                )
+
+    def test_repeated_intent_is_penalized(self):
+        self.state.recent_proactive_intents = [
+            ProactiveIntent.START_NEW_TOPIC,
+            ProactiveIntent.START_NEW_TOPIC,
+            ProactiveIntent.START_NEW_TOPIC,
+        ]
+        weights = self.machine.effective_intent_weights(self.state, self.FULL_SIGNALS)
+        self.assertAlmostEqual(weights[ProactiveIntent.START_NEW_TOPIC], 30 * 0.25**3)
+        self.assertEqual(
+            weights[ProactiveIntent.ASK_USER_SOMETHING],
+            DEFAULT_INTENT_WEIGHTS[ProactiveIntent.ASK_USER_SOMETHING],
+        )
+
+    def test_silence_acknowledgment_decays_fast(self):
+        self.state.recent_proactive_intents = [ProactiveIntent.REACT_TO_SILENCE]
+        weights = self.machine.effective_intent_weights(self.state, self.FULL_SIGNALS)
+        self.assertAlmostEqual(weights[ProactiveIntent.REACT_TO_SILENCE], 0.5)
+
+    def test_missing_memory_disables_bring_up_memory(self):
+        signals = ProactiveIntentSignals(
+            has_useful_memory=False,
+            has_recent_context=True,
+            unfinished_topic=False,
+        )
+        weights = self.machine.effective_intent_weights(self.state, signals)
+        self.assertEqual(weights[ProactiveIntent.BRING_UP_MEMORY], 0.0)
+        self.assertIsNone(_spin_for(weights, ProactiveIntent.BRING_UP_MEMORY))
+
+    def test_little_context_boosts_self_initiated_intents(self):
+        signals = ProactiveIntentSignals(
+            has_useful_memory=False,
+            has_recent_context=False,
+            unfinished_topic=False,
+        )
+        weights = self.machine.effective_intent_weights(self.state, signals)
+        self.assertEqual(weights[ProactiveIntent.CONTINUE_PREVIOUS_TOPIC], 0.0)
+        self.assertEqual(weights[ProactiveIntent.START_NEW_TOPIC], 45.0)
+        self.assertEqual(weights[ProactiveIntent.ASK_USER_SOMETHING], 30.0)
+        self.assertEqual(weights[ProactiveIntent.CASUAL_OBSERVATION], 15.0)
+
+    def test_unfinished_topic_boosts_continue_previous_topic(self):
+        signals = ProactiveIntentSignals(
+            has_useful_memory=False,
+            has_recent_context=True,
+            unfinished_topic=True,
+        )
+        weights = self.machine.effective_intent_weights(self.state, signals)
+        self.assertEqual(weights[ProactiveIntent.CONTINUE_PREVIOUS_TOPIC], 40.0)
+
+    def test_recent_intents_are_trimmed_to_three(self):
+        for index in range(5):
+            self.machine.record_proactive_sent(
+                self.state,
+                response_text=f"pesan {index}",
+                intent=ProactiveIntent.START_NEW_TOPIC,
+            )
+        self.assertEqual(len(self.state.recent_proactive_intents), 3)
+
+    def test_config_weights_override_defaults_with_validation(self):
+        machine = ProactiveStateMachine(
+            ProactiveChatConfig(
+                initial_idle_min_seconds=0,
+                initial_idle_max_seconds=0,
+                intent_weights={"start_new_topic": 100, "unknown_key": 7},
+            ),
+            monotonic=_Clock(),
+            randint=lambda minimum, _maximum: minimum,
+        )
+        weights = machine.effective_intent_weights(self.state, self.FULL_SIGNALS)
+        self.assertEqual(weights[ProactiveIntent.START_NEW_TOPIC], 100.0)
+        self.assertEqual(
+            weights[ProactiveIntent.REACT_TO_SILENCE],
+            DEFAULT_INTENT_WEIGHTS[ProactiveIntent.REACT_TO_SILENCE],
+        )
+        with self.assertRaises(ValueError):
+            ProactiveChatConfig(intent_weights={"start_new_topic": -1})
+
+    def test_old_config_without_intent_weights_still_loads(self):
+        self.assertIsNone(ProactiveChatConfig().intent_weights)
+        settings = BasicMemoryAgentConfig(llm_provider="ollama_llm")
+        self.assertIsNone(settings.proactive_intent_weights)
+        weights = self.machine.effective_intent_weights(self.state, self.FULL_SIGNALS)
+        self.assertEqual(weights, DEFAULT_INTENT_WEIGHTS)
+
+    def test_intent_context_round_trip_and_fallback(self):
+        context = ProactiveIntentContext(
+            intent=ProactiveIntent.BRING_UP_MEMORY,
+            user_has_replied_since_last_proactive=False,
+            consecutive_ignored=2,
+            recent_silence_acknowledgment=True,
+        )
+        self.assertEqual(ProactiveIntentContext.from_dict(context.as_dict()), context)
+        self.assertIsNone(ProactiveIntentContext.from_dict(None))
+        fallback = ProactiveIntentContext.from_dict({"intent": "bogus"})
+        self.assertEqual(fallback.intent, ProactiveIntent.CASUAL_OBSERVATION)
+
+
+class ProactiveIntentPromptTests(unittest.IsolatedAsyncioTestCase):
+    """Contract: internal intent context reaches the prompt, not history."""
+
+    def setUp(self):
+        self._old_cwd = os.getcwd()
+        self._temp = tempfile.TemporaryDirectory()
+        os.chdir(self._temp.name)
+        self.conf_uid = "mili-proactive"
+        self.history_uid = create_new_history(self.conf_uid)
+        store_message(self.conf_uid, self.history_uid, "human", "Aku lagi belajar.")
+        store_message(self.conf_uid, self.history_uid, "ai", "Belajar apa?")
+
+    def tearDown(self):
+        os.chdir(self._old_cwd)
+        self._temp.cleanup()
+
+    @staticmethod
+    def _intent_context(intent):
+        return ProactiveIntentContext(
+            intent=intent,
+            user_has_replied_since_last_proactive=True,
+            consecutive_ignored=0,
+            recent_silence_acknowledgment=False,
+        )
+
+    async def _generate(self, **kwargs):
+        agent, llm = _make_agent(self.conf_uid, self.history_uid)
+        outputs = [output async for output in agent.chat_proactively(**kwargs)]
+        self.assertTrue(outputs)
+        return agent, llm
+
+    async def test_intent_context_reaches_proactive_prompt(self):
+        agent, llm = await self._generate(
+            intent_context=self._intent_context(ProactiveIntent.START_NEW_TOPIC)
+        )
+        system = llm.calls[-1]["system"]
+        self.assertIn("Internal proactive context for this turn only", system)
+        self.assertIn("intent: start_new_topic", system)
+        self.assertIn("never announce a topic", system.lower())
+
+    async def test_ignored_question_intent_reaches_prompt(self):
+        agent, llm = await self._generate(
+            followup_context=ProactiveFollowupContext(
+                previous_proactive_ignored=True,
+                consecutive_ignored=1,
+                previous_proactive_expected_response=True,
+            ),
+            intent_context=self._intent_context(
+                ProactiveIntent.REACT_TO_IGNORED_QUESTION
+            ),
+        )
+        system = llm.calls[-1]["system"]
+        self.assertIn("intent: react_to_ignored_question", system)
+        self.assertIn("unanswered question", system)
+
+    async def test_anti_fake_history_contract_in_prompt(self):
+        agent, llm = await self._generate(
+            intent_context=self._intent_context(ProactiveIntent.START_NEW_TOPIC)
+        )
+        system = llm.calls[-1]["system"]
+        self.assertIn("Never claim", system)
+        self.assertIn("specific past personal events", system)
+
+    async def test_intent_metadata_never_enters_history(self):
+        agent, llm = await self._generate(
+            intent_context=self._intent_context(ProactiveIntent.START_NEW_TOPIC)
+        )
+        for message in get_history(self.conf_uid, self.history_uid):
+            self.assertNotIn("Internal proactive context", str(message))
+            self.assertNotIn("intent:", str(message))
+
+    async def test_no_fake_user_message_and_single_llm_call(self):
+        agent, llm = await self._generate(
+            intent_context=self._intent_context(ProactiveIntent.CASUAL_OBSERVATION)
+        )
+        self.assertEqual(
+            [message["role"] for message in agent._memory],
+            ["user", "assistant", "assistant"],
+        )
+        self.assertEqual(len(llm.calls), 1)
+
+    def test_intent_instruction_contract(self):
+        full = format_intent_instruction(
+            self._intent_context(ProactiveIntent.START_NEW_TOPIC)
+        )
+        self.assertIn("intent: start_new_topic", full)
+        self.assertIn("consecutive_ignored: 0", full)
+        self.assertIn("recent_silence_acknowledgment: false", full)
+        self.assertIn("never announce a topic", full)
+        compact = format_intent_instruction(
+            self._intent_context(ProactiveIntent.START_NEW_TOPIC),
+            include_guidance=False,
+        )
+        self.assertIn("intent: start_new_topic", compact)
+        self.assertNotIn("never announce a topic", compact)
+        self.assertIsNone(format_intent_instruction(None))
 
 
 if __name__ == "__main__":
