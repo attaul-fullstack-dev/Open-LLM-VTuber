@@ -166,6 +166,35 @@ class EmotionTagCleanupPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Hujan itu siklus air.", joined)
         self.assertIn("Capek ya hari ini.", joined)
 
+    async def test_marker_at_start_extracted_and_cleaned(self):
+        # Stage 4 timing fix: the prompt now asks for the single turn-level
+        # marker at the very START of the response, e.g. "[smirk] text...".
+        outputs = await self._run_pipeline("[smirk] Masa gitu aja harus aku jelasin.")
+        labelled = [o for o in outputs if o.actions.emotions]
+        self.assertEqual(len(labelled), 1, "exactly one sentence carries the marker")
+        self.assertEqual(labelled[0].actions.emotions, ["smirk"])
+        for output in outputs:
+            self.assertNotIn("[smirk]", output.display_text.text)
+            self.assertNotIn("[smirk]", output.tts_text)
+        self.assertNotIn("[", "".join(o.display_text.text for o in outputs))
+
+    async def test_first_sentence_emotion_then_unmarked_sentences(self):
+        # With the marker moved to the start, the emotion arrives on the FIRST
+        # sentence and later sentences carry none — the frontend latch keeps
+        # the face. Prove the label is not stuck on the last sentence anymore.
+        outputs = await self._run_pipeline(
+            "[joy] Akhirnya berhasil juga.", "Seru banget.", "Besok lanjut lagi."
+        )
+        labelled = [o for o in outputs if o.actions.emotions]
+        self.assertEqual(len(labelled), 1)
+        self.assertEqual(labelled[0].actions.emotions, ["joy"])
+        self.assertLess(
+            outputs.index(labelled[0]),
+            len(outputs) - 1,
+            "marker must be at the start, not the last sentence",
+        )
+        self.assertNotIn("[", "".join(o.display_text.text for o in outputs))
+
 
 class EmotionTagCleanupProactiveTests(unittest.IsolatedAsyncioTestCase):
     """Proactive turns share the same decorated chain, so emotion tags are
