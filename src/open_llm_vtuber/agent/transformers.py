@@ -92,6 +92,18 @@ def actions_extractor(live2d_model: Live2dModel):
                         expressions = live2d_model.extract_emotion(sentence.text)
                         if expressions:
                             actions.expressions = expressions
+                        # Stage 4: also carry the semantic emotion labels so the
+                        # frontend can map them to avatar facial states cleanly
+                        # (the legacy index alone is lossy / mis-mapped).
+                        # Guarded with hasattr so any test/model double that
+                        # only implements the legacy extract_emotion keeps
+                        # working; production Live2dModel always has it.
+                        if hasattr(live2d_model, "extract_emotion_keys"):
+                            emotion_keys = live2d_model.extract_emotion_keys(
+                                sentence.text
+                            )
+                            if emotion_keys:
+                                actions.emotions = emotion_keys
                     yield sentence, actions  # Yield the tuple
                 elif isinstance(item, dict):
                     # Pass through dictionaries

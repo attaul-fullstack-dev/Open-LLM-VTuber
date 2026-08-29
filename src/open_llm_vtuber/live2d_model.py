@@ -171,6 +171,39 @@ class Live2dModel:
             i += 1
         return expression_list
 
+    def extract_emotion_keys(self, str_to_check: str) -> list:
+        """
+        Like ``extract_emotion``, but returns the matched emotion LABELS (the
+        ``emotionMap`` keys) that appear in the string, in order of appearance.
+        The stage-4 frontend maps these semantic labels to avatar facial states,
+        instead of relying on the legacy presentation index (which is lossy and
+        was mapped to the wrong presets).
+
+        Parameters:
+            str_to_check (str): The string to check for emotions.
+
+        Returns:
+            list: The emotion key labels found in the string, e.g.
+            ``["anger"]``. An empty list is returned if no emotions are found.
+        """
+
+        expression_keys: list = []
+        str_to_check = str_to_check.lower()
+
+        i = 0
+        while i < len(str_to_check):
+            if str_to_check[i] != "[":
+                i += 1
+                continue
+            for key in self.emo_map.keys():
+                emo_tag = f"[{key}]"
+                if str_to_check[i : i + len(emo_tag)] == emo_tag:
+                    expression_keys.append(key)
+                    i += len(emo_tag) - 1
+                    break
+            i += 1
+        return expression_keys
+
     def remove_emotion_keywords(self, target_str: str) -> str:
         """
         Remove the emotion keywords from the input string and return the cleaned string.
