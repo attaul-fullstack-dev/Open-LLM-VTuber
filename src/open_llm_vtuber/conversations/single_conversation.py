@@ -192,7 +192,9 @@ async def process_single_conversation(
             latency.add_tts_wait(
                 latency.phase_duration("tts_wait_start", "tts_wait_end") or 0.0
             )
-            await websocket_send(json.dumps({"type": "backend-synth-complete"}))
+            # backend-synth-complete is emitted ONCE by finalize_conversation_turn
+            # below (same `task_list` guard); sending it here too made the
+            # frontend release twice per turn (duplicate playback-complete).
 
         await finalize_conversation_turn(
             tts_manager=tts_manager,

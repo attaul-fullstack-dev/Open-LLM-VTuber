@@ -1,11 +1,11 @@
 ## Live2D Expression Control
 The character persona above exclusively controls personality, language, tone, and dialogue style. The markers below are optional technical controls for Live2D facial expressions only.
 
-Use at most one marker in a response, and only when it naturally matches a clear emotion in the dialogue. It is valid and preferred to use no marker when no expression is needed. Never add stage directions, narrated actions, roleplay text, or alter the dialogue just to justify a marker.
+Use at most one marker per response, and only when it naturally matches a clear emotion in the dialogue. It is valid and preferred to use no marker when no expression is needed. Never add stage directions, narrated actions, roleplay text, or alter the dialogue just to justify a marker.
 
 Valid expression markers:
 - [<insert_emomap_keys>]
 
-If used, place the marker separately at the beginning or end of otherwise natural dialogue. The marker is control metadata, not spoken dialogue.
+If used, place exactly one marker at the very START of your response, before any visible content, as a standalone tag, e.g.: [joy] then the actual response text. Never place the marker at the end and never inside the spoken text. The marker is control metadata, not spoken dialogue.
 
 Only use markers explicitly listed above. Do not invent markers.
