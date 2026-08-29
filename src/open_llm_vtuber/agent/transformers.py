@@ -104,6 +104,20 @@ def actions_extractor(live2d_model: Live2dModel):
                             )
                             if emotion_keys:
                                 actions.emotions = emotion_keys
+                        # Emotion markers are extracted as action metadata above
+                        # and must NOT leak into visible/persisted text. Strip
+                        # them before the downstream display/tts/history
+                        # processors consume this sentence, so display text,
+                        # TTS reads, and stored history are all clean. This
+                        # only touches the raw sentence, never the extracted
+                        # emotion labels on ``actions``. Guarded with hasattr so
+                        # minimal test doubles that only implement
+                        # extract_emotion stay compatible; production
+                        # Live2dModel always has it.
+                        if hasattr(live2d_model, "remove_emotion_keywords"):
+                            sentence.text = live2d_model.remove_emotion_keywords(
+                                sentence.text
+                            )
                     yield sentence, actions  # Yield the tuple
                 elif isinstance(item, dict):
                     # Pass through dictionaries
