@@ -226,6 +226,22 @@ Urutan yang TERVERIFIKASI ABIS di live test:
 
 **Kesimpulan rig:** kalau ini masih belum cukup beda, kemungkinan besar rig mao_pro udah mentok (mouth/brow/eye-form all saturated) → butuh rerig / ekspresi, bukan tuning byar.
 
+## 17. Debug diagnostic bridge (ANGRYDIAG) — desain & pembersihan
+
+**Pola debug bridge** (dipakai berulang: S4TRACE, EMODIAG, ANGRYDIAG):
+- Frontend kirim fire-and-forget `fetch('/debug/<nama>')` ke endpoint backend kecil yang cuma cata ke `/tmp/server_setsid.log` (logger.info).
+- Payloadny ONLY metadata: label emotion, resolved faceId, activity/claim/release. JANGAN PERNAH isi chat/memory/persona/key.
+- User cukup `grep '<MARKER>' /tmp/server_setsid.log | tail -N` di VPS (tanpa DevTools Android).
+- Verifikasi endpoint aktif: `curl -X POST .../debug/<nama> -d '{...}'` → 200 + baris tercatat di log (tanda probe di log harus bisa dibedakan dari evidence asli / diabaikan).
+
+**Cara hapus tuntas (final):**
+1. Hapus fetcer di FRONTEND (pasti ikut di bundle kalau lupa → grep bundle!).
+2. Hapus endpoint + import `json`/`Request`/`logger` di BACKEND kalau tak terpakai lagi (ruff akan `Remove unused import` kalau lupa).
+3. Konfirmasi: `grep -ri '<marker>' src/ tests/ dist/web/assets/main-*.js` → 0. Termasuk marker lain (capface/EMODIAG/S4TRACE) & `/debug/` routes (`app.post/app.get`).
+4. Bundle `__pycache__/*.pyc` kadang binary-match — itu CACHE, bukan source. Abaikan/verify dengan `--include=*.py`.
+5. Build ulang bundle dari dist kosong (`rm -rf dist`) biar yakin bersih, verifikasi marker 0 + fitur tetap ada.
+6. Jangan ubah runtime behavior saat hapus diag — commit khusus "chore: remove temporary ...".
+
 ## Log perubahan catatan ini
 
 - `2026-08-30` — Inisialisasi: catat 11 pelajaran terkonfirmasi dari sesi Stage 3/4/5.
@@ -234,3 +250,4 @@ Urutan yang TERVERIFIKASI ABIS di live test:
 - `2026-08-30` — Tambah #14: proactive follow-up kena bias "complain silence" (2 sumber); soft-kan instruksi + guard anti-repetisi.
 - `2026-08-30` — Tambah #15: state intensitas-tinggi angry_strong + strong_blush (label emo_map baru embarrassed/anger_strong, weight 0, mapping contextual).
 - `2026-08-30` — Tambah #16: angry_strong visual — mouth/brow/eye-form jenuh; headroom cuma EyeOpen + EyeSmile negatif.
+- `2026-08-30` — Tambah #17: pola debug bridge & cara hapus tuntas (ANGRYDIAG final cleanup).

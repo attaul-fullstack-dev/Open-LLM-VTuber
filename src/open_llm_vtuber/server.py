@@ -86,11 +86,11 @@ class WebSocketServer:
             allow_credentials=True,
             allow_methods=["*"],
             allow_headers=["*"],
-        )
-
-        # Include routes, passing the context instance
+        )        # Include routes, passing the context instance
         # The context will be populated during the initialize step
         self.app.include_router(
+
+
             init_client_ws_route(default_context_cache=self.default_context_cache),
         )
         self.app.include_router(
