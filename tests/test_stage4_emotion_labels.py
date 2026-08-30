@@ -345,20 +345,43 @@ class EmotionPromptBiasContractTests(unittest.TestCase):
         self.assertIn("not on the user's words", self.content)
 
     def test_prompt_guards_high_intensity_labels(self):
-        # anger_strong reserved for genuinely strong anger; ordinary rage/tsundere
-        # must stay [anger]. embarrassed only for genuinely flustered/shy reactions.
+        # anger_strong reserved for genuinely intense anger; ordinary tsundere
+        # irritation must stay [anger]. embarrassed only for real fluster/shy.
         self.assertIn("[anger_strong]", self.content)
         self.assertIn("[embarrassed]", self.content)
-        self.assertIn("fury", self.content)
+        self.assertIn("furious", self.content)
         self.assertIn("angry outburst", self.content)
         self.assertIn("flustered", self.content)
         self.assertIn("merely because the conversation is playful", self.content)
+
+    def test_prompt_anger_scales_appropriately_for_ordinary_cases(self):
+        # Ordinary annoyance / tsundere scolding must NOT become anger_strong.
+        self.assertIn("[anger]", self.content)
+        self.assertIn("mild or moderate anger", self.content)
+        self.assertIn("tsundere pouting", self.content)
+        self.assertIn("stay [anger]", self.content)
+
+    def test_prompt_anger_strong_reaches_severe_context(self):
+        # The threshold must not be so strict that an EXPLICITLY severe context
+        # (deliberate destruction / betrayal of something important, no remorse)
+        # never selects anger_strong. The contract must name that severe category.
+        self.assertIn("deliberate destruction", self.content)
+        self.assertIn("betrayal", self.content)
+        self.assertIn("serious hurt/harm", self.content)
+        self.assertIn("truly furious", self.content)
+
+    def test_prompt_anger_strong_is_not_inferred_from_keyword_or_generic(self):
+        # Neither a single angry keyword nor generic negative banter may force
+        # anger_strong; it is reserved for genuinely intense, elevated anger.
+        self.assertIn("single angry keyword", self.content)
+        self.assertIn("generic negative", self.content)
+        self.assertIn("intensity", self.content.lower())
         self.assertNotIn("barely", self.content)  # placeholder no-op guard
 
     def test_prompt_does_not_map_generic_labels_to_strong_states(self):
         # smirk / joy / anger must not be described as if they become the strong
         # states — that would recreate the smirk-overuse problem.
-        self.assertIn("stay [anger]", self.content)
+        self.assertIn("ordinary irritation", self.content.lower())
         self.assertIn("prefer no marker or [joy]", self.content)
 
 
