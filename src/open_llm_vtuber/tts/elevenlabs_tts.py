@@ -24,6 +24,7 @@ class TTSEngine(TTSInterface):
         similarity_boost: float = 0.5,
         style: float = 0.0,
         use_speaker_boost: bool = True,
+        speed: float = 1.0,
     ):
         """
         Initializes the ElevenLabs TTS engine.
@@ -37,6 +38,7 @@ class TTSEngine(TTSInterface):
             similarity_boost (float): Voice similarity boost (0.0 to 1.0).
             style (float): Voice style exaggeration (0.0 to 1.0).
             use_speaker_boost (bool): Enable speaker boost for better quality.
+            speed (float): Speech speed (0.7 to 1.2; 1.0 is normal speed).
         """
         self.api_key = api_key
         self.voice_id = voice_id
@@ -46,6 +48,7 @@ class TTSEngine(TTSInterface):
         self.similarity_boost = similarity_boost
         self.style = style
         self.use_speaker_boost = use_speaker_boost
+        self.speed = speed
 
         # Determine file extension from output format
         if "mp3" in output_format:
@@ -104,6 +107,7 @@ class TTSEngine(TTSInterface):
                     "similarity_boost": self.similarity_boost,
                     "style": self.style,
                     "use_speaker_boost": self.use_speaker_boost,
+                    "speed": self.speed,
                 },
             )
 
