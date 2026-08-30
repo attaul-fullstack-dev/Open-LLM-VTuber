@@ -209,6 +209,23 @@ Urutan yang TERVERIFIKASI ABIS di live test:
 
 **Catatan testing quirk:** test `strong_blush` "release clears Cheek" perlu toleransi epsilon (`Math.abs(cheek) < 0.01`) karena interpolation meninggalkan residu floating ~1e-11, bukan 0 persis.
 
+## 16. angry_strong visual distinction — headroom yang tersisa cuma mata
+
+**Masalah live:** `[anger_strong]` sudah benar (label), tapi visual nyaris sama dengan `angry_pout` (bedanya cuma sedikit).
+
+**Temuan audit:** sebagian besar cue anger SUDAH JENUH (mentok real max):
+- `ParamMouthUp: -1.0` (min), `ParamMouthAngry: 1.0` / `ParamMouthAngryLine: 1.0` (max),
+- `ParamEyeForm: 1.0` (max), `ParamBrowAngle/Form: -1.0` (min, sudah -0.9 → -1.0 = beda kecil).
+- `model3.json` TIDAK mencantumkan range param (Live2D default -1..1; EyeOpen 0..1) — yang klasik `FACIAL_RANGES` di frontend cuma DOKUMENTASI, bukan clamp penulis. Jadi nilai additive langsung sampai rig; CubismModel yg clamp ke min/max asli param.
+
+**Headroom visual yang TERSISA (belum disentuh angry_pout):**
+1. **`EyeOpen` multiply** — bisa dikecilkan jauh (0.78 → 0.62).
+2. **`EyeLSmile/EyeRSmile` NEGATIF** — menarik sudut mata tegangan/turun. angry_pout sengaja EyeSmile = 0, jadi ini pembeda utama "cute pout → garang".
+
+**Fix angry_strong** (tanpa sentuh angry_pout, tanpa rerig, tanpa MouthDown, Cheek tetap 0): `EyeOpen x0.62` + `EyeSmile ±(-0.6)`, sisanya tetap (MouthAngry/Line 1.0, MouthUp -1, brow angle/form -1.0, EyeForm 1.0, MouthDown 0, Cheek 0).
+
+**Kesimpulan rig:** kalau ini masih belum cukup beda, kemungkinan besar rig mao_pro udah mentok (mouth/brow/eye-form all saturated) → butuh rerig / ekspresi, bukan tuning byar.
+
 ## Log perubahan catatan ini
 
 - `2026-08-30` — Inisialisasi: catat 11 pelajaran terkonfirmasi dari sesi Stage 3/4/5.
@@ -216,3 +233,4 @@ Urutan yang TERVERIFIKASI ABIS di live test:
 - `2026-08-30` — Tambah #13: capability-test neutral/sad/angry via `?capface=`, akar smile-baseline MouthUp=1.0, writer order terkonfirmasi.
 - `2026-08-30` — Tambah #14: proactive follow-up kena bias "complain silence" (2 sumber); soft-kan instruksi + guard anti-repetisi.
 - `2026-08-30` — Tambah #15: state intensitas-tinggi angry_strong + strong_blush (label emo_map baru embarrassed/anger_strong, weight 0, mapping contextual).
+- `2026-08-30` — Tambah #16: angry_strong visual — mouth/brow/eye-form jenuh; headroom cuma EyeOpen + EyeSmile negatif.
