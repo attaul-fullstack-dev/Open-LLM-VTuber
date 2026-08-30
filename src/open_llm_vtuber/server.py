@@ -8,10 +8,8 @@ It uses FastAPI for the server and Starlette for static file serving.
 
 import os
 import shutil
-import json
 
-from fastapi import FastAPI, Request
-from loguru import logger
+from fastapi import FastAPI
 from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import Response
 from starlette.staticfiles import StaticFiles as StarletteStaticFiles
@@ -89,27 +87,6 @@ class WebSocketServer:
             allow_methods=["*"],
             allow_headers=["*"],
         )
-
-        # TEMPORARY Stage-5/4 emotion diagnostic bridge. The frontend POSTs ONLY
-        # emotion metadata (labels, mapped face id, claim/release decision) here
-        # so it lands in the same server log the user greps during a live test.
-        # No chat text / persona / memory ever arrives here.
-        @self.app.post("/debug/emodiag")
-        async def _emodiag(req: Request):
-            try:
-                data = await req.json()
-            except Exception:
-                data = {}
-            allow = {
-                "faceId", "discriminator", "claim", "release", "reason",
-                "emotions", "expressions", "hasAudio", "seq",
-            }
-            slim = {k: v for k, v in data.items() if k in allow}
-            try:
-                logger.info("[EMODIAG-F] " + json.dumps(slim, ensure_ascii=False, sort_keys=True))
-            except Exception:
-                pass
-            return {"ok": True}
 
         # Include routes, passing the context instance
         # The context will be populated during the initialize step

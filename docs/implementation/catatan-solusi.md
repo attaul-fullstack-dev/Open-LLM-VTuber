@@ -156,7 +156,23 @@ Urutan yang TERVERIFIKASI ABIS di live test:
 
 **Trap diagnostik:** JANGAN tambah `emoDiag({ claim:true })` tanpa syarat setelah publish — itu MENYESATKAN. Decision otentik ada di subscriber (`decision:${kind}`). Kalau perlu trace, pakai field jujur (`incoming`/`on`) dan serahkan penentuan ke subscribe.
 
+## 13. Capability-test wajah (rig mao_pro) — neutral/sad/angry
+
+**Akar masalah "neutral tampak senyum":** idle motion `mtn_01.motion3.json` megang `ParamMouthUp = 1.0` (pose mulut netral-nya sendiri, loop motion 5.57s), DAN max asli param itu juga 1.0. Tapi palette Stage 3 `neutral` additive-nya KOSONG → tidak ada yang nge-counter baseline → mulut tetap ke-clamp di 1.0 = senyum permanen. Ini masalah NILAI, bukan writer-order (Time mode facial Stage 3/4 memang writer terakhir sebelum `model.update()`).
+
+**Writer order terkonfirmasi (`lappmodel.ts update`):** `loadParameters → motion(set ParamMouthUp=1.0) → blink → expression → drag → breath → physics → lip sync(ParamA) → pose → Stage2 movement hook → Stage3 facial hook → model.update()`. Stage 3 API (brows/mouth/eye-smile) jadi penulis terakhir → tidak di-overwrite physics/pose/lipsync. Bukan masalah ordering.
+
+**Solusi sementara (developer-only), aktivasi via URL `?capface=`:**
+- `neutral`: `MouthUp:-1.0` (counter baseline 1.0 → ratakan senyum), brows/eyes netral, `Cheek:0` (clear blush residue).
+- `sad`: mirror exp_05 — `MouthUp:-1.0, MouthDown:0.8, BrowLAngle/Form:-0.8, eyeOpen 0.92`.
+- `angry`: mirror exp_08 — `MouthUp:-1.0, MouthAngry:1.0, MouthAngryLine:1.0, MouthDown:0 (jangan, biar gak jadi sad), EyeForm:1.0, brow furrow -0.9, eyeOpen 0.85`.
+- Saat cap active: `controller.step()` TIDAK dipanggil → Stage 3 idle & Stage 4 contextual face di-bypass; Stage 2 body/head tetap jalan (hook terpisah).
+- File: `use-live2d-idle-facial.ts` (TEMP_CAPABILITY_FACES + readCapabilityFace). Gampang dibalik (satu diff) setelah live-test.
+
+**Kesimpulan kemampuan rig (belum tuning final):** semua 3 ekspresi secara teori bisa dibuat jelas — neutral butuh counter MouthUp -1.0; sad bisa lewat mulut turun + brows; angry bisa lewat pout line + EyeForm + brow furrow tanpa MouthDown. Belum ada satupun yang terbukti mustahil TANPA rerig kecuali live-test membuktikan.
+
 ## Log perubahan catatan ini
 
 - `2026-08-30` — Inisialisasi: catat 11 pelajaran terkonfirmasi dari sesi Stage 3/4/5.
 - `2026-08-30` — Tambah #12: bias emosi `[smirk]` default & jalur turn-level latch (Case A terkonfirmasi; prompt-guard + diagnosa jujur).
+- `2026-08-30` — Tambah #13: capability-test neutral/sad/angry via `?capface=`, akar smile-baseline MouthUp=1.0, writer order terkonfirmasi.
