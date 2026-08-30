@@ -911,22 +911,23 @@ def format_followup_instruction(
     if context.previous_proactive_expected_response:
         expectation = "yes -- it asked the user a direct question"
         priority = (
-            "your previous message asked the user something and they never "
-            "answered; strongly prefer reacting to the unanswered question "
-            "first -- notice the silence with mild irritation, confusion, "
-            "teasing, embarrassment, or a short complaint, escalating "
-            "naturally with each ignored follow-up (first: mild confusion or "
-            "teasing; second: more impatient or annoyed; third or later: "
-            "resigned, sulking, briefly giving up, or changing topic); never "
-            "repeat the exact same question"
+            "your previous message asked the user something and they have not "
+            "answered yet -- they may be busy or away. Do NOT make the "
+            "silence the point every time, and never repeat the same question. "
+            "Usually choose a natural next move: change subject, share a short "
+            "thought, or ask something different. Only occasionally (not "
+            "repeatedly) lightly acknowledge the silence with a tease or a "
+            "resigned 'yaudah deh'. Never complain at length and never repeat "
+            "the exact same question"
         )
     else:
         expectation = "no -- it was a statement, not a question"
         priority = (
             "your previous proactive message was a statement, not a question; "
-            "do NOT claim the user failed to answer a question -- you may "
-            "notice the silence more generally, tease lightly, or naturally "
-            "move to something else"
+            "the user not replying to it is completely normal, so do NOT make "
+            "an issue of the silence. Move on naturally: continue with something "
+            "related, share a thought, or start something new. At most you may "
+            "very briefly notice the silence, or just not mention it at all"
         )
 
     return (
@@ -1107,6 +1108,17 @@ class ProactiveIntentDecision:
     signals: ProactiveIntentSignals
 
 
+def _silence_complaint_recently_used(state: ProactiveRuntimeState) -> bool:
+    """True when a silence/ignored-question complaint already happened recently.
+
+    Internal anti-repetition guard: a forced ``REACT_TO_IGNORED_QUESTION`` turn
+    is only allowed when the same complaint strategy has not just been used,
+    so consecutive ignored follow-ups naturally vary instead of repeating
+    "why aren't you replying / I'm talking alone".
+    """
+    return ProactiveIntent.REACT_TO_IGNORED_QUESTION in state.recent_proactive_intents
+
+
 def _decision_reason(signals: ProactiveIntentSignals, intent: str) -> str:
     if signals.assistant_question_pending or signals.unfinished_topic:
         return "unfinished_topic"
@@ -1141,6 +1153,7 @@ def resolve_proactive_intent_decision(
         followup_context is not None
         and followup_context.previous_proactive_ignored
         and followup_context.previous_proactive_expected_response
+        and not _silence_complaint_recently_used(state)
     ):
         return ProactiveIntentDecision(
             strategy=ProactiveTurnStrategy.FORCED_IGNORED_QUESTION,

@@ -689,7 +689,7 @@ class ProactiveFollowupPromptTests(unittest.IsolatedAsyncioTestCase):
         system = llm.calls[-1]["system"]
         self.assertIn("Internal follow-up context for this turn only", system)
         self.assertIn("asked the user a direct question", system)
-        self.assertIn("unanswered question", system)
+        self.assertIn("make the silence the point every time", system)
         self.assertIn("never repeat the exact same question", system)
 
     async def test_ignored_statement_does_not_claim_unanswered_question(self):
@@ -702,8 +702,9 @@ class ProactiveFollowupPromptTests(unittest.IsolatedAsyncioTestCase):
         ]
         system = llm.calls[-1]["system"]
         self.assertIn("was a statement, not a question", system)
-        self.assertIn("do NOT claim the user failed to answer", system)
+        self.assertIn("do NOT make an issue of the silence", system)
         self.assertNotIn("asked the user a direct question", system)
+        self.assertNotIn("make the silence the point every time", system)
 
     async def test_no_ignored_context_produces_no_followup_block(self):
         agent, llm = _make_agent(self.conf_uid, self.history_uid)
@@ -725,12 +726,14 @@ class ProactiveFollowupPromptTests(unittest.IsolatedAsyncioTestCase):
     def test_followup_instruction_contract(self):
         question = format_followup_instruction(self._ignored_context(question=True))
         self.assertIn("Consecutive proactive messages ignored: 1", question)
-        self.assertIn("mild confusion or teasing", question)
-        self.assertIn("more impatient or annoyed", question)
-        self.assertIn("resigned, sulking", question)
+        # The ignored-question block encourages VARIETY instead of making
+        # silence-complaint the default follow-up style.
+        self.assertIn("never repeat the same question", question)
+        self.assertIn("Usually choose a natural next move", question)
+        self.assertIn("Only occasionally (not repeatedly)", question)
         self.assertIn("never mention counters, timers", question)
         statement = format_followup_instruction(self._ignored_context(question=False))
-        self.assertIn("do NOT claim the user failed to answer", statement)
+        self.assertIn("do NOT make an issue of the silence", statement)
         answered = format_followup_instruction(
             ProactiveFollowupContext(
                 previous_proactive_ignored=False,
@@ -1002,6 +1005,49 @@ class SemanticProactiveSelectionTests(unittest.TestCase):
         self.assertEqual(decision.intent, ProactiveIntent.REACT_TO_IGNORED_QUESTION)
         self.assertEqual(decision.reason, "ignored_question_priority")
 
+    def test_ignored_question_only_forced_when_complaint_not_just_used(self):
+        # The FIRST ignored question may still be forced (fresh state).
+        followup = ProactiveFollowupContext(True, 1, True)
+        decision = resolve_proactive_intent_decision(
+            followup, self.state, self.machine, self.signals
+        )
+        self.assertEqual(
+            decision.strategy, ProactiveTurnStrategy.FORCED_IGNORED_QUESTION
+        )
+
+    def test_second_ignored_question_is_not_forced_to_complain(self):
+        # After a forced complaint turn the intent is recorded in
+        # recent_proactive_intents, so the NEXT ignored follow-up must NOT be
+        # forced to repeat "why aren't you replying ".
+        self.state.recent_proactive_intents.append(
+            ProactiveIntent.REACT_TO_IGNORED_QUESTION
+        )
+        followup = ProactiveFollowupContext(True, 2, True)
+        decision = resolve_proactive_intent_decision(
+            followup, self.state, self.machine, self.signals
+        )
+        self.assertNotEqual(
+            decision.strategy, ProactiveTurnStrategy.FORCED_IGNORED_QUESTION
+        )
+        # It falls through to the configured (semantic) strategy so variety wins.
+        self.assertEqual(decision.strategy, ProactiveTurnStrategy.SEMANTIC_AUTO)
+
+    def test_consecutive_ignored_followups_cannot_all_complain(self):
+        # Simulate several recorded complaint turns all in the recent window;
+        # repeated ignored follow-ups must keep falling through to variety.
+        self.state.recent_proactive_intents.extend(
+            [ProactiveIntent.REACT_TO_IGNORED_QUESTION] * 3
+        )
+        followup = ProactiveFollowupContext(True, 3, True)
+        for _ in range(3):
+            decision = resolve_proactive_intent_decision(
+                followup, self.state, self.machine, self.signals
+            )
+            self.assertNotEqual(
+                decision.strategy, ProactiveTurnStrategy.FORCED_IGNORED_QUESTION
+            )
+            self.assertEqual(decision.strategy, ProactiveTurnStrategy.SEMANTIC_AUTO)
+
     def test_explicit_heuristic_strategy_keeps_v2_selector(self):
         decision = resolve_proactive_intent_decision(
             None,
@@ -1092,7 +1138,8 @@ class ProactiveIntentPromptTests(unittest.IsolatedAsyncioTestCase):
         )
         system = llm.calls[-1]["system"]
         self.assertIn("intent: react_to_ignored_question", system)
-        self.assertIn("unanswered question", system)
+        self.assertIn("make the silence the point every time", system)
+        self.assertIn("never repeat the same question", system)
 
     async def test_anti_fake_history_contract_in_prompt(self):
         agent, llm = await self._generate(

@@ -171,8 +171,28 @@ Urutan yang TERVERIFIKASI ABIS di live test:
 
 **Kesimpulan kemampuan rig (belum tuning final):** semua 3 ekspresi secara teori bisa dibuat jelas — neutral butuh counter MouthUp -1.0; sad bisa lewat mulut turun + brows; angry bisa lewat pout line + EyeForm + brow furrow tanpa MouthDown. Belum ada satupun yang terbukti mustahil TANPA rerig kecuali live-test membuktikan.
 
+## 14. Proactive follow-up: ganti bias "complain silence" jadi variasi + anti-repetisi
+
+**Masalah live:** kalau user diem, follow-up proactive jadi repetitive/self-conscious ("kok malah nyuruh aku lanjutin sendiri?", "capek nungguin kamu", "mau lihat aku ngomong sendirian ya?") — terasa mekanis.
+
+**Akar penyebab (2 sumber):**
+1. `format_followup_instruction` di `proactive_chat.py` — instruksi lama: "strongly prefer reacting to the unanswered question first ... notice the silence with mild irritation ... escalating naturally ... (first: mild confusion; second: impatient; third: resigned/sulking)" → menjadikan komplain silence DEFAULT di tiap follow-up yang diabaikan.
+2. `resolve_proactive_intent_decision` — SELALU paksa `FORCED_IGNORED_QUESTION → REACT_TO_IGNORED_QUESTION` saat question diabaikan, tanpa anti-repetisi.
+
+**Solusi (permanen, tidak ubah persona/tuning/mapping):**
+- **Softkan instruksi follow-up** (`format_followup_instruction`): model disuruh BIASANYA ganti arah (ganti topik, komentar, pemikiran, pertanyaan beda, lanjut sendiri), cuma sekali-kali akui keheningan (tease / "yaudah deh"), jangan komplain berulang, jangan ulang pertanyaan yang sama. Statement yang diabaikan → "not replying is completely normal, do NOT make an issue of the silence".
+- **Guard deterministic anti-repetisi** (`_silence_complaint_recently_used(state)`): kalau `REACT_TO_IGNORED_QUESTION` sudah ada di `state.recent_proactive_intents` (sudah pernah komplain), turn berikutnya TIDAK dipaksa force lagi → jatuh ke seleksi semantic/bervariasi. Komplain pertama tetap diizinkan (state fresh = recent intents kosong).
+- `record_proactive_sent` sudah melacak intent → menjaganya di window 3 turn.
+
+**Cara kerja:** user diem → proactive #1 (boleh komplain sekali) → intent tercatat → proactive #2/#3 tidak dipaksa komplain → model otomatis pilih topik/observasi/pertanyaan beda. Proactive setelah user akhirnya balas → `record_user_activity` reset counters → normal lagi.
+
+**Kontrak yang dipertahankan:** backoff/ignored limit tidak berubah, satu provider call, tidak ada eval LLM, casing teks assertion di test menyesuaikan frase baru.
+
+**Catatan test quirk:** `context_window_override=2000` di `_make_agent` — teks follow-up sedikit lebih panjang bisa bikin test yang sekaligus kirim `followup_context` + `intent_context` lewat budget → "Proactive generation skipped because context does not fit" → output kosong. Jaga teks tetap ringkas.
+
 ## Log perubahan catatan ini
 
 - `2026-08-30` — Inisialisasi: catat 11 pelajaran terkonfirmasi dari sesi Stage 3/4/5.
 - `2026-08-30` — Tambah #12: bias emosi `[smirk]` default & jalur turn-level latch (Case A terkonfirmasi; prompt-guard + diagnosa jujur).
 - `2026-08-30` — Tambah #13: capability-test neutral/sad/angry via `?capface=`, akar smile-baseline MouthUp=1.0, writer order terkonfirmasi.
+- `2026-08-30` — Tambah #14: proactive follow-up kena bias "complain silence" (2 sumber); soft-kan instruksi + guard anti-repetisi.
