@@ -260,5 +260,46 @@ class EmotionTagCleanupProactiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("[joy]", output.tts_text)
 
 
+class EmotionPromptBiasContractTests(unittest.TestCase):
+    """Prompt-content contract: the LLM instruction file must keep explicit
+    per-label choice rules so smirk is not a default tsundere habit. This is a
+    content-guard against the confirmed bias that smirk got chosen for both a
+    clearly sad context and a plain neutral/factual context."""
+
+    PROMPT_PATH = os.path.join(
+        "prompts", "utils", "live2d_expression_prompt.txt"
+    )
+
+    def setUp(self):
+        with open(self.PROMPT_PATH, encoding="utf-8") as f:
+            self.content = f.read()
+
+    def test_prompt_keeps_marker_placement_rule(self):
+        self.assertIn("at the very START", self.content)
+        self.assertIn("exactly one marker", self.content)
+
+    def test_prompt_says_neutral_is_the_default(self):
+        # Neutral / no-marker must be the common case for factual replies.
+        self.assertIn("[neutral]", self.content)
+        self.assertIn("Default to NO marker", self.content)
+
+    def test_prompt_guards_smirk_from_overuse(self):
+        # smirk must be reserved for genuinely sly/teasing tone, not casual/sarcasm.
+        self.assertIn("[smirk]", self.content)
+        self.assertIn("smirk", self.content)
+        self.assertIn("teasing", self.content)
+        self.assertIn("only when your response is genuinely happy", self.content)  # joy rule
+
+    def test_prompt_keeps_sadness_and_anger_valid(self):
+        self.assertIn("[sadness]", self.content)
+        self.assertIn("[anger]", self.content)
+        self.assertIn("genuinely sad", self.content)
+        self.assertIn("genuinely irritated", self.content)
+
+    def test_prompt_bases_choice_on_response_tone_not_user_words(self):
+        self.assertIn("emotional tone", self.content)
+        self.assertIn("not on the user's words", self.content)
+
+
 if __name__ == "__main__":
     unittest.main()

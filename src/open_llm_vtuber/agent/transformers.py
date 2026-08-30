@@ -98,12 +98,27 @@ def actions_extractor(live2d_model: Live2dModel):
                         # Guarded with hasattr so any test/model double that
                         # only implements the legacy extract_emotion keeps
                         # working; production Live2dModel always has it.
+                        emotion_keys: list = []
                         if hasattr(live2d_model, "extract_emotion_keys"):
                             emotion_keys = live2d_model.extract_emotion_keys(
                                 sentence.text
                             )
                             if emotion_keys:
                                 actions.emotions = emotion_keys
+                        # TEMPORARY Stage-5/4 emotion diagnostic (metadata ONLY,
+                        # never conversation text). One line per sentence with the
+                        # extracted emotion labels, legacy expression indices and
+                        # marker presence, so a live test can verify CASE 1/2/3.
+                        from ..request_latency import get_latency_tracker, monotonic_ms
+                        tracker = get_latency_tracker()
+                        logger.info(
+                            "[EMODIAG] req={} t_ms={:.0f} has_marker={} emotions={} expressions={}",
+                            (tracker.request_id if tracker else "-"),
+                            (max(0.0, monotonic_ms() - tracker.started_ms) if tracker else 0.0),
+                            bool(expressions or emotion_keys),
+                            ",".join(emotion_keys) if emotion_keys else "-",
+                            ",".join(str(e) for e in expressions) if expressions else "-",
+                        )
                         # Emotion markers are extracted as action metadata above
                         # and must NOT leak into visible/persisted text. Strip
                         # them before the downstream display/tts/history
