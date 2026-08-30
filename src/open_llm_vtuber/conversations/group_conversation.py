@@ -271,7 +271,9 @@ async def handle_group_member_turn(
 
     if tts_manager.task_list:
         await asyncio.gather(*tts_manager.task_list)
-        await current_ws_send(json.dumps({"type": "backend-synth-complete"}))
+        # backend-synth-complete is emitted ONCE by finalize_conversation_turn
+        # below (same `task_list` guard); sending it here too made the frontend
+        # release twice per turn (duplicate playback-complete).
 
         broadcast_ctx = BroadcastContext(
             broadcast_func=broadcast_func,

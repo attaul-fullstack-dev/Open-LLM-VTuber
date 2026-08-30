@@ -21,6 +21,13 @@ from ...chat_history_manager import (
     get_metadata,
     update_summary_metadata,
 )
+from ...proactive_chat import (
+    ProactiveFollowupContext,
+    ProactiveIntentContext,
+    ProactiveTurnStrategy,
+    format_followup_instruction,
+    format_intent_instruction,
+)
 from ...character_state import (
     CharacterState,
     add_character_memory as persist_character_memory,
@@ -32,6 +39,7 @@ from ...character_state import (
     reset_character_state as reset_persisted_character_state,
     set_character_relationship,
 )
+from ...character_memory_commands import parse_memory_command
 from ..transformers import (
     sentence_divider,
     actions_extractor,
@@ -63,7 +71,6 @@ from ..relationship_context import (
     detect_relationship_update,
     normalize_relationship_status,
 )
-import re
 import time
 from ...request_latency import (
     get_latency_tracker,
@@ -71,22 +78,17 @@ from ...request_latency import (
     set_latency_phase,
 )
 
-# Conservative, local-only character memory triggers. No LLM classifier and no
-# extra API call per message. Only explicit user requests are honored:
-#   - Remember:  "Ingat ya, makanan favoritku ramen."
-#                "Jangan lupa kalau aku suka kopi."
-#   - Forget:    "Lupakan kalau makanan favoritku ramen."
-_MEMORY_REMEMBER = re.compile(
-    r"(?:tolong\s+)?(?:ingat|catat)\s+(?:ya|yah|dong|deh|dulu|kalau)?\s*[,:]?\s*|"
-    r"jangan\s+lupa\s+(?:ya|yah|dong|deh)?\s*[,:]?\s*",
-    re.IGNORECASE,
-)
-_MEMORY_FORGET = re.compile(
-    r"(?:tolong\s+)?lupakan\s+(?:ya|yah|dong|deh)?\s*"
-    r"(?:kalau|soal|tentang|yang\s+kamu\s+ingat)?\s+|"
-    r"hapus\s+dari\s+ingatan\s+",
-    re.IGNORECASE,
-)
+# Request-only cue for every proactive turn. Proactive generation is a
+# system-initiated turn, so the provider request never contains a *current*
+# user turn from the real conversation; the transcript is always history.
+# Some OpenAI-compatible providers (observed: Ollama Cloud) can complete a
+# stream with zero assistant tokens when the request ends on an assistant
+# message (e.g. after Mili's first proactive message, or after any normal
+# user/assistant exchange). This short, model-neutral, request-only user turn
+# gives the provider a current generation cue. It is appended after context
+# selection, before the provider call, and is never persisted: it never enters
+# _memory, history, summary, memory parsing, relationship logic, or the UI.
+PROACTIVE_TURN_CUE = "Continue the conversation naturally on your own."
 
 
 class BasicMemoryAgent(AgentInterface):
@@ -477,25 +479,21 @@ class BasicMemoryAgent(AgentInterface):
         """Honor explicit remember/forget requests with cheap local rules."""
         if not self._character_conf_uid:
             return False
-        text = (user_text or "").strip()
-        if not text:
+        result = parse_memory_command(user_text)
+        if result.action == "none" or not result.payload:
             return False
-        forget_match = _MEMORY_FORGET.match(text)
-        if forget_match:
-            target = text[forget_match.end():].strip(" .,!?;:，。！？；：")
-            if len(target) >= 3:
-                return self.remove_character_memory(target)
-        remember_match = _MEMORY_REMEMBER.match(text)
-        if remember_match:
-            raw = text[remember_match.end():].strip()
-            content = raw.strip(" .,!?;:，。！？；：")
-            if (
-                len(content) >= 4
-                and not raw.endswith("?")
-                and not raw.endswith("？")
-            ):
-                return self.add_character_memory(content, explicit=True)
-        return False
+        if result.action == "forget":
+            success = self.remove_character_memory(result.payload)
+        else:
+            success = self.add_character_memory(result.payload, explicit=True)
+        logger.info(
+            "Character memory command: memory_command={}, matched_trigger={}, "
+            "success={}",
+            result.action,
+            result.matched_trigger,
+            success,
+        )
+        return success
 
     def observe_character_events(
         self,
@@ -1390,12 +1388,21 @@ class BasicMemoryAgent(AgentInterface):
 
     def _proactive_chat_function_factory(
         self,
+        followup_context: Optional[
+            Union[Dict[str, Any], ProactiveFollowupContext]
+        ] = None,
+        intent_context: Optional[
+            Union[Dict[str, Any], ProactiveIntentContext]
+        ] = None,
     ) -> Callable[[], AsyncIterator[Union[SentenceOutput, Dict[str, Any]]]]:
         """Create an assistant-only turn using the normal character context.
 
         The generation cue is appended to the effective system prompt only for
         this request.  It never enters ``_memory`` or the persisted transcript.
         The generated assistant message does enter ``_memory`` normally.
+        ``followup_context`` carries the deterministic ignored-proactive state
+        (see ``proactive_chat.ProactiveFollowupContext``); it only shapes the
+        prompt and never triggers an extra model call.
         """
 
         @tts_filter(self._tts_preprocessor_config)
@@ -1433,6 +1440,41 @@ class BasicMemoryAgent(AgentInterface):
                     + proactive_instruction,
                 ]
             )
+            if isinstance(intent_context, dict):
+                parsed_intent = ProactiveIntentContext.from_dict(intent_context)
+            else:
+                parsed_intent = intent_context
+            if isinstance(followup_context, dict):
+                parsed_followup = ProactiveFollowupContext.from_dict(followup_context)
+            else:
+                parsed_followup = followup_context
+            # In semantic-auto mode, an ignored statement does not make
+            # silence the topic.  A genuinely unanswered proactive question
+            # remains deterministic and keeps the existing escalation block.
+            semantic_ignored_statement = (
+                parsed_intent is not None
+                and parsed_intent.strategy == ProactiveTurnStrategy.SEMANTIC_AUTO
+                and parsed_followup is not None
+                and not parsed_followup.previous_proactive_expected_response
+            )
+            followup_block = (
+                None
+                if semantic_ignored_statement
+                else format_followup_instruction(parsed_followup)
+            )
+            if followup_block:
+                current_system_prompt = "\n\n".join(
+                    [current_system_prompt, followup_block]
+                )
+            # When the ignored-question follow-up block is present it already
+            # carries the turn's instructions; emit only compact intent lines.
+            intent_block = format_intent_instruction(
+                parsed_intent, include_guidance=followup_block is None
+            )
+            if intent_block:
+                current_system_prompt = "\n\n".join(
+                    [current_system_prompt, intent_block]
+                )
             try:
                 request_messages = await self._prepare_context_with_summary(
                     messages,
@@ -1445,6 +1487,28 @@ class BasicMemoryAgent(AgentInterface):
                     error,
                 )
                 return
+
+            # Ephemeral proactive turn cue: proactive generation is a
+            # system-initiated turn, so there is never a *current* user turn in
+            # the transcript (all of it is history). Some OpenAI-compatible
+            # providers complete with an empty stream when the request ends on
+            # an assistant message and no current user cue exists. Inject ONE
+            # request-only internal user turn so the provider produces the new
+            # assistant message. It lives only in this local request list: it
+            # never enters _memory, history, summary, memory parsing,
+            # relationship logic, or the UI.
+            request_messages = [
+                *request_messages,
+                {"role": "user", "content": PROACTIVE_TURN_CUE},
+            ]
+            logger.info(
+                "Proactive generation: proactive_turn_cue=True, "
+                "request_message_count_after={}",
+                len(request_messages),
+            )
+            tracker = get_latency_tracker()
+            if tracker:
+                tracker.message_count = len(request_messages)
 
             token_stream = self._llm.chat_completion(
                 request_messages,
@@ -1467,9 +1531,17 @@ class BasicMemoryAgent(AgentInterface):
 
     async def chat_proactively(
         self,
+        followup_context: Optional[
+            Union[Dict[str, Any], ProactiveFollowupContext]
+        ] = None,
+        intent_context: Optional[
+            Union[Dict[str, Any], ProactiveIntentContext]
+        ] = None,
     ) -> AsyncIterator[Union[SentenceOutput, Dict[str, Any]]]:
         """Generate one proactive assistant message without a fake user turn."""
-        proactive_chat = self._proactive_chat_function_factory()
+        proactive_chat = self._proactive_chat_function_factory(
+            followup_context, intent_context
+        )
         async for output in proactive_chat():
             yield output
 

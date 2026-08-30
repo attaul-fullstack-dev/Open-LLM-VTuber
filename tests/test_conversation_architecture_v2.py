@@ -557,5 +557,53 @@ class ConversationArchitectureV2Tests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Current state: dating", system_prompt)
 
 
+class BackendCompletionSignalDedupTests(unittest.TestCase):
+    """One assistant turn → ONE authoritative `backend-synth-complete`.
+
+    Live proof of the duplicate: the frontend received backend-synth-complete
+    TWICE per turn (once from the conversation module itself, once from
+    finalize_conversation_turn), so it released the contextual face twice and
+    re-sent frontend-playback-complete repeatedly. The single authoritative
+    emitter is now finalize_conversation_turn; single_conversation and
+    group_conversation only keep an explanatory comment. This source-contract
+    guard keeps the dedup from regressing.
+    """
+
+    ROOT = os.path.join(os.path.dirname(__file__), "..")
+
+    def _read(self, relative_path):
+        with open(
+            os.path.join(self.ROOT, relative_path), encoding="utf-8"
+        ) as f:
+            return f.read()
+
+    def test_single_conversation_no_longer_emits_completion(self):
+        source = self._read(
+            "src/open_llm_vtuber/conversations/single_conversation.py"
+        )
+        self.assertNotIn(
+            'json.dumps({"type": "backend-synth-complete"})', source
+        )
+
+    def test_group_conversation_no_longer_emits_completion(self):
+        source = self._read(
+            "src/open_llm_vtuber/conversations/group_conversation.py"
+        )
+        self.assertNotIn(
+            'json.dumps({"type": "backend-synth-complete"})', source
+        )
+
+    def test_finalize_is_the_only_emitter(self):
+        source = self._read(
+            "src/open_llm_vtuber/conversations/conversation_utils.py"
+        )
+        self.assertEqual(
+            source.count('json.dumps({"type": "backend-synth-complete"})'),
+            1,
+            "finalize_conversation_turn must be the ONLY backend-synth-complete "
+            "emitter",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

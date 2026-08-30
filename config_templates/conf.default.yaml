@@ -85,11 +85,14 @@ character_config:
         proactive_enabled: True
         initial_idle_min_seconds: 45
         initial_idle_max_seconds: 90
-        followup_idle_min_seconds: 90
-        followup_idle_max_seconds: 240
+        followup_idle_min_seconds: 25
+        followup_idle_max_seconds: 50
         ignored_before_backoff: 3
-        backoff_min_seconds: 180
-        backoff_max_seconds: 360
+        backoff_min_seconds: 45
+        backoff_max_seconds: 60
+        # semantic lets the same proactive LLM request choose direction;
+        # heuristic keeps the deterministic Heuristics v2 weighted selector.
+        proactive_intent_strategy: semantic
 
       letta_agent:
         host: 'localhost' # Host address

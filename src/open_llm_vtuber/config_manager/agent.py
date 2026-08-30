@@ -47,11 +47,17 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
     proactive_enabled: bool = Field(True, alias="proactive_enabled")
     initial_idle_min_seconds: int = Field(45, ge=0, alias="initial_idle_min_seconds")
     initial_idle_max_seconds: int = Field(90, ge=0, alias="initial_idle_max_seconds")
-    followup_idle_min_seconds: int = Field(90, ge=0, alias="followup_idle_min_seconds")
-    followup_idle_max_seconds: int = Field(240, ge=0, alias="followup_idle_max_seconds")
+    followup_idle_min_seconds: int = Field(25, ge=0, alias="followup_idle_min_seconds")
+    followup_idle_max_seconds: int = Field(50, ge=0, alias="followup_idle_max_seconds")
     ignored_before_backoff: int = Field(3, gt=0, alias="ignored_before_backoff")
-    backoff_min_seconds: int = Field(180, ge=0, alias="backoff_min_seconds")
-    backoff_max_seconds: int = Field(360, ge=0, alias="backoff_max_seconds")
+    backoff_min_seconds: int = Field(45, ge=0, alias="backoff_min_seconds")
+    backoff_max_seconds: int = Field(60, ge=0, alias="backoff_max_seconds")
+    proactive_intent_strategy: Literal["semantic", "heuristic"] = Field(
+        "semantic", alias="proactive_intent_strategy"
+    )
+    proactive_intent_weights: Optional[Dict[str, float]] = Field(
+        None, alias="proactive_intent_weights"
+    )
 
     DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
         "llm_provider": Description(
@@ -115,24 +121,32 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
             zh="首次主动聊天前的最长空闲时间（默认：90 秒）",
         ),
         "followup_idle_min_seconds": Description(
-            en="Minimum delay after an ignored proactive message (default: 90 seconds)",
-            zh="主动消息未回复后的最短间隔（默认：90 秒）",
+            en="Minimum delay after an ignored proactive message (default: 25 seconds)",
+            zh="主动消息未回复后的最短间隔（默认：25 秒）",
         ),
         "followup_idle_max_seconds": Description(
-            en="Maximum delay after an ignored proactive message (default: 240 seconds)",
-            zh="主动消息未回复后的最长间隔（默认：240 秒）",
+            en="Maximum delay after an ignored proactive message (default: 50 seconds)",
+            zh="主动消息未回复后的最长间隔（默认：50 秒）",
         ),
         "ignored_before_backoff": Description(
             en="Ignored proactive messages before applying backoff (default: 3)",
             zh="触发退避前连续未回复的主动消息数（默认：3）",
         ),
         "backoff_min_seconds": Description(
-            en="Minimum proactive backoff delay (default: 180 seconds)",
-            zh="主动聊天退避的最短时间（默认：180 秒）",
+            en="Minimum proactive backoff delay (default: 45 seconds)",
+            zh="主动聊天退避的最短时间（默认：45 秒）",
         ),
         "backoff_max_seconds": Description(
-            en="Maximum proactive backoff delay (default: 360 seconds)",
-            zh="主动聊天退避的最长时间（默认：360 秒）",
+            en="Maximum proactive backoff delay (default: 60 seconds)",
+            zh="主动聊天退避的最长时间（默认：60 秒）",
+        ),
+        "proactive_intent_strategy": Description(
+            en="Proactive direction selection: semantic (same generation request) or heuristic (v2 weighted selector)",
+            zh="主动对话方向选择：semantic（同一次生成请求）或 heuristic（v2 加权选择器）",
+        ),
+        "proactive_intent_weights": Description(
+            en="Optional per-intent weight overrides for proactive topic selection (react_to_silence, continue_previous_topic, start_new_topic, ask_user_something, bring_up_memory, casual_observation)",
+            zh="主动话题选择的意图权重覆盖（可选）",
         ),
     }
 
