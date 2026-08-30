@@ -190,9 +190,29 @@ Urutan yang TERVERIFIKASI ABIS di live test:
 
 **Catatan test quirk:** `context_window_override=2000` di `_make_agent` — teks follow-up sedikit lebih panjang bisa bikin test yang sekaligus kirim `followup_context` + `intent_context` lewat budget → "Proactive generation skipped because context does not fit" → output kosong. Jaga teks tetap ringkas.
 
+## 15. State wajah intensitas-tinggi: angry_strong + strong_blush
+
+**Tujuan:** dua state kontekstual high-intensity tambahan tanpa ngerusak state yang udah verified (neutral/sad_soft/angry_pout/small_smile/squint_smile). **Bukan** random idle.
+
+**Cara menambah label semantic baru (hati-hati):**
+- Label emotion yang valid = `emo_map.keys()` mao_pro/shizuku di `model_dict.json`. Biar parser (`extract_emotion_keys`) + prompt (`<insert_emomap_keys>`) kenal, label BARU harus ditambah ke emo_map DI KEDUA model (mao_pro & shizuku). Index = nomor preset exp_0X (exp_06 embarrassed, exp_08 angry: pakai index itu di emoMap, biar legacy extract juga wajar).
+- `embarrassed`: index 6. `anger_strong`: index 8.
+- Prompt guard: `[anger_strong]` HANYA utk kemarahan benar-benar kuat (fury/outburst), ordinary anger/tsundere/pout TETAP `[anger]`. `[embarrassed]` HANYA utk genuinely flustered/shy, bukan sekadar playful. Ini mencegah terulang bias overuse label (pelajaran #12).
+- Frontend `contextual-emotion.ts`: `embarrassed -> strong_blush`, `anger_strong -> angry_strong`. Generic `joy/smirk/anger` TIDAK di-upgrade ke state kuat.
+
+**Palette Stage 3:**
+- `angry_strong`: (weight 0 = tak pernah dipilih random idle). Stack semua cue anger ke extreme SAFE-nya TANPA MouthDown (biar gak jadi sedih). Beda dari angry_pout: brow angle/form -1.0 (lebih mengerut dari -0.9) + eyeOpen 0.78 (lebih sipit dari 0.85). Cheek 0 (pipi merah + alis marah kayak malu, bukan marah).
+- `strong_blush`: (weight 0). Ikuti resep shy rig (exp_06): Cheek 1.0 (max rig, jauh > small_smile 0.45 / squint 0.5), EyeSmile 0.35 (senyum malu kecil), brow naik 0.2, eyeOpen normal. MouthDown/Angry 0 (bukan sedih/marah).
+- Karena `weight:0` tanpa `longIdleWeight`, `pickWeighted` (yang hanya tambah bobot `w>0`) otomatis skip → tidak muncul di idle/long_idle. Tapi MAP `CONTEXTUAL_EMOTION_MAP` tetap di-validasi "semua face id harus ada di palette" — jadi state baru WAJIB ada di palette biar response face bisa di-claim.
+
+**Cara trigger live test:** minta Mili benaran marah keras (bukan kesal biasa) → model keluar `[anger_strong]`. Atau minta Mili nge-bangun terkejut/malu beneran → `[embarrassed]`. Cek mapping di jawaban.
+
+**Catatan testing quirk:** test `strong_blush` "release clears Cheek" perlu toleransi epsilon (`Math.abs(cheek) < 0.01`) karena interpolation meninggalkan residu floating ~1e-11, bukan 0 persis.
+
 ## Log perubahan catatan ini
 
 - `2026-08-30` — Inisialisasi: catat 11 pelajaran terkonfirmasi dari sesi Stage 3/4/5.
 - `2026-08-30` — Tambah #12: bias emosi `[smirk]` default & jalur turn-level latch (Case A terkonfirmasi; prompt-guard + diagnosa jujur).
 - `2026-08-30` — Tambah #13: capability-test neutral/sad/angry via `?capface=`, akar smile-baseline MouthUp=1.0, writer order terkonfirmasi.
 - `2026-08-30` — Tambah #14: proactive follow-up kena bias "complain silence" (2 sumber); soft-kan instruksi + guard anti-repetisi.
+- `2026-08-30` — Tambah #15: state intensitas-tinggi angry_strong + strong_blush (label emo_map baru embarrassed/anger_strong, weight 0, mapping contextual).
