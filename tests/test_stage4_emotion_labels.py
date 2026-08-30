@@ -58,6 +58,50 @@ class ExtractEmotionKeysTests(unittest.TestCase):
         self.assertEqual(self.model.extract_emotion_keys("[JOY]"), ["joy"])
 
 
+class ExtractHighIntensityEmotionKeysTests(unittest.TestCase):
+    """Stage 5 high-intensity labels: anger_strong + embarrassed."""
+
+    def setUp(self):
+        self.model = _model_with_map(
+            {
+                "neutral": 0,
+                "anger": 2,
+                "anger_strong": 8,
+                "embarrassed": 6,
+                "joy": 3,
+                "smirk": 3,
+            }
+        )
+
+    def test_extracts_anger_strong_label(self):
+        self.assertEqual(
+            self.model.extract_emotion_keys("Dasar! [anger_strong] tidak percaya."),
+            ["anger_strong"],
+        )
+
+    def test_extracts_embarrassed_label(self):
+        self.assertEqual(
+            self.model.extract_emotion_keys("Eh [embarrassed], kok diomongin gitu."),
+            ["embarrassed"],
+        )
+
+    def test_ordinary_anger_stays_separate_from_anger_strong(self):
+        self.assertEqual(self.model.extract_emotion_keys("[anger] jangan."), ["anger"])
+        self.assertEqual(
+            self.model.extract_emotion_keys("[anger_strong] jangan."),
+            ["anger_strong"],
+        )
+
+    def test_tags_are_stripped_from_text(self):
+        cleaned = self.model.remove_emotion_keywords("Eh [embarrassed] gimana sih.")
+        self.assertNotIn("[embarrassed]", cleaned)
+        self.assertNotIn("[anger_strong]", self.model.remove_emotion_keywords("Dasar [anger_strong]!"))
+
+    def test_legacy_index_of_high_intensity_labels(self):
+        self.assertEqual(self.model.extract_emotion("[embarrassed]"), [6])
+        self.assertEqual(self.model.extract_emotion("[anger_strong]"), [8])
+
+
 class ActionsEmotionsSerializationTests(unittest.TestCase):
     def test_emotions_field_round_trips(self):
         actions = Actions(expressions=[2], emotions=["anger"])
@@ -294,11 +338,28 @@ class EmotionPromptBiasContractTests(unittest.TestCase):
         self.assertIn("[sadness]", self.content)
         self.assertIn("[anger]", self.content)
         self.assertIn("genuinely sad", self.content)
-        self.assertIn("genuinely irritated", self.content)
+        self.assertIn("genuine irritation", self.content)
 
     def test_prompt_bases_choice_on_response_tone_not_user_words(self):
         self.assertIn("emotional tone", self.content)
         self.assertIn("not on the user's words", self.content)
+
+    def test_prompt_guards_high_intensity_labels(self):
+        # anger_strong reserved for genuinely strong anger; ordinary rage/tsundere
+        # must stay [anger]. embarrassed only for genuinely flustered/shy reactions.
+        self.assertIn("[anger_strong]", self.content)
+        self.assertIn("[embarrassed]", self.content)
+        self.assertIn("fury", self.content)
+        self.assertIn("angry outburst", self.content)
+        self.assertIn("flustered", self.content)
+        self.assertIn("merely because the conversation is playful", self.content)
+        self.assertNotIn("barely", self.content)  # placeholder no-op guard
+
+    def test_prompt_does_not_map_generic_labels_to_strong_states(self):
+        # smirk / joy / anger must not be described as if they become the strong
+        # states — that would recreate the smirk-overuse problem.
+        self.assertIn("stay [anger]", self.content)
+        self.assertIn("prefer no marker or [joy]", self.content)
 
 
 if __name__ == "__main__":
