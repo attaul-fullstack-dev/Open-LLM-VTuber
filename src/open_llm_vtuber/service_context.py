@@ -103,6 +103,13 @@ class ServiceContext:
         self.send_text: Callable = None
         self.client_uid: str = None
 
+        # Runtime per-session flag driven by the frontend Settings "Voice
+        # Output" toggle. Default ON. When False the backend must not synthesize
+        # TTS audio (e.g. ElevenLabs credits) and instead sends text-only
+        # display payloads; the frontend reuses its existing safe text-only
+        # response lifecycle.
+        self.voice_output_enabled: bool = True
+
     def __str__(self):
         return (
             f"ServiceContext:\n"

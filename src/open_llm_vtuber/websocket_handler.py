@@ -65,7 +65,11 @@ class MessageType(Enum):
     ]
     CONVERSATION = ["mic-audio-end", "text-input", "ai-speak-signal"]
     CONFIG = ["fetch-configs", "switch-config"]
-    CONTROL = ["interrupt-signal", "audio-play-start"]
+    CONTROL = [
+        "interrupt-signal",
+        "audio-play-start",
+        "voice-output-toggle",
+    ]
     DATA = ["mic-audio-data"]
 
 
@@ -508,6 +512,7 @@ class WebSocketHandler:
             "switch-config": self._handle_config_switch,
             "fetch-backgrounds": self._handle_fetch_backgrounds,
             "audio-play-start": self._handle_audio_play_start,
+            "voice-output-toggle": self._handle_voice_output_toggle,
             "request-init-config": self._handle_init_config_request,
             "heartbeat": self._handle_heartbeat,
         }
@@ -1171,6 +1176,23 @@ class WebSocketHandler:
         bg_files = scan_bg_directory()
         await websocket.send_text(
             json.dumps({"type": "background-files", "files": bg_files})
+        )
+
+    async def _handle_voice_output_toggle(
+        self, websocket: WebSocket, client_uid: str, data: WSMessage
+    ) -> None:
+        """Set the session Voice Output (TTS synthesis) enabled state.
+
+        When OFF the backend skips ElevenLabs/audio synthesis entirely and
+        sends text-only display payloads, so no credits are consumed.
+        """
+        context = self.client_contexts.get(client_uid)
+        enabled = bool(data.get("enabled", True))
+        if context is None:
+            return
+        context.voice_output_enabled = enabled
+        logger.info(
+            "Voice output toggle for client {} -> enabled={}", client_uid, enabled
         )
 
     async def _handle_audio_play_start(

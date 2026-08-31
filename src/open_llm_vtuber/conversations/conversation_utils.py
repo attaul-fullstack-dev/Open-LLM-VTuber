@@ -50,6 +50,7 @@ async def process_agent_output(
     websocket_send: WebSocketSend,
     tts_manager: TTSTaskManager,
     translate_engine: Optional[Any] = None,
+    synthesize_audio: bool = True,
 ) -> str:
     """Process agent output with character information and optional translation"""
     output.display_text.name = character_config.character_name
@@ -65,6 +66,7 @@ async def process_agent_output(
                 websocket_send,
                 tts_manager,
                 translate_engine,
+                synthesize_audio=synthesize_audio,
             )
         elif isinstance(output, AudioOutput):
             full_response = await handle_audio_output(output, websocket_send)
@@ -88,6 +90,7 @@ async def handle_sentence_output(
     websocket_send: WebSocketSend,
     tts_manager: TTSTaskManager,
     translate_engine: Optional[Any] = None,
+    synthesize_audio: bool = True,
 ) -> str:
     """Handle sentence output type with optional translation support"""
     full_response = ""
@@ -109,6 +112,7 @@ async def handle_sentence_output(
             live2d_model=live2d_model,
             tts_engine=tts_engine,
             websocket_send=websocket_send,
+            synthesize_audio=synthesize_audio,
         )
     return full_response
 

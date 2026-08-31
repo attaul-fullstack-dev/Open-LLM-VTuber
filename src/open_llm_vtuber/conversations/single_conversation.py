@@ -151,6 +151,9 @@ async def process_single_conversation(
                         websocket_send=websocket_send,  # Pass websocket_send for audio/tts messages
                         tts_manager=tts_manager,
                         translate_engine=context.translate_engine,
+                        synthesize_audio=getattr(
+                            context, "voice_output_enabled", True
+                        ),
                     )
                     latency.add_tts_enqueue(
                         (time.perf_counter() - tts_started) * 1000
