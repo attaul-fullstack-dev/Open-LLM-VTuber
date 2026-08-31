@@ -382,6 +382,9 @@ async def process_member_response(
                     websocket_send=current_ws_send,  # Send TTS/display text directly to speaker's client
                     tts_manager=tts_manager,
                     translate_engine=context.translate_engine,
+                    synthesize_audio=getattr(
+                        context, "voice_output_enabled", True
+                    ),
                 )
                 full_response += response_part  # Accumulate text response
             else:

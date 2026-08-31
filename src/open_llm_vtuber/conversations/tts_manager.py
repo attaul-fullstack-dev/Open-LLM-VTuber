@@ -39,6 +39,7 @@ class TTSTaskManager:
         live2d_model: Live2dModel,
         tts_engine: TTSInterface,
         websocket_send: WebSocketSend,
+        synthesize_audio: bool = True,
     ) -> None:
         """
         Queue a TTS task while maintaining order of delivery.
@@ -50,6 +51,10 @@ class TTSTaskManager:
             live2d_model: Live2D model instance
             tts_engine: TTS engine instance
             websocket_send: WebSocket send function
+            synthesize_audio: When False, skip audio synthesis entirely and
+                send a text-only display payload (no TTS API call). Reuses the
+                existing silent/text-only payload path so the frontend and the
+                turn lifecycle behave exactly like the muted case.
         """
         if len(re.sub(r'[\s.,!?，。！？\'"』」）】\s]+', "", tts_text)) == 0:
             logger.debug("Empty TTS text, sending silent display payload")
@@ -91,6 +96,7 @@ class TTSTaskManager:
                 live2d_model=live2d_model,
                 tts_engine=tts_engine,
                 sequence_number=current_sequence,
+                synthesize_audio=synthesize_audio,
             )
         )
         self.task_list.append(task)
@@ -146,6 +152,7 @@ class TTSTaskManager:
         live2d_model: Live2dModel,
         tts_engine: TTSInterface,
         sequence_number: int,
+        synthesize_audio: bool = True,
     ) -> None:
         """Process TTS generation and queue the result for ordered delivery"""
         from ..request_latency import get_latency_tracker
@@ -154,11 +161,15 @@ class TTSTaskManager:
         audio_file_path = None
         synthesis_started = time.perf_counter()
         try:
-            audio_file_path = await self._generate_audio(tts_engine, tts_text)
-            if tracker:
-                tracker.add_tts_synthesis(
-                    (time.perf_counter() - synthesis_started) * 1000
-                )
+            if synthesize_audio:
+                audio_file_path = await self._generate_audio(tts_engine, tts_text)
+                if tracker:
+                    tracker.add_tts_synthesis(
+                        (time.perf_counter() - synthesis_started) * 1000
+                    )
+            # When synthesis is disabled we intentionally pass audio_path=None;
+            # prepare_audio_payload emits a silent display payload carrying only
+            # display_text + actions, preserving order and the turn lifecycle.
             payload = prepare_audio_payload(
                 audio_path=audio_file_path,
                 display_text=display_text,
