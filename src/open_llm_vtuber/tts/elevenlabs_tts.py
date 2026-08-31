@@ -18,13 +18,13 @@ class TTSEngine(TTSInterface):
         self,
         api_key: str,
         voice_id: str,
-        model_id: str = "eleven_multilingual_v2",
+        model_id: str = "eleven_v3_conversational",
         output_format: str = "mp3_44100_128",
         stability: float = 0.5,
         similarity_boost: float = 0.5,
         style: float = 0.0,
         use_speaker_boost: bool = True,
-        speed: float = 1.0,
+        speed: float = 0.80,
     ):
         """
         Initializes the ElevenLabs TTS engine.

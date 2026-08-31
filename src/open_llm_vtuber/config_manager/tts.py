@@ -590,13 +590,13 @@ class ElevenLabsTTSConfig(I18nMixin):
 
     api_key: str = Field(..., alias="api_key")
     voice_id: str = Field(..., alias="voice_id")
-    model_id: str = Field("eleven_multilingual_v2", alias="model_id")
+    model_id: str = Field("eleven_v3_conversational", alias="model_id")
     output_format: str = Field("mp3_44100_128", alias="output_format")
     stability: float = Field(0.5, alias="stability")
     similarity_boost: float = Field(0.5, alias="similarity_boost")
     style: float = Field(0.0, alias="style")
     use_speaker_boost: bool = Field(True, alias="use_speaker_boost")
-    speed: float = Field(1.0, ge=0.7, le=1.2, alias="speed")
+    speed: float = Field(0.80, ge=0.7, le=1.2, alias="speed")
 
     DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
         "api_key": Description(
