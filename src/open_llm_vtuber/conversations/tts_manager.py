@@ -13,6 +13,9 @@ from ..tts.tts_interface import TTSInterface
 from ..utils.stream_audio import prepare_audio_payload
 from .types import WebSocketSend
 
+# Serialize ElevenLabs synthesis to avoid API concurrency-limit errors.
+_ELEVENLABS_TTS_SEMAPHORE = asyncio.Semaphore(1)
+
 
 class TTSTaskManager:
     """Manages TTS tasks and ensures ordered delivery to frontend while allowing parallel TTS generation"""
@@ -183,13 +186,26 @@ class TTSTaskManager:
                 tts_engine.remove_file(audio_file_path)
                 logger.debug("Audio cache file cleaned.")
 
-    async def _generate_audio(self, tts_engine: TTSInterface, text: str) -> str:
-        """Generate audio file from text"""
+    async def _generate_audio(
+        self,
+        tts_engine: TTSInterface,
+        text: str,
+    ) -> str:
+        """Generate audio file from text."""
         logger.debug("Generating TTS audio (characters={})", len(text))
-        return await tts_engine.async_generate_audio(
-            text=text,
-            file_name_no_ext=f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{str(uuid.uuid4())[:8]}",
-        )
+
+        async def generate() -> str:
+            return await tts_engine.async_generate_audio(
+                text=text,
+                file_name_no_ext=f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{str(uuid.uuid4())[:8]}",
+            )
+
+        if tts_engine.__class__.__module__.endswith(".elevenlabs_tts"):
+            async with _ELEVENLABS_TTS_SEMAPHORE:
+                logger.debug("ElevenLabs TTS concurrency slot acquired")
+                return await generate()
+
+        return await generate()
 
     def clear(self) -> None:
         """Clear all pending tasks and reset state"""
