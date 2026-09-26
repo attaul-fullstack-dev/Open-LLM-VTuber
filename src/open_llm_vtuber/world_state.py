@@ -1,0 +1,556 @@
+"""Stage 7 — Simulated Life: character-scoped World/Life State.
+
+This module is the SINGLE WRITER for the World/Life State fields::
+
+    location, activity, energy, mood, time_context,
+    activity_started_at, last_update_at, recent_activity_history
+
+All other subsystems (conversation, proactive, emotion/avatar, TTS, voice)
+get READ-ONLY snapshots via :func:`load_and_reconcile_world_state` or
+:func:`build_world_state_context`. Nothing else may mutate these fields.
+
+Design rules (see Phase 2 scope):
+
+* Pure deterministic core: :func:`reconcile` / :func:`transition` contain
+  NO file I/O, NO websocket logic, NO LLM/provider calls, NO scheduler,
+  NO frontend logic. Persistence and orchestration live outside the core.
+* Lazy reconciliation only: state is reconciled when existing lifecycle
+  events already occur (conversation trigger, proactive check, reconnect /
+  history switch, character load / server restart). There is deliberately
+  NO background loop, NO setInterval, NO second scheduler.
+* Fail-soft: corrupt files yield a safe default; save failures return
+  ``False`` and never raise into the conversation path.
+* Mood isolation: ``mood`` is slow persistent life state. It MUST NOT write
+  ``Actions.expressions`` / ``Actions.emotions`` and never bypasses
+  ``agent/transformers.py``. Semantic Emotion stays authoritative for
+  per-response avatar expression.
+* Clock injection: every public function accepts ``now`` so tests can use a
+  fake clock (+5m / +2h / +9h / +2d) without waiting. Default is real
+  server-side wall-clock time (UTC, matching ``character_state``).
+
+Initial transition model (intentionally small, documented here):
+
+* ``time_context`` derives from wall-clock hour (server-side convention):
+  night 22-05, morning 05-11, afternoon 11-17, evening 17-22.
+* Energy rates per hour (deterministic, bounded 0-100):
+  sleeping +15, resting +8, eating +5, idle -1, reading -2, playing -6.
+* Activity durations (time since ``activity_started_at``):
+  sleeping >= 8h -> idle; eating >= 45m -> idle; playing >= 2h -> idle;
+  reading >= 3h -> idle; resting >= 2h -> idle.
+  Early exits: sleeping with energy >= 100 and age >= 90m -> idle;
+  resting with energy >= 95 and age >= 30m -> idle.
+  Low-energy: idle at night (22-05) with energy <= 30 -> sleeping;
+  idle with energy <= 10 -> resting; playing with energy <= 5 -> resting.
+* Location consistency (enforced on every reconcile, no history entry
+  unless the activity itself changed):
+  sleeping/resting/reading -> room; eating -> kitchen;
+  playing -> outside by day (06-18) else room; idle keeps its location.
+* Mood derivation (slow state, recomputed on every reconcile):
+  sleeping -> sleepy; energy >= 70 -> content; 30-70 -> calm;
+  10-30 -> tired; below 10 -> exhausted.
+* ``recent_activity_history`` records WORLD ACTIVITY TRANSITIONS only
+  (never chat messages), capped at 10 entries.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import threading
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
+from loguru import logger
+
+from .chat_history_manager import _sanitize_path_component
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+WORLD_STATE_VERSION = 1
+WORLD_STATE_DIR = "world_state"
+
+VALID_LOCATIONS = ("room", "kitchen", "outside")
+VALID_ACTIVITIES = ("idle", "resting", "reading", "eating", "playing", "sleeping")
+VALID_MOODS = ("calm", "content", "tired", "sleepy", "exhausted")
+
+DEFAULT_LOCATION = "room"
+DEFAULT_ACTIVITY = "idle"
+DEFAULT_ENERGY = 80
+DEFAULT_MOOD = "calm"
+
+MIN_ENERGY = 0
+MAX_ENERGY = 100
+
+HISTORY_CAP = 10
+
+# Energy delta per elapsed hour, by activity. Positive recovers, negative
+# spends. Deliberately simple linear rates; no physiology simulation.
+ENERGY_RATE_PER_HOUR: Dict[str, float] = {
+    "sleeping": 15.0,
+    "resting": 8.0,
+    "eating": 5.0,
+    "idle": -1.0,
+    "reading": -2.0,
+    "playing": -6.0,
+}
+
+# Activity age thresholds (seconds) after which an activity ends -> idle.
+ACTIVITY_DURATION_LIMIT_S: Dict[str, float] = {
+    "sleeping": 8 * 3600,
+    "eating": 45 * 60,
+    "playing": 2 * 3600,
+    "reading": 3 * 3600,
+    "resting": 2 * 3600,
+}
+
+NIGHT_START_HOUR = 22
+NIGHT_END_HOUR = 5
+DAY_OUTSIDE_START_HOUR = 6
+DAY_OUTSIDE_END_HOUR = 18
+
+_state_locks: Dict[str, threading.RLock] = {}
+_state_locks_guard = threading.Lock()
+
+
+def _get_state_lock(filepath: str) -> threading.RLock:
+    with _state_locks_guard:
+        return _state_locks.setdefault(filepath, threading.RLock())
+
+
+def _write_state_atomic(filepath: str, data: Dict[str, Any]) -> None:
+    temporary_path = f"{filepath}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(temporary_path, "w", encoding="utf-8") as file:
+            json.dump(data, file, ensure_ascii=False, indent=2)
+        os.replace(temporary_path, filepath)
+    finally:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
+
+
+# ---------------------------------------------------------------------------
+# Clock + parsing helpers (pure)
+# ---------------------------------------------------------------------------
+
+
+def utcnow() -> datetime:
+    """Default real wall-clock (server-side UTC convention)."""
+    return datetime.now(timezone.utc)
+
+
+def _ensure_aware(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def _parse_iso(value: Any, fallback: datetime) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return fallback
+    return _ensure_aware(parsed)
+
+
+def _to_iso(value: datetime) -> str:
+    return _ensure_aware(value).isoformat(timespec="seconds")
+
+
+# ---------------------------------------------------------------------------
+# State shape
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class WorldState:
+    """Character-scoped simulated-life state (single-writer: this module)."""
+
+    location: str = DEFAULT_LOCATION
+    activity: str = DEFAULT_ACTIVITY
+    energy: int = DEFAULT_ENERGY
+    mood: str = DEFAULT_MOOD
+    time_context: str = "evening"
+    activity_started_at: Optional[str] = None
+    last_update_at: Optional[str] = None
+    recent_activity_history: List[Dict[str, Any]] = field(default_factory=list)
+
+
+def normalize_location(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    return text if text in VALID_LOCATIONS else DEFAULT_LOCATION
+
+
+def normalize_activity(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    return text if text in VALID_ACTIVITIES else DEFAULT_ACTIVITY
+
+
+def normalize_mood(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    return text if text in VALID_MOODS else DEFAULT_MOOD
+
+
+def clamp_energy(value: Any) -> int:
+    try:
+        number = int(round(float(value)))
+    except (TypeError, ValueError):
+        return DEFAULT_ENERGY
+    return max(MIN_ENERGY, min(MAX_ENERGY, number))
+
+
+# ---------------------------------------------------------------------------
+# Pure deterministic core (no I/O)
+# ---------------------------------------------------------------------------
+
+
+def derive_time_context(moment: datetime) -> str:
+    """Map wall-clock hour to a coarse time context (pure)."""
+    hour = _ensure_aware(moment).hour
+    if hour >= NIGHT_START_HOUR or hour < NIGHT_END_HOUR:
+        return "night"
+    if hour < 11:
+        return "morning"
+    if hour < 17:
+        return "afternoon"
+    return "evening"
+
+
+def derive_mood(activity: str, energy: int) -> str:
+    """Derive slow life-state mood from activity + energy (pure)."""
+    if activity == "sleeping":
+        return "sleepy"
+    if energy >= 70:
+        return "content"
+    if energy >= 30:
+        return "calm"
+    if energy >= 10:
+        return "tired"
+    return "exhausted"
+
+
+def location_for(activity: str, moment: datetime, current_location: str) -> str:
+    """Enforce activity/location consistency (pure).
+
+    ``idle`` keeps its location; every other activity has a home so the
+    world cannot drift into impossible states (e.g. sleeping outside).
+    """
+    if activity in ("sleeping", "resting", "reading"):
+        return "room"
+    if activity == "eating":
+        return "kitchen"
+    if activity == "playing":
+        hour = _ensure_aware(moment).hour
+        if DAY_OUTSIDE_START_HOUR <= hour < DAY_OUTSIDE_END_HOUR:
+            return "outside"
+        return "room"
+    return normalize_location(current_location)
+
+
+def default_state(now: Optional[datetime] = None) -> WorldState:
+    """Build the initial world state for a character (pure)."""
+    moment = _ensure_aware(now) if now is not None else utcnow()
+    stamp = _to_iso(moment)
+    return WorldState(
+        location=DEFAULT_LOCATION,
+        activity=DEFAULT_ACTIVITY,
+        energy=DEFAULT_ENERGY,
+        mood=derive_mood(DEFAULT_ACTIVITY, DEFAULT_ENERGY),
+        time_context=derive_time_context(moment),
+        activity_started_at=stamp,
+        last_update_at=stamp,
+        recent_activity_history=[],
+    )
+
+
+def _is_night(moment: datetime) -> bool:
+    hour = _ensure_aware(moment).hour
+    return hour >= NIGHT_START_HOUR or hour < NIGHT_END_HOUR
+
+
+def transition(
+    state: WorldState, elapsed_s: float, now: datetime
+) -> Tuple[WorldState, bool]:
+    """Apply one deterministic transition step (pure, no I/O).
+
+    Returns ``(new_state, activity_changed)``. Energy, mood, location and
+    timestamps are updated in place on a copy; history is appended only
+    when the activity itself changes.
+    """
+    moment = _ensure_aware(now)
+    elapsed = max(0.0, float(elapsed_s or 0.0))
+
+    current = WorldState(
+        location=normalize_location(state.location),
+        activity=normalize_activity(state.activity),
+        energy=clamp_energy(state.energy),
+        mood=normalize_mood(state.mood),
+        time_context=state.time_context,
+        activity_started_at=state.activity_started_at,
+        last_update_at=state.last_update_at,
+        recent_activity_history=[
+            dict(item) for item in (state.recent_activity_history or [])
+        ],
+    )
+
+    # Energy drifts linearly with elapsed time at the activity rate.
+    rate = ENERGY_RATE_PER_HOUR[current.activity]
+    new_energy = clamp_energy(current.energy + (elapsed / 3600.0) * rate)
+
+    activity_age_s = max(
+        0.0,
+        (moment - _parse_iso(current.activity_started_at, moment)).total_seconds(),
+    )
+
+    new_activity = current.activity
+    limit = ACTIVITY_DURATION_LIMIT_S.get(current.activity)
+    if limit is not None and activity_age_s >= limit:
+        new_activity = "idle"
+    elif current.activity == "sleeping" and (
+        new_energy >= MAX_ENERGY and activity_age_s >= 90 * 60
+    ):
+        new_activity = "idle"
+    elif current.activity == "resting" and (
+        new_energy >= 95 and activity_age_s >= 30 * 60
+    ):
+        new_activity = "idle"
+    elif current.activity == "idle":
+        if _is_night(moment) and new_energy <= 30:
+            new_activity = "sleeping"
+        elif new_energy <= 10:
+            new_activity = "resting"
+    elif current.activity == "playing" and new_energy <= 5:
+        new_activity = "resting"
+
+    new_location = location_for(new_activity, moment, current.location)
+    new_mood = derive_mood(new_activity, new_energy)
+    new_time_context = derive_time_context(moment)
+
+    activity_changed = new_activity != current.activity
+    if activity_changed:
+        record = {
+            "from": current.activity,
+            "to": new_activity,
+            "at": _to_iso(moment),
+            "location": new_location,
+        }
+        history = [*current.recent_activity_history, record][-HISTORY_CAP:]
+    else:
+        history = current.recent_activity_history[-HISTORY_CAP:]
+
+    updated = WorldState(
+        location=new_location,
+        activity=new_activity,
+        energy=new_energy,
+        mood=new_mood,
+        time_context=new_time_context,
+        activity_started_at=(
+            _to_iso(moment) if activity_changed else current.activity_started_at
+        ),
+        last_update_at=current.last_update_at,
+        recent_activity_history=history,
+    )
+    return updated, activity_changed
+
+
+def reconcile(
+    state: WorldState, now: Optional[datetime] = None
+) -> Tuple[WorldState, bool]:
+    """Lazily reconcile state against wall-clock time (pure, no I/O).
+
+    Computes ``elapsed = now - last_update_at`` and runs one bounded
+    deterministic transition. Never replays every missed minute/hour:
+    long offline gaps collapse into a single step (e.g. sleeping through
+    a 2-day gap wakes to idle with full energy, not 48 hourly ticks).
+
+    Returns ``(new_state, changed)`` where ``changed`` covers any field
+    difference, including timestamp / time_context / energy-only updates.
+    A second call with the same ``now`` is always a no-op.
+    """
+    moment = _ensure_aware(now) if now is not None else utcnow()
+    baseline = WorldState(
+        location=normalize_location(state.location),
+        activity=normalize_activity(state.activity),
+        energy=clamp_energy(state.energy),
+        mood=normalize_mood(state.mood),
+        time_context=state.time_context,
+        activity_started_at=state.activity_started_at,
+        last_update_at=state.last_update_at,
+        recent_activity_history=[
+            dict(item) for item in (state.recent_activity_history or [])
+        ],
+    )
+    last = _parse_iso(baseline.last_update_at, moment)
+    if moment < last:
+        # Clock skew / backwards fake clock: fail-soft, never move backwards.
+        return baseline, False
+
+    elapsed = (moment - last).total_seconds()
+    updated, _ = transition(baseline, elapsed, moment)
+
+    changed = (
+        updated.location != baseline.location
+        or updated.activity != baseline.activity
+        or updated.energy != baseline.energy
+        or updated.mood != baseline.mood
+        or updated.time_context != baseline.time_context
+        or updated.activity_started_at != baseline.activity_started_at
+        or updated.recent_activity_history != baseline.recent_activity_history
+    )
+    if not changed and baseline.last_update_at == _to_iso(moment):
+        return baseline, False
+    if not changed:
+        # Timestamps still advance so the next call with the same ``now``
+        # is a strict no-op (idempotent reconcile).
+        baseline.last_update_at = _to_iso(moment)
+        return baseline, True
+    updated.last_update_at = _to_iso(moment)
+    return updated, True
+
+
+def build_world_state_context(state: WorldState) -> str:
+    """Render the VERY COMPACT world line injected into the system prompt."""
+    return (
+        "[Mili World State]\n"
+        f"location={normalize_location(state.location)}; "
+        f"activity={normalize_activity(state.activity)}; "
+        f"energy={clamp_energy(state.energy)}; "
+        f"mood={normalize_mood(state.mood)}; "
+        f"time_context={state.time_context or derive_time_context(utcnow())}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Persistence (sibling store mirroring character_state.py patterns)
+# ---------------------------------------------------------------------------
+
+
+def get_world_state_path(conf_uid: str, base_dir: str = WORLD_STATE_DIR) -> str:
+    """Return the on-disk path for a character world-state file."""
+    if not conf_uid:
+        raise ValueError("conf_uid cannot be empty")
+    safe_conf_uid = _sanitize_path_component(conf_uid)
+    return os.path.join(base_dir, f"{safe_conf_uid}.json")
+
+
+def _state_to_dict(state: WorldState) -> Dict[str, Any]:
+    return {
+        "version": WORLD_STATE_VERSION,
+        "location": normalize_location(state.location),
+        "activity": normalize_activity(state.activity),
+        "energy": clamp_energy(state.energy),
+        "mood": normalize_mood(state.mood),
+        "time_context": state.time_context,
+        "activity_started_at": state.activity_started_at,
+        "last_update_at": state.last_update_at,
+        "recent_activity_history": list(state.recent_activity_history or [])[
+            -HISTORY_CAP:
+        ],
+    }
+
+
+def _state_from_dict(data: Any, now: datetime) -> WorldState:
+    fallback = default_state(now)
+    if not isinstance(data, dict):
+        return fallback
+    history: List[Dict[str, Any]] = []
+    raw_history = data.get("recent_activity_history", [])
+    if isinstance(raw_history, list):
+        for item in raw_history[-HISTORY_CAP:]:
+            if not isinstance(item, dict):
+                continue
+            history.append(
+                {
+                    "from": normalize_activity(item.get("from")),
+                    "to": normalize_activity(item.get("to")),
+                    "at": str(item.get("at", "")),
+                    "location": normalize_location(
+                        item.get("location", DEFAULT_LOCATION)
+                    ),
+                }
+            )
+    return WorldState(
+        location=normalize_location(data.get("location", fallback.location)),
+        activity=normalize_activity(data.get("activity", fallback.activity)),
+        energy=clamp_energy(data.get("energy", fallback.energy)),
+        mood=normalize_mood(data.get("mood", fallback.mood)),
+        time_context=str(
+            data.get("time_context", fallback.time_context) or fallback.time_context
+        ),
+        activity_started_at=data.get("activity_started_at")
+        or fallback.activity_started_at,
+        last_update_at=data.get("last_update_at") or fallback.last_update_at,
+        recent_activity_history=history,
+    )
+
+
+def load_world_state(
+    conf_uid: str,
+    now: Optional[datetime] = None,
+    base_dir: str = WORLD_STATE_DIR,
+) -> WorldState:
+    """Load world state without reconciling; missing/corrupt -> safe default."""
+    moment = _ensure_aware(now) if now is not None else utcnow()
+    filepath = get_world_state_path(conf_uid, base_dir)
+    if not os.path.exists(filepath):
+        return default_state(moment)
+    try:
+        with open(filepath, "r", encoding="utf-8") as file:
+            data = json.load(file)
+        return _state_from_dict(data, moment)
+    except Exception as error:
+        logger.error("Failed to load world state: error_type={}", type(error).__name__)
+        return default_state(moment)
+
+
+def save_world_state(
+    conf_uid: str,
+    state: WorldState,
+    base_dir: str = WORLD_STATE_DIR,
+) -> bool:
+    """Atomically persist world state; returns success (fail-soft)."""
+    filepath = get_world_state_path(conf_uid, base_dir)
+    try:
+        os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
+        lock = _get_state_lock(os.path.abspath(filepath))
+        with lock:
+            _write_state_atomic(filepath, _state_to_dict(state))
+        return True
+    except Exception as error:
+        logger.error("Failed to save world state: error_type={}", type(error).__name__)
+        return False
+
+
+def load_and_reconcile_world_state(
+    conf_uid: str,
+    now: Optional[datetime] = None,
+    base_dir: str = WORLD_STATE_DIR,
+) -> WorldState:
+    """Load, lazily reconcile against ``now``, persist only if changed.
+
+    This is the single entry point for conversation triggers, proactive
+    checks, reconnect/history-switch and character load paths. It never
+    raises: on any failure the caller gets a usable in-memory state and
+    the conversation path continues unchanged.
+    """
+    try:
+        moment = _ensure_aware(now) if now is not None else utcnow()
+        filepath = get_world_state_path(conf_uid, base_dir)
+        existed = os.path.exists(filepath)
+        state = load_world_state(conf_uid, moment, base_dir)
+        reconciled, changed = reconcile(state, moment)
+        if changed or not existed:
+            save_world_state(conf_uid, reconciled, base_dir)
+        return reconciled
+    except Exception as error:
+        logger.error(
+            "World state reconcile skipped: error_type={}", type(error).__name__
+        )
+        try:
+            moment = _ensure_aware(now) if now is not None else utcnow()
+            return default_state(moment)
+        except Exception:
+            return WorldState()

@@ -71,6 +71,10 @@ from ..relationship_context import (
     detect_relationship_update,
     normalize_relationship_status,
 )
+from ...world_state import (
+    build_world_state_context,
+    load_and_reconcile_world_state,
+)
 import time
 from ...request_latency import (
     get_latency_tracker,
@@ -309,6 +313,13 @@ class BasicMemoryAgent(AgentInterface):
             updated_at=state.relationship_updated_at,
             reason=state.relationship_reason,
         )
+        # Stage 7: initialize (or lazily reconcile, e.g. after an offline
+        # gap / server restart) the character-scoped World/Life State.
+        # Fail-soft by design: world problems must never break history load.
+        try:
+            load_and_reconcile_world_state(conf_uid)
+        except Exception as error:
+            logger.warning("World state init skipped: type={}", type(error).__name__)
         logger.info(
             "Character state stats: relationship_status={}, "
             "character_memory_count={}, relationship_update_trigger=load_history",
@@ -329,6 +340,19 @@ class BasicMemoryAgent(AgentInterface):
         memory_context = build_character_memory_context(self._character_state)
         if memory_context:
             parts.append(memory_context)
+        # Stage 7: VERY COMPACT read-only World/Life snapshot. Reconciled
+        # lazily on every turn (conversation + proactive share this path),
+        # persisted only when something actually changed. Fail-soft: the
+        # prompt simply omits the line when no character is loaded or the
+        # store is unavailable. Never touches Emotion/transformers output.
+        if self._character_conf_uid:
+            try:
+                snapshot = load_and_reconcile_world_state(self._character_conf_uid)
+                parts.append(build_world_state_context(snapshot))
+            except Exception as error:
+                logger.warning(
+                    "World state context skipped: type={}", type(error).__name__
+                )
         return "\n\n".join(parts)
 
     def set_relationship_status(

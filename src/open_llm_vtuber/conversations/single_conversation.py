@@ -19,6 +19,7 @@ from .types import WebSocketSend
 from .tts_manager import TTSTaskManager
 from ..chat_history_manager import store_message
 from ..service_context import ServiceContext
+from ..world_state import load_and_reconcile_world_state
 from ..request_latency import (
     RequestLatencyTracker,
     reset_latency_tracker,
@@ -72,6 +73,17 @@ async def process_single_conversation(
 
     try:
         await latency.emit("backend-received")
+        # Stage 7: lazy World/Life reconcile on the conversation trigger
+        # (covers normal + proactive turns, reconnect, restart offline gap).
+        # Idempotent and fail-soft: a world failure never breaks the turn.
+        try:
+            conf_uid = getattr(context.character_config, "conf_uid", None)
+            if conf_uid:
+                load_and_reconcile_world_state(conf_uid)
+        except Exception as error:
+            logger.warning(
+                "World state reconcile skipped: type={}", type(error).__name__
+            )
         # Send initial signals
         await send_conversation_start_signals(websocket_send)
         latency.mark("websocket_first_output")
