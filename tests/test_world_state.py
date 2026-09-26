@@ -7,6 +7,7 @@ restart, emotion isolation, zero-LLM-calls, and no-scheduler guarantees.
 """
 
 import asyncio
+import json
 import os
 import tempfile
 import unittest
@@ -534,6 +535,102 @@ class PromptFormatTests(unittest.TestCase):
             self.assertIn(key, line)
         # Compact: header + exactly one state line.
         self.assertEqual(len(line.strip().splitlines()), 2)
+
+
+class UserTimezoneTests(unittest.TestCase):
+    """Phase 2: user-local hour drives time rules; storage stays UTC."""
+
+    TZ = "Asia/Jakarta"  # UTC+7, no DST
+
+    def utc(self, hour, minute=0):
+        return datetime(2026, 9, 26, hour, minute, tzinfo=timezone.utc)
+
+    def test_utc7_boundaries(self):
+        # local = UTC + 7
+        cases = [
+            (22, 0, "morning"),  # 05:00 local
+            (4, 0, "afternoon"),  # 11:00 local
+            (10, 0, "evening"),  # 17:00 local
+            (15, 0, "night"),  # 22:00 local
+        ]
+        for utc_hour, minute, expected in cases:
+            with self.subTest(utc_hour=utc_hour):
+                self.assertEqual(
+                    derive_time_context(self.utc(utc_hour, minute), self.TZ),
+                    expected,
+                )
+
+    def test_utc7_edges(self):
+        edges = [
+            ((21, 59), "night"),  # 04:59 local
+            ((22, 0), "morning"),  # 05:00 local
+            ((3, 59), "morning"),  # 10:59 local
+            ((4, 0), "afternoon"),  # 11:00 local
+            ((9, 59), "afternoon"),  # 16:59 local
+            ((10, 0), "evening"),  # 17:00 local
+            ((14, 59), "evening"),  # 21:59 local
+            ((15, 0), "night"),  # 22:00 local
+        ]
+        for (hour, minute), expected in edges:
+            with self.subTest(utc=f"{hour}:{minute:02d}"):
+                self.assertEqual(
+                    derive_time_context(self.utc(hour, minute), self.TZ),
+                    expected,
+                )
+
+    def test_observed_case_2240_wib_is_night(self):
+        # 22:40 WIB == 15:40 UTC must read night, not afternoon.
+        moment = datetime(2026, 9, 26, 15, 40, tzinfo=timezone.utc)
+        self.assertEqual(derive_time_context(moment, self.TZ), "night")
+        self.assertEqual(derive_time_context(moment, None), "afternoon")
+
+    def test_other_timezone_not_hardcoded(self):
+        # America/New_York is UTC-4 in September: 15:40 UTC -> 11:40 local.
+        moment = datetime(2026, 9, 26, 15, 40, tzinfo=timezone.utc)
+        self.assertEqual(derive_time_context(moment, "America/New_York"), "afternoon")
+        # 02:00 UTC -> 22:00 local previous day -> night.
+        early = datetime(2026, 9, 26, 2, 0, tzinfo=timezone.utc)
+        self.assertEqual(derive_time_context(early, "America/New_York"), "night")
+        self.assertEqual(derive_time_context(early, None), "night")
+
+    def test_invalid_timezone_falls_back_to_utc(self):
+        moment = datetime(2026, 9, 26, 15, 40, tzinfo=timezone.utc)
+        self.assertEqual(derive_time_context(moment, "Not/AZone"), "afternoon")
+        self.assertEqual(derive_time_context(moment, ""), "afternoon")
+
+    def test_reconcile_uses_local_hour_for_night_rule(self):
+        # 15:40 UTC idle low energy: UTC says afternoon (stay idle),
+        # Jakarta says 22:40 night -> sleeping.
+        base = datetime(2026, 9, 26, 15, 30, tzinfo=timezone.utc)
+        now = datetime(2026, 9, 26, 15, 40, tzinfo=timezone.utc)
+        idle = WorldState(
+            location="room",
+            activity="idle",
+            energy=20,
+            mood="tired",
+            time_context="afternoon",
+            activity_started_at=base.isoformat(),
+            last_update_at=base.isoformat(),
+            recent_activity_history=[],
+        )
+        as_utc, _ = reconcile(idle, now, None)
+        self.assertEqual(as_utc.activity, "idle")
+        as_local, changed = reconcile(idle, now, self.TZ)
+        self.assertTrue(changed)
+        self.assertEqual(as_local.activity, "sleeping")
+        self.assertEqual(as_local.time_context, "night")
+
+    def test_persisted_timestamps_stay_utc(self):
+        import tempfile
+
+        base_dir = tempfile.mkdtemp()
+        now = datetime(2026, 9, 26, 15, 40, tzinfo=timezone.utc)
+        state = load_and_reconcile_world_state("tz-char", now, base_dir, self.TZ)
+        self.assertEqual(state.time_context, "night")
+        with open(os.path.join(base_dir, "tz-char.json")) as f:
+            raw = json.load(f)
+        for key in ("activity_started_at", "last_update_at"):
+            self.assertTrue(raw[key].endswith("+00:00"), raw[key])
 
 
 if __name__ == "__main__":

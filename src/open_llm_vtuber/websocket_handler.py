@@ -28,6 +28,7 @@ from .conversations.conversation_handler import (
     handle_group_interrupt,
     handle_individual_interrupt,
 )
+from .world_state import load_and_reconcile_world_state
 from .conversations.single_conversation import process_single_conversation
 from .conversations.conversation_utils import EMOJI_LIST
 from .proactive_chat import (
@@ -84,6 +85,8 @@ class WSMessage(TypedDict, total=False):
     history_uid: Optional[str]
     file: Optional[str]
     display_text: Optional[dict]
+    timezone: Optional[str]
+    enabled: Optional[bool]
 
 
 def create_locked_send_text(websocket: WebSocket):
@@ -126,6 +129,23 @@ class WebSocketHandler:
 
         # Message handlers mapping
         self._message_handlers = self._init_message_handlers()
+
+    @staticmethod
+    def _update_user_timezone(context: ServiceContext, data: dict) -> None:
+        """Remember the session IANA timezone reported by the frontend.
+
+        Used for user-local World State time rules. Missing/invalid values
+        keep the previous session value (or UTC fallback when never set).
+        """
+        try:
+            tz = data.get("timezone") if isinstance(data, dict) else None
+        except Exception:
+            tz = None
+        if isinstance(tz, str) and tz.strip():
+            context.user_timezone = tz.strip()[:64]
+            agent = getattr(context, "agent_engine", None)
+            if agent is not None and hasattr(agent, "_user_timezone"):
+                agent._user_timezone = context.user_timezone
 
     @staticmethod
     def _proactive_config(context: ServiceContext) -> ProactiveChatConfig:
@@ -515,6 +535,7 @@ class WebSocketHandler:
             "voice-output-toggle": self._handle_voice_output_toggle,
             "request-init-config": self._handle_init_config_request,
             "heartbeat": self._handle_heartbeat,
+            "fetch-world-state": self._handle_fetch_world_state,
         }
 
     async def handle_new_connection(
@@ -851,9 +872,11 @@ class WebSocketHandler:
         context = self.client_contexts[client_uid]
         # Update history_uid in service context
         context.history_uid = history_uid
+        self._update_user_timezone(context, data)
         context.agent_engine.set_memory_from_history(
             conf_uid=context.character_config.conf_uid,
             history_uid=history_uid,
+            user_timezone=context.user_timezone,
         )
 
         messages = [
@@ -880,9 +903,11 @@ class WebSocketHandler:
         history_uid = create_new_history(context.character_config.conf_uid)
         if history_uid:
             context.history_uid = history_uid
+            self._update_user_timezone(context, data)
             context.agent_engine.set_memory_from_history(
                 conf_uid=context.character_config.conf_uid,
                 history_uid=history_uid,
+                user_timezone=context.user_timezone,
             )
             await websocket.send_text(
                 json.dumps(
@@ -918,9 +943,11 @@ class WebSocketHandler:
             )
         )
         if history_uid == context.history_uid:
+            self._update_user_timezone(context, data)
             context.agent_engine.set_memory_from_history(
                 conf_uid=context.character_config.conf_uid,
                 history_uid=history_uid,
+                user_timezone=context.user_timezone,
             )
             context.history_uid = None
         self._proactive_states.get(client_uid, {}).pop(history_uid, None)
@@ -1122,6 +1149,9 @@ class WebSocketHandler:
         msg_type = data.get("type", "")
         if msg_type in {"text-input", "mic-audio-end"}:
             await self._record_user_activity(client_uid)
+            context = self.client_contexts.get(client_uid)
+            if context is not None:
+                self._update_user_timezone(context, data)
         await handle_conversation_trigger(
             msg_type=msg_type,
             data=data,
@@ -1143,6 +1173,38 @@ class WebSocketHandler:
                     context.history_uid,
                     user_activity=False,
                 )
+
+    async def _handle_fetch_world_state(
+        self, websocket: WebSocket, client_uid: str, data: WSMessage
+    ) -> None:
+        """Return the authoritative World/Life snapshot (read-only).
+
+        Used by the optional Life State observability widget. Reconciles
+        lazily with the session timezone, persists only when changed, and
+        never triggers LLM/provider calls, proactive turns, or schedulers.
+        """
+        context = self.client_contexts.get(client_uid)
+        if context is None:
+            return
+        self._update_user_timezone(context, data)
+        try:
+            snapshot = load_and_reconcile_world_state(
+                context.character_config.conf_uid, tz=context.user_timezone
+            )
+            payload = {
+                "type": "world-state",
+                "location": snapshot.location,
+                "activity": snapshot.activity,
+                "energy": snapshot.energy,
+                "mood": snapshot.mood,
+                "time_context": snapshot.time_context,
+                "activity_started_at": snapshot.activity_started_at,
+                "last_update_at": snapshot.last_update_at,
+            }
+        except Exception as error:
+            logger.warning("World state fetch skipped: type={}", type(error).__name__)
+            payload = {"type": "world-state", "error": "unavailable"}
+        await websocket.send_text(json.dumps(payload))
 
     async def _handle_fetch_configs(
         self, websocket: WebSocket, client_uid: str, data: WSMessage

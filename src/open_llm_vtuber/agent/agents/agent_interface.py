@@ -43,12 +43,15 @@ class AgentInterface(ABC):
         pass
 
     @abstractmethod
-    def set_memory_from_history(self, conf_uid: str, history_uid: str) -> None:
+    def set_memory_from_history(
+        self, conf_uid: str, history_uid: str, user_timezone: str | None = None
+    ) -> None:
         """
         Load the agent's working memory from chat history
 
         Args:
             conf_uid: str - Configuration ID
             history_uid: str - History ID
+            user_timezone: Optional IANA timezone for user-local time rules
         """
         pass

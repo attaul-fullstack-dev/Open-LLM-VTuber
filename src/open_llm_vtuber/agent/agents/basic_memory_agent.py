@@ -156,6 +156,8 @@ class BasicMemoryAgent(AgentInterface):
         self._relationship_state = RelationshipState()
         self._character_state = CharacterState()
         self._character_conf_uid: Optional[str] = None
+        # IANA timezone for user-local World State time rules (None = UTC).
+        self._user_timezone: Optional[str] = None
 
         self._formatted_tools_openai = []
         self._formatted_tools_claude = []
@@ -317,7 +319,7 @@ class BasicMemoryAgent(AgentInterface):
         # gap / server restart) the character-scoped World/Life State.
         # Fail-soft by design: world problems must never break history load.
         try:
-            load_and_reconcile_world_state(conf_uid)
+            load_and_reconcile_world_state(conf_uid, tz=self._user_timezone)
         except Exception as error:
             logger.warning("World state init skipped: type={}", type(error).__name__)
         logger.info(
@@ -347,7 +349,9 @@ class BasicMemoryAgent(AgentInterface):
         # store is unavailable. Never touches Emotion/transformers output.
         if self._character_conf_uid:
             try:
-                snapshot = load_and_reconcile_world_state(self._character_conf_uid)
+                snapshot = load_and_reconcile_world_state(
+                    self._character_conf_uid, tz=self._user_timezone
+                )
                 parts.append(build_world_state_context(snapshot))
             except Exception as error:
                 logger.warning(
@@ -853,8 +857,11 @@ class BasicMemoryAgent(AgentInterface):
 
         self._memory.append(message_data)
 
-    def set_memory_from_history(self, conf_uid: str, history_uid: str) -> None:
+    def set_memory_from_history(
+        self, conf_uid: str, history_uid: str, user_timezone: str | None = None
+    ) -> None:
         """Load memory from chat history."""
+        self._user_timezone = user_timezone
         messages = get_history(conf_uid, history_uid)
 
         self._memory = []

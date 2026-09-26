@@ -79,7 +79,9 @@ async def process_single_conversation(
         try:
             conf_uid = getattr(context.character_config, "conf_uid", None)
             if conf_uid:
-                load_and_reconcile_world_state(conf_uid)
+                load_and_reconcile_world_state(
+                    conf_uid, tz=getattr(context, "user_timezone", None)
+                )
         except Exception as error:
             logger.warning(
                 "World state reconcile skipped: type={}", type(error).__name__

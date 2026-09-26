@@ -50,7 +50,9 @@ class LettaAgent(AgentInterface):
             )
         )
 
-    def set_memory_from_history(self, conf_uid: str, history_uid: str) -> None:
+    def set_memory_from_history(
+        self, conf_uid: str, history_uid: str, user_timezone: str | None = None
+    ) -> None:
         # The Letta Server automatically stores historical messages, so this part is not needed
         pass
 

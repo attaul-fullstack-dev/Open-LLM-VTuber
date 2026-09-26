@@ -119,7 +119,9 @@ class HumeAIAgent(AgentInterface):
         if not self._connected or not self._ws or self._ws.closed:
             await self.connect(self._chat_group_id)
 
-    def set_memory_from_history(self, conf_uid: str, history_uid: str) -> None:
+    def set_memory_from_history(
+        self, conf_uid: str, history_uid: str, user_timezone: str | None = None
+    ) -> None:
         """
         Set chat group ID based on history
 

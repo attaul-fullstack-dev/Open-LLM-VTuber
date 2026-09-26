@@ -27,6 +27,10 @@ Design rules (see Phase 2 scope):
 * Clock injection: every public function accepts ``now`` so tests can use a
   fake clock (+5m / +2h / +9h / +2d) without waiting. Default is real
   server-side wall-clock time (UTC, matching ``character_state``).
+* User timezone: pure functions accept an optional ``tz`` IANA name. Hour
+  derivation (time_context, night rules, playing location) then uses the
+  user-local hour; persisted timestamps always stay canonical UTC.
+  ``tz=None`` (or unknown) keeps the original server-UTC behavior.
 
 Initial transition model (intentionally small, documented here):
 
@@ -61,6 +65,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from loguru import logger
 
@@ -115,6 +120,9 @@ DAY_OUTSIDE_END_HOUR = 18
 _state_locks: Dict[str, threading.RLock] = {}
 _state_locks_guard = threading.Lock()
 
+_TZ_CACHE: Dict[str, Optional[ZoneInfo]] = {}
+_TZ_WARNED: set = set()
+
 
 def _get_state_lock(filepath: str) -> threading.RLock:
     with _state_locks_guard:
@@ -158,6 +166,48 @@ def _parse_iso(value: Any, fallback: datetime) -> datetime:
 
 def _to_iso(value: datetime) -> str:
     return _ensure_aware(value).isoformat(timespec="seconds")
+
+
+def resolve_tz(tz: Optional[str]) -> Optional[ZoneInfo]:
+    """Return a ZoneInfo for a user/session timezone name, or None.
+
+    ``None`` (or blank/invalid) means "no user timezone known" and callers
+    fall back to server-side UTC, preserving pre-timezone behavior.
+    Persistence always stays canonical UTC; only hour derivation converts.
+    Results (including misses) are cached so an unknown name warns once.
+    """
+    name = str(tz or "").strip()
+    if not name:
+        return None
+    if name in _TZ_CACHE:
+        return _TZ_CACHE[name]
+    try:
+        zone: Optional[ZoneInfo] = ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        zone = None
+        if name not in _TZ_WARNED:
+            _TZ_WARNED.add(name)
+            logger.warning(
+                "Unknown user timezone, falling back to UTC: tz={}", name[:64]
+            )
+    _TZ_CACHE[name] = zone
+    return zone
+
+
+def local_hour(moment: datetime, tz: Optional[str]) -> int:
+    """Wall-clock hour of ``moment`` in the user timezone (pure)."""
+    aware = _ensure_aware(moment)
+    zone = resolve_tz(tz)
+    if zone is None:
+        return aware.hour
+    try:
+        return aware.astimezone(zone).hour
+    except Exception as error:
+        logger.warning(
+            "Timezone conversion failed, using UTC hour: type={}",
+            type(error).__name__,
+        )
+        return aware.hour
 
 
 # ---------------------------------------------------------------------------
@@ -207,9 +257,13 @@ def clamp_energy(value: Any) -> int:
 # ---------------------------------------------------------------------------
 
 
-def derive_time_context(moment: datetime) -> str:
-    """Map wall-clock hour to a coarse time context (pure)."""
-    hour = _ensure_aware(moment).hour
+def derive_time_context(moment: datetime, tz: Optional[str] = None) -> str:
+    """Map wall-clock hour to a coarse time context (pure).
+
+    The hour is taken in the user/session timezone when ``tz`` (IANA name)
+    is provided, otherwise server-side UTC. Buckets are unchanged.
+    """
+    hour = local_hour(moment, tz)
     if hour >= NIGHT_START_HOUR or hour < NIGHT_END_HOUR:
         return "night"
     if hour < 11:
@@ -232,25 +286,33 @@ def derive_mood(activity: str, energy: int) -> str:
     return "exhausted"
 
 
-def location_for(activity: str, moment: datetime, current_location: str) -> str:
+def location_for(
+    activity: str,
+    moment: datetime,
+    current_location: str,
+    tz: Optional[str] = None,
+) -> str:
     """Enforce activity/location consistency (pure).
 
     ``idle`` keeps its location; every other activity has a home so the
     world cannot drift into impossible states (e.g. sleeping outside).
+    Day/night for ``playing`` uses the user-local hour when ``tz`` is set.
     """
     if activity in ("sleeping", "resting", "reading"):
         return "room"
     if activity == "eating":
         return "kitchen"
     if activity == "playing":
-        hour = _ensure_aware(moment).hour
+        hour = local_hour(moment, tz)
         if DAY_OUTSIDE_START_HOUR <= hour < DAY_OUTSIDE_END_HOUR:
             return "outside"
         return "room"
     return normalize_location(current_location)
 
 
-def default_state(now: Optional[datetime] = None) -> WorldState:
+def default_state(
+    now: Optional[datetime] = None, tz: Optional[str] = None
+) -> WorldState:
     """Build the initial world state for a character (pure)."""
     moment = _ensure_aware(now) if now is not None else utcnow()
     stamp = _to_iso(moment)
@@ -259,26 +321,30 @@ def default_state(now: Optional[datetime] = None) -> WorldState:
         activity=DEFAULT_ACTIVITY,
         energy=DEFAULT_ENERGY,
         mood=derive_mood(DEFAULT_ACTIVITY, DEFAULT_ENERGY),
-        time_context=derive_time_context(moment),
+        time_context=derive_time_context(moment, tz),
         activity_started_at=stamp,
         last_update_at=stamp,
         recent_activity_history=[],
     )
 
 
-def _is_night(moment: datetime) -> bool:
-    hour = _ensure_aware(moment).hour
+def _is_night(moment: datetime, tz: Optional[str] = None) -> bool:
+    hour = local_hour(moment, tz)
     return hour >= NIGHT_START_HOUR or hour < NIGHT_END_HOUR
 
 
 def transition(
-    state: WorldState, elapsed_s: float, now: datetime
+    state: WorldState,
+    elapsed_s: float,
+    now: datetime,
+    tz: Optional[str] = None,
 ) -> Tuple[WorldState, bool]:
     """Apply one deterministic transition step (pure, no I/O).
 
     Returns ``(new_state, activity_changed)``. Energy, mood, location and
     timestamps are updated in place on a copy; history is appended only
-    when the activity itself changes.
+    when the activity itself changes. Day/night-dependent rules use the
+    user-local hour when ``tz`` (IANA name) is provided, else server UTC.
     """
     moment = _ensure_aware(now)
     elapsed = max(0.0, float(elapsed_s or 0.0))
@@ -318,16 +384,16 @@ def transition(
     ):
         new_activity = "idle"
     elif current.activity == "idle":
-        if _is_night(moment) and new_energy <= 30:
+        if _is_night(moment, tz) and new_energy <= 30:
             new_activity = "sleeping"
         elif new_energy <= 10:
             new_activity = "resting"
     elif current.activity == "playing" and new_energy <= 5:
         new_activity = "resting"
 
-    new_location = location_for(new_activity, moment, current.location)
+    new_location = location_for(new_activity, moment, current.location, tz)
     new_mood = derive_mood(new_activity, new_energy)
-    new_time_context = derive_time_context(moment)
+    new_time_context = derive_time_context(moment, tz)
 
     activity_changed = new_activity != current.activity
     if activity_changed:
@@ -357,7 +423,9 @@ def transition(
 
 
 def reconcile(
-    state: WorldState, now: Optional[datetime] = None
+    state: WorldState,
+    now: Optional[datetime] = None,
+    tz: Optional[str] = None,
 ) -> Tuple[WorldState, bool]:
     """Lazily reconcile state against wall-clock time (pure, no I/O).
 
@@ -365,6 +433,10 @@ def reconcile(
     deterministic transition. Never replays every missed minute/hour:
     long offline gaps collapse into a single step (e.g. sleeping through
     a 2-day gap wakes to idle with full energy, not 48 hourly ticks).
+
+    ``tz`` is the user/session IANA timezone name. Day/night-dependent
+    rules and ``time_context`` use the user-local hour; persistence
+    timestamps stay canonical UTC. ``None`` keeps server-UTC behavior.
 
     Returns ``(new_state, changed)`` where ``changed`` covers any field
     difference, including timestamp / time_context / energy-only updates.
@@ -389,7 +461,7 @@ def reconcile(
         return baseline, False
 
     elapsed = (moment - last).total_seconds()
-    updated, _ = transition(baseline, elapsed, moment)
+    updated, _ = transition(baseline, elapsed, moment, tz)
 
     changed = (
         updated.location != baseline.location
@@ -452,8 +524,8 @@ def _state_to_dict(state: WorldState) -> Dict[str, Any]:
     }
 
 
-def _state_from_dict(data: Any, now: datetime) -> WorldState:
-    fallback = default_state(now)
+def _state_from_dict(data: Any, now: datetime, tz: Optional[str] = None) -> WorldState:
+    fallback = default_state(now, tz)
     if not isinstance(data, dict):
         return fallback
     history: List[Dict[str, Any]] = []
@@ -491,19 +563,20 @@ def load_world_state(
     conf_uid: str,
     now: Optional[datetime] = None,
     base_dir: str = WORLD_STATE_DIR,
+    tz: Optional[str] = None,
 ) -> WorldState:
     """Load world state without reconciling; missing/corrupt -> safe default."""
     moment = _ensure_aware(now) if now is not None else utcnow()
     filepath = get_world_state_path(conf_uid, base_dir)
     if not os.path.exists(filepath):
-        return default_state(moment)
+        return default_state(moment, tz)
     try:
         with open(filepath, "r", encoding="utf-8") as file:
             data = json.load(file)
-        return _state_from_dict(data, moment)
+        return _state_from_dict(data, moment, tz)
     except Exception as error:
         logger.error("Failed to load world state: error_type={}", type(error).__name__)
-        return default_state(moment)
+        return default_state(moment, tz)
 
 
 def save_world_state(
@@ -528,20 +601,22 @@ def load_and_reconcile_world_state(
     conf_uid: str,
     now: Optional[datetime] = None,
     base_dir: str = WORLD_STATE_DIR,
+    tz: Optional[str] = None,
 ) -> WorldState:
     """Load, lazily reconcile against ``now``, persist only if changed.
 
     This is the single entry point for conversation triggers, proactive
     checks, reconnect/history-switch and character load paths. It never
     raises: on any failure the caller gets a usable in-memory state and
-    the conversation path continues unchanged.
+    the conversation path continues unchanged. ``tz`` selects the
+    user-local hour for time rules; stored timestamps stay UTC.
     """
     try:
         moment = _ensure_aware(now) if now is not None else utcnow()
         filepath = get_world_state_path(conf_uid, base_dir)
         existed = os.path.exists(filepath)
-        state = load_world_state(conf_uid, moment, base_dir)
-        reconciled, changed = reconcile(state, moment)
+        state = load_world_state(conf_uid, moment, base_dir, tz)
+        reconciled, changed = reconcile(state, moment, tz)
         if changed or not existed:
             save_world_state(conf_uid, reconciled, base_dir)
         return reconciled
