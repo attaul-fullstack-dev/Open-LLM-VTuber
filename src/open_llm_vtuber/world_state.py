@@ -441,6 +441,13 @@ def reconcile(
     Returns ``(new_state, changed)`` where ``changed`` covers any field
     difference, including timestamp / time_context / energy-only updates.
     A second call with the same ``now`` is always a no-op.
+
+    Only material field changes advance ``last_update_at``. Timestamp-only
+    touches are deliberately NOT persisted: integer energy cannot represent
+    sub-unit drift, so moving the baseline on every read would freeze
+    slow drains (e.g. idle -1/hour) under frequent refreshes. Keeping the
+    baseline at the last material change lets fractional elapsed time
+    accumulate correctly across sparse AND frequent reconciles.
     """
     moment = _ensure_aware(now) if now is not None else utcnow()
     baseline = WorldState(
@@ -472,13 +479,11 @@ def reconcile(
         or updated.activity_started_at != baseline.activity_started_at
         or updated.recent_activity_history != baseline.recent_activity_history
     )
-    if not changed and baseline.last_update_at == _to_iso(moment):
-        return baseline, False
     if not changed:
-        # Timestamps still advance so the next call with the same ``now``
-        # is a strict no-op (idempotent reconcile).
-        baseline.last_update_at = _to_iso(moment)
-        return baseline, True
+        # No material difference: keep the old baseline (including
+        # last_update_at) so sub-unit energy drift can still accumulate
+        # on later reconciles. Still a strict no-op for identical ``now``.
+        return baseline, False
     updated.last_update_at = _to_iso(moment)
     return updated, True
 

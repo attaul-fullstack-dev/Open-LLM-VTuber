@@ -199,8 +199,13 @@ class ReconciliationTests(unittest.TestCase):
         base = noon()
         state = state_at("reading", energy=80, at=base)
         updated, changed = reconcile(state, base + timedelta(minutes=5))
-        self.assertTrue(changed)  # timestamps advance
+        # +5min of reading drifts 80 -> 79.83 -> rounds back to 80: no
+        # material change, so the baseline (and last_update_at) is kept
+        # for future decay instead of being consumed by the timestamp.
+        self.assertFalse(changed)
         self.assertEqual(updated.activity, "reading")
+        self.assertEqual(updated.energy, 80)
+        self.assertEqual(updated.last_update_at, state.last_update_at)
         self.assertGreaterEqual(updated.energy, MIN_ENERGY)
 
     def test_plus_2_hours(self):
@@ -584,6 +589,24 @@ class UserTimezoneTests(unittest.TestCase):
         self.assertEqual(derive_time_context(moment, self.TZ), "night")
         self.assertEqual(derive_time_context(moment, None), "afternoon")
 
+    def test_live_report_boundaries(self):
+        # Exact cases from the live bug report (UTC -> Asia/Jakarta).
+        cases = [
+            ((15, 16), "night"),  # 22:16 WIB
+            ((16, 16), "night"),  # 23:16 WIB
+            ((21, 0), "night"),  # 04:00 WIB
+            ((22, 0), "morning"),  # 05:00 WIB
+        ]
+        for (hour, minute), expected in cases:
+            with self.subTest(utc=f"{hour}:{minute:02d}"):
+                self.assertEqual(
+                    derive_time_context(
+                        datetime(2026, 9, 26, hour, minute, tzinfo=timezone.utc),
+                        self.TZ,
+                    ),
+                    expected,
+                )
+
     def test_other_timezone_not_hardcoded(self):
         # America/New_York is UTC-4 in September: 15:40 UTC -> 11:40 local.
         moment = datetime(2026, 9, 26, 15, 40, tzinfo=timezone.utc)
@@ -631,6 +654,76 @@ class UserTimezoneTests(unittest.TestCase):
             raw = json.load(f)
         for key in ("activity_started_at", "last_update_at"):
             self.assertTrue(raw[key].endswith("+00:00"), raw[key])
+
+
+class FetchReconcileEnergyTests(unittest.TestCase):
+    """fetch/load path must reconcile energy from elapsed wall-clock time."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.base_dir = os.path.join(self._tmp.name, "world_state")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _seed(self, activity, energy, at):
+        state = WorldState(
+            location="room",
+            activity=activity,
+            energy=energy,
+            mood=derive_mood(activity, energy),
+            time_context="afternoon",
+            activity_started_at=at.isoformat(),
+            last_update_at=at.isoformat(),
+            recent_activity_history=[],
+        )
+        self.assertTrue(save_world_state("mili", state, self.base_dir))
+        return state
+
+    def test_elapsed_36min_idle_drops_energy(self):
+        # Live case: last_update 15:40 UTC idle 80, now 16:16 UTC.
+        base = datetime(2026, 9, 26, 15, 40, tzinfo=timezone.utc)
+        self._seed("idle", 80, base)
+        updated = load_and_reconcile_world_state(
+            "mili", base + timedelta(minutes=36), self.base_dir
+        )
+        # idle -1/hour * 0.6h = -0.6 -> 79.4 -> 79
+        self.assertEqual(updated.energy, 79)
+        self.assertEqual(updated.activity, "idle")
+        # Persisted baseline advanced to the material change.
+        reloaded = load_world_state(
+            "mili", base + timedelta(minutes=36), self.base_dir
+        )
+        self.assertEqual(reloaded.energy, 79)
+
+    def test_frequent_refresh_no_longer_freezes_energy(self):
+        # Regression: refreshes every 2 minutes for 2h of reading must
+        # decay (linear ideal 76), not stick at 80 forever. Each material
+        # persist rounds to int, so pathological polling may drift ~±2
+        # around the ideal; sparse reconciles stay exact (see test above).
+        base = datetime(2026, 9, 26, 12, 0, tzinfo=timezone.utc)
+        self._seed("reading", 80, base)
+        now = base
+        for _ in range(60):
+            now += timedelta(minutes=2)
+            load_and_reconcile_world_state("mili", now, self.base_dir)
+        final = load_world_state("mili", now, self.base_dir)
+        self.assertLess(final.energy, 80)
+        self.assertGreaterEqual(final.energy, 72)
+        self.assertLessEqual(final.energy, 76)
+
+    def test_noop_refresh_keeps_baseline_for_future_decay(self):
+        base = datetime(2026, 9, 26, 12, 0, tzinfo=timezone.utc)
+        self._seed("reading", 80, base)
+        first = load_and_reconcile_world_state(
+            "mili", base + timedelta(minutes=5), self.base_dir
+        )
+        self.assertEqual(first.energy, 80)
+        # Baseline preserved: a later +65min reconcile sees the full span.
+        later = load_and_reconcile_world_state(
+            "mili", base + timedelta(minutes=65), self.base_dir
+        )
+        self.assertEqual(later.energy, 78)
 
 
 if __name__ == "__main__":
