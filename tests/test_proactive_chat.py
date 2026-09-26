@@ -142,7 +142,9 @@ def _make_agent(conf_uid, history_uid, llm_cls=_FakeLLM):
                 "translate_provider": "deeplx",
             },
         ),
-        context_window_override=2000,
+        # Stage 7 adds a ~32-token World State line to every system prompt;
+        # keep headroom so prompt-content tests are not budget-edge sensitive.
+        context_window_override=2200,
     )
     agent.set_memory_from_history(conf_uid, history_uid)
     return agent, llm
