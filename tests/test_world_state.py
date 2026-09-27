@@ -542,8 +542,23 @@ class PromptFormatTests(unittest.TestCase):
         self.assertTrue(line.startswith("[Mili World State]"))
         for key in ("location=", "activity=", "energy=", "mood=", "time_context="):
             self.assertIn(key, line)
-        # Compact: header + exactly one state line.
+        # Compact: header + exactly one state line (no history seeded).
         self.assertEqual(len(line.strip().splitlines()), 2)
+
+    def test_recent_life_capped_at_two_transitions(self):
+        history = [
+            {"from": "idle", "to": "reading", "at": "t0", "location": "room"},
+            {"from": "reading", "to": "eating", "at": "t1", "location": "kitchen"},
+            {"from": "eating", "to": "playing", "at": "t2", "location": "outside"},
+        ]
+        state = state_at("playing", energy=60, at=noon(), history=history)
+        line = build_world_state_context(state)
+        self.assertEqual(len(line.strip().splitlines()), 3)
+        self.assertIn("Recent life:", line)
+        # Only the latest two; the oldest (idle → reading) stays out.
+        self.assertNotIn("idle → reading", line)
+        self.assertIn("reading → eating", line)
+        self.assertIn("eating → playing", line)
 
 
 class UserTimezoneTests(unittest.TestCase):
@@ -726,6 +741,248 @@ class FetchReconcileEnergyTests(unittest.TestCase):
             "mili", base + timedelta(minutes=65), self.base_dir
         )
         self.assertEqual(later.energy, 78)
+
+
+class BehaviorLayerV1Tests(unittest.IsolatedAsyncioTestCase):
+    """Behavior Layer v1: world state inside character context (tests A-I)."""
+
+    def setUp(self):
+        self._old_cwd = os.getcwd()
+        self._tmp = tempfile.TemporaryDirectory()
+        os.chdir(self._tmp.name)
+
+    def tearDown(self):
+        os.chdir(self._old_cwd)
+        self._tmp.cleanup()
+
+    def _seed(self, conf_uid, activity, energy, location="room", history=None):
+        from src.open_llm_vtuber.world_state import utcnow
+
+        now = utcnow()
+        state = WorldState(
+            location=location,
+            activity=activity,
+            energy=energy,
+            mood=derive_mood(activity, energy),
+            time_context=derive_time_context(now),
+            activity_started_at=now.isoformat(),
+            last_update_at=now.isoformat(),
+            recent_activity_history=list(history or []),
+        )
+        self.assertTrue(save_world_state(conf_uid, state))
+        return state
+
+    def _agent(self, conf_uid, history_uid, llm, live2d=None):
+        from src.open_llm_vtuber.agent.agents.basic_memory_agent import (
+            BasicMemoryAgent,
+        )
+        from src.open_llm_vtuber.chat_history_manager import create_new_history
+        from src.open_llm_vtuber.config_manager import TTSPreprocessorConfig
+
+        if history_uid is None:
+            history_uid = create_new_history(conf_uid)
+        agent = BasicMemoryAgent(
+            llm=llm,
+            system="persona Mili",
+            live2d_model=live2d or _QuietLive2D(),
+            tts_preprocessor_config=TTSPreprocessorConfig(
+                remove_special_char=True,
+                translator_config={
+                    "translate_audio": False,
+                    "translate_provider": "deeplx",
+                },
+            ),
+            context_window_override=8000,
+        )
+        agent.set_memory_from_history(conf_uid, history_uid)
+        return agent
+
+    def test_a_activity_in_context(self):
+        llm = _SilentLLM()
+        self._seed("mili-a", "reading", 65, "room")
+        agent = self._agent("mili-a", None, llm)
+        prompt = agent._relationship_system_prompt(agent._system)
+        self.assertIn("activity=reading", prompt)
+
+    def test_b_location_in_context(self):
+        llm = _SilentLLM()
+        self._seed("mili-b", "eating", 70, "kitchen")
+        agent = self._agent("mili-b", None, llm)
+        prompt = agent._relationship_system_prompt(agent._system)
+        self.assertIn("location=kitchen", prompt)
+        self.assertIn("activity=eating", prompt)
+
+    def test_c_energy_in_context(self):
+        llm = _SilentLLM()
+        self._seed("mili-c", "resting", 20)
+        agent = self._agent("mili-c", None, llm)
+        prompt = agent._relationship_system_prompt(agent._system)
+        self.assertIn("energy=20", prompt)
+
+    def test_d_mood_separate_from_semantic_emotion(self):
+        llm = _MarkerLLM()
+        self._seed("mili-d", "reading", 40)  # mood calm, far from joy
+        agent = self._agent("mili-d", None, llm)
+        prompt = agent._relationship_system_prompt(agent._system)
+        self.assertIn("mood=calm", prompt)
+        self.assertNotIn("joy", prompt.split("[Mili World State]")[1])
+
+    async def test_d2_emotion_actions_untouched_by_world_mood(self):
+        from src.open_llm_vtuber.agent.input_types import (
+            BatchInput,
+            TextData,
+            TextSource,
+        )
+
+        llm = _MarkerLLM()
+        self._seed("mili-d2", "sleeping", 5)  # mood sleepy
+        agent = self._agent("mili-d2", None, llm, _MarkerLive2D())
+        seen = [
+            item
+            async for item in agent.chat(
+                BatchInput(texts=[TextData(source=TextSource.INPUT, content="hai")])
+            )
+        ]
+        outputs = [item for item in seen if hasattr(item, "actions")]
+        self.assertTrue(outputs)
+        for output in outputs:
+            self.assertEqual(list(output.actions.emotions or []), ["joy"])
+            self.assertNotIn("sleepy", str(output.actions.emotions))
+
+    def test_e_recent_history_selective(self):
+        llm = _SilentLLM()
+        self._seed(
+            "mili-e",
+            "reading",
+            60,
+            "room",
+            history=[
+                {
+                    "from": "resting",
+                    "to": "reading",
+                    "at": "t",
+                    "location": "room",
+                }
+            ],
+        )
+        agent = self._agent("mili-e", None, llm)
+        prompt = agent._relationship_system_prompt(agent._system)
+        self.assertIn("resting → reading", prompt)
+
+    async def test_f_activity_survives_chat(self):
+        from src.open_llm_vtuber.agent.input_types import (
+            BatchInput,
+            TextData,
+            TextSource,
+        )
+
+        llm = _SilentLLM()
+        self._seed("mili-f", "reading", 65)
+        agent = self._agent("mili-f", None, llm)
+        async for _ in agent.chat(
+            BatchInput(texts=[TextData(source=TextSource.INPUT, content="Mil?")])
+        ):
+            pass
+        reloaded = load_world_state("mili-f")
+        self.assertEqual(reloaded.activity, "reading")
+
+    def test_g_context_uses_reconciled_state(self):
+        from src.open_llm_vtuber.world_state import utcnow
+
+        llm = _SilentLLM()
+        # Seed relative to the real clock so the scenario is stable no
+        # matter when it runs: sleeping 9h ago, reconciled at seed+9h.
+        slept_at = utcnow() - timedelta(hours=9)
+        stale = WorldState(
+            location="room",
+            activity="sleeping",
+            energy=10,
+            mood="sleepy",
+            time_context="night",
+            activity_started_at=slept_at.isoformat(),
+            last_update_at=slept_at.isoformat(),
+            recent_activity_history=[],
+        )
+        self.assertTrue(save_world_state("mili-g", stale))
+        # Fake clock at the +9h mark: sleeping duration exceeded -> idle.
+        reconciled = load_and_reconcile_world_state(
+            "mili-g", slept_at + timedelta(hours=9)
+        )
+        self.assertEqual(reconciled.activity, "idle")
+        agent = self._agent("mili-g", None, llm)
+        prompt = agent._relationship_system_prompt(agent._system)
+        self.assertIn("activity=idle", prompt)
+        world_block = prompt.split("[Mili World State]")[1]
+        self.assertNotIn("activity=sleeping", world_block)
+
+    def test_h_character_isolation(self):
+        llm = _SilentLLM()
+        self._seed("mili-h1", "reading", 65)
+        self._seed("mili-h2", "sleeping", 90)
+        agent_a = self._agent("mili-h1", None, llm)
+        agent_b = self._agent("mili-h2", None, llm)
+        prompt_a = agent_a._relationship_system_prompt(agent_a._system)
+        prompt_b = agent_b._relationship_system_prompt(agent_b._system)
+        self.assertIn("activity=reading", prompt_a)
+        self.assertNotIn("activity=sleeping", prompt_a)
+        self.assertIn("activity=sleeping", prompt_b)
+        self.assertNotIn("activity=reading", prompt_b)
+
+    async def test_i_no_extra_llm_call(self):
+        from src.open_llm_vtuber.agent.input_types import (
+            BatchInput,
+            TextData,
+            TextSource,
+        )
+
+        llm = _SilentLLM()
+        self._seed("mili-i", "reading", 65)
+        agent = self._agent("mili-i", None, llm)
+        async for _ in agent.chat(
+            BatchInput(texts=[TextData(source=TextSource.INPUT, content="halo")])
+        ):
+            pass
+        self.assertEqual(llm.calls, 1)
+
+
+class _SilentLLM:
+    model = "behavior-v1-test"
+    max_tokens = 100
+
+    def __init__(self):
+        self.calls = 0
+
+    async def chat_completion(self, messages, system=None, tools=None):
+        self.calls += 1
+        yield "oke."
+
+
+class _QuietLive2D:
+    def extract_emotion(self, _text):
+        return []
+
+    def extract_emotion_keys(self, _text):
+        return []
+
+    def remove_emotion_keywords(self, text):
+        return text
+
+
+class _MarkerLLM(_SilentLLM):
+    async def chat_completion(self, messages, system=None, tools=None):
+        self.calls += 1
+        yield "[joy] Halo."
+
+
+class _MarkerLive2D:
+    def extract_emotion(self, text):
+        return [3] if "[joy]" in text else []
+
+    def extract_emotion_keys(self, text):
+        return ["joy"] if "[joy]" in text else []
+
+    def remove_emotion_keywords(self, text):
+        return text.replace("[joy]", "").strip()
 
 
 if __name__ == "__main__":

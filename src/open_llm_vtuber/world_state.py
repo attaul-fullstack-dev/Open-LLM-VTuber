@@ -488,16 +488,35 @@ def reconcile(
     return updated, True
 
 
+# Maximum recent transitions exposed to character context (selective).
+# The store keeps HISTORY_CAP; the prompt carries only the latest few so
+# the model gets continuity ("tadi ngapain") without a giant history block.
+CONTEXT_RECENT_LIFE_LIMIT = 2
+
+
 def build_world_state_context(state: WorldState) -> str:
-    """Render the VERY COMPACT world line injected into the system prompt."""
-    return (
-        "[Mili World State]\n"
+    """Render the VERY COMPACT world context injected into the system prompt.
+
+    Current life (activity/location/energy/mood/time) plus at most the last
+    two activity transitions for continuity. No chat text, no full history.
+    """
+    lines = [
+        "[Mili World State]",
         f"location={normalize_location(state.location)}; "
         f"activity={normalize_activity(state.activity)}; "
         f"energy={clamp_energy(state.energy)}; "
         f"mood={normalize_mood(state.mood)}; "
-        f"time_context={state.time_context or derive_time_context(utcnow())}"
-    )
+        f"time_context={state.time_context or derive_time_context(utcnow())}",
+    ]
+    recent = list(state.recent_activity_history or [])[-CONTEXT_RECENT_LIFE_LIMIT:]
+    moves = [
+        f"{normalize_activity(item.get('from'))} → {normalize_activity(item.get('to'))}"
+        for item in recent
+        if isinstance(item, dict)
+    ]
+    if moves:
+        lines.append("Recent life: " + ", ".join(moves))
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
