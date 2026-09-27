@@ -1263,5 +1263,111 @@ class ReactiveAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(load_world_state(self.conf_uid).mood, "happy")
 
 
+class FetchHandlerTests(unittest.IsolatedAsyncioTestCase):
+    """fetch-world-state handler: reconcile + authoritative payload (B-E, J)."""
+
+    def setUp(self):
+        self._old_cwd = os.getcwd()
+        self._tmp = tempfile.TemporaryDirectory()
+        os.chdir(self._tmp.name)
+
+    def tearDown(self):
+        os.chdir(self._old_cwd)
+        self._tmp.cleanup()
+
+    def _handler_with_context(self, conf_uid="mili-fetch", tz="Asia/Jakarta"):
+        from types import SimpleNamespace
+
+        from src.open_llm_vtuber.service_context import ServiceContext
+        from src.open_llm_vtuber.websocket_handler import WebSocketHandler
+
+        handler = WebSocketHandler(ServiceContext())
+        context = SimpleNamespace(
+            character_config=SimpleNamespace(conf_uid=conf_uid),
+            user_timezone=tz,
+        )
+        handler.client_contexts["c1"] = context
+        return handler
+
+    async def _fetch(self, handler, data):
+        sent = []
+
+        class _FakeWS:
+            async def send_text(self, payload):
+                sent.append(json.loads(payload))
+
+        await handler._handle_fetch_world_state(_FakeWS(), "c1", data)
+        self.assertEqual(len(sent), 1)
+        return sent[0]
+
+    async def test_fetch_returns_reconciled_snapshot(self):
+        from datetime import timezone as _tz
+
+        base = datetime(2026, 9, 27, 1, 0, tzinfo=_tz.utc)
+        seed = WorldState(
+            location="room",
+            activity="sleeping",
+            energy=10,
+            mood="sleepy",
+            time_context="night",
+            activity_started_at=base.isoformat(),
+            last_update_at=base.isoformat(),
+            recent_activity_history=[],
+            mood_ttl_turns=0,
+            mood_set_at=None,
+        )
+        self.assertTrue(save_world_state("mili-fetch", seed))
+        handler = self._handler_with_context()
+        # 9h later: 10:00 UTC = 17:00 WIB. Sleeping duration exceeded
+        # (idle) and the local hour reads evening.
+        import unittest.mock as mock
+
+        real_datetime = datetime
+        with mock.patch(
+            "src.open_llm_vtuber.world_state.datetime"
+        ) as mock_dt:
+            mock_dt.now.return_value = base + timedelta(hours=9)
+            mock_dt.fromisoformat.side_effect = real_datetime.fromisoformat
+            payload = await self._fetch(
+                handler, {"type": "fetch-world-state", "timezone": "Asia/Jakarta"}
+            )
+        self.assertEqual(payload["type"], "world-state")
+        self.assertEqual(payload["activity"], "idle")
+        self.assertEqual(payload["time_context"], "evening")
+        for key in (
+            "location",
+            "activity",
+            "energy",
+            "mood",
+            "time_context",
+            "activity_started_at",
+            "last_update_at",
+        ):
+            self.assertIn(key, payload)
+
+    async def test_fetch_stores_session_timezone(self):
+        handler = self._handler_with_context(tz=None)
+        self.assertIsNone(handler.client_contexts["c1"].user_timezone)
+        await self._fetch(
+            handler, {"type": "fetch-world-state", "timezone": "Asia/Jakarta"}
+        )
+        self.assertEqual(
+            handler.client_contexts["c1"].user_timezone, "Asia/Jakarta"
+        )
+
+    async def test_fetch_without_client_is_noop(self):
+        from src.open_llm_vtuber.service_context import ServiceContext
+        from src.open_llm_vtuber.websocket_handler import WebSocketHandler
+
+        handler = WebSocketHandler(ServiceContext())
+
+        class _FakeWS:
+            async def send_text(self, payload):
+                raise AssertionError("must not send without context")
+
+        await handler._handle_fetch_world_state(_FakeWS(), "ghost", {})
+        # No exception, no send.
+
+
 if __name__ == "__main__":
     unittest.main()
