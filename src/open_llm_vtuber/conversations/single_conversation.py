@@ -210,6 +210,22 @@ async def process_single_conversation(
         latency.mark("agent_end")
         # --- End processing agent response ---
 
+        # Reactive life state BEFORE finalize: the widget auto-fetches on
+        # conversation-chain-end, so the reactive persist must already be
+        # done when chain-end is emitted. Same guard as the character
+        # observer below (visible normal turns with a real response only).
+        # Pure + persist, no LLM calls.
+        if context.history_uid and full_response and not skip_history and not proactive:
+            reactive = getattr(context.agent_engine, "observe_reactive_state", None)
+            if callable(reactive):
+                try:
+                    reactive(turn_emotions)
+                except Exception as reactive_error:
+                    logger.warning(
+                        "Reactive observation skipped: type={}",
+                        type(reactive_error).__name__,
+                    )
+
         # Wait for any pending TTS tasks
         if tts_manager.task_list:
             latency.mark("tts_wait_start")
@@ -257,20 +273,6 @@ async def process_single_conversation(
                         "character_event_ms",
                         (time.perf_counter() - event_started) * 1000,
                     )
-                # Reactive life state: same guard as the character observer
-                # (visible normal turns only). Pure + persist, no LLM calls.
-                # The widget picks the result up on conversation-chain-end.
-                reactive = getattr(
-                    context.agent_engine, "observe_reactive_state", None
-                )
-                if callable(reactive):
-                    try:
-                        reactive(turn_emotions)
-                    except Exception as reactive_error:
-                        logger.warning(
-                            "Reactive observation skipped: type={}",
-                            type(reactive_error).__name__,
-                        )
 
         latency.mark("websocket_final_output")
         return full_response  # Return accumulated full_response

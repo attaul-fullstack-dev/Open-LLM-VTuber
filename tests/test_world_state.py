@@ -1323,9 +1323,7 @@ class FetchHandlerTests(unittest.IsolatedAsyncioTestCase):
         import unittest.mock as mock
 
         real_datetime = datetime
-        with mock.patch(
-            "src.open_llm_vtuber.world_state.datetime"
-        ) as mock_dt:
+        with mock.patch("src.open_llm_vtuber.world_state.datetime") as mock_dt:
             mock_dt.now.return_value = base + timedelta(hours=9)
             mock_dt.fromisoformat.side_effect = real_datetime.fromisoformat
             payload = await self._fetch(
@@ -1351,9 +1349,7 @@ class FetchHandlerTests(unittest.IsolatedAsyncioTestCase):
         await self._fetch(
             handler, {"type": "fetch-world-state", "timezone": "Asia/Jakarta"}
         )
-        self.assertEqual(
-            handler.client_contexts["c1"].user_timezone, "Asia/Jakarta"
-        )
+        self.assertEqual(handler.client_contexts["c1"].user_timezone, "Asia/Jakarta")
 
     async def test_fetch_without_client_is_noop(self):
         from src.open_llm_vtuber.service_context import ServiceContext
@@ -1367,6 +1363,158 @@ class FetchHandlerTests(unittest.IsolatedAsyncioTestCase):
 
         await handler._handle_fetch_world_state(_FakeWS(), "ghost", {})
         # No exception, no send.
+
+
+class TurnOrderingTests(unittest.IsolatedAsyncioTestCase):
+    """Reactive persist must precede conversation-chain-end (live bug).
+
+    Regression: chain-end used to be emitted (finalize) BEFORE the reactive
+    observer ran, so the widget auto-fetch on chain-end always read stale
+    state and only manual refresh showed the truth.
+    """
+
+    def setUp(self):
+        self._old_cwd = os.getcwd()
+        self._tmp = tempfile.TemporaryDirectory()
+        os.chdir(self._tmp.name)
+        self.conf_uid = "mili-order"
+
+    def tearDown(self):
+        os.chdir(self._old_cwd)
+        self._tmp.cleanup()
+
+    async def test_reactive_persisted_before_chain_end(self):
+        import asyncio
+        import json as _json
+
+        from types import SimpleNamespace
+
+        from src.open_llm_vtuber.agent.agents.basic_memory_agent import (
+            BasicMemoryAgent,
+        )
+        from src.open_llm_vtuber.chat_history_manager import create_new_history
+        from src.open_llm_vtuber.config_manager import TTSPreprocessorConfig
+        from src.open_llm_vtuber.conversations.single_conversation import (
+            process_single_conversation,
+        )
+        from src.open_llm_vtuber.message_handler import message_handler
+        from src.open_llm_vtuber.world_state import utcnow
+
+        class _BlushLLM:
+            model = "order-test"
+            max_tokens = 100
+
+            def __init__(self):
+                self.calls = 0
+
+            async def chat_completion(self, messages, system=None, tools=None):
+                self.calls += 1
+                yield "[embarrassed] Ih, apaan sih."
+
+        class _BlushLive2D:
+            def extract_emotion(self, text):
+                return [6] if "[embarrassed]" in text else []
+
+            def extract_emotion_keys(self, text):
+                return ["embarrassed"] if "[embarrassed]" in text else []
+
+            def remove_emotion_keywords(self, text):
+                return text.replace("[embarrassed]", "").strip()
+
+        now = utcnow()
+        save_world_state(
+            self.conf_uid,
+            WorldState(
+                location="room",
+                activity="reading",
+                energy=65,
+                mood="calm",
+                time_context="night",
+                activity_started_at=now.isoformat(),
+                last_update_at=now.isoformat(),
+                recent_activity_history=[],
+                mood_ttl_turns=0,
+                mood_set_at=None,
+            ),
+        )
+        history_uid = create_new_history(self.conf_uid)
+        llm = _BlushLLM()
+        agent = BasicMemoryAgent(
+            llm=llm,
+            system="persona Mili",
+            live2d_model=_BlushLive2D(),
+            tts_preprocessor_config=TTSPreprocessorConfig(
+                remove_special_char=True,
+                translator_config={
+                    "translate_audio": False,
+                    "translate_provider": "deeplx",
+                },
+            ),
+            context_window_override=8000,
+        )
+        agent.set_memory_from_history(self.conf_uid, history_uid)
+        context = SimpleNamespace(
+            character_config=SimpleNamespace(
+                conf_uid=self.conf_uid,
+                human_name="Human",
+                character_name="Mili",
+                avatar="",
+            ),
+            history_uid=history_uid,
+            agent_engine=agent,
+            asr_engine=None,
+            tts_engine=SimpleNamespace(),
+            live2d_model=_BlushLive2D(),
+            translate_engine=None,
+            voice_output_enabled=False,
+        )
+
+        sent = []
+        world_at_chain_end = {}
+
+        async def fake_send(payload):
+            message = _json.loads(payload)
+            sent.append(message)
+            if message.get("type") == "control" and message.get("text") == (
+                "conversation-chain-end"
+            ):
+                with open(os.path.join("world_state", f"{self.conf_uid}.json")) as file:
+                    world_at_chain_end.update(_json.load(file))
+
+        async def answer_playback():
+            for _ in range(600):
+                await asyncio.sleep(0.05)
+                if any(m.get("type") == "backend-synth-complete" for m in sent):
+                    message_handler.handle_message(
+                        "order-client", {"type": "frontend-playback-complete"}
+                    )
+                    return
+            raise TimeoutError("no synth-complete seen")
+
+        talk = asyncio.create_task(
+            process_single_conversation(
+                context=context,
+                websocket_send=fake_send,
+                client_uid="order-client",
+                user_input="kamu lucu deh",
+            )
+        )
+        await asyncio.gather(talk, answer_playback())
+
+        # The turn completed through the real pipeline.
+        self.assertTrue(
+            any(
+                m.get("type") == "control" and m.get("text") == "conversation-chain-end"
+                for m in sent
+            )
+        )
+        # THE ordering guarantee: reactive state already persisted when
+        # chain-end (the widget auto-fetch trigger) was emitted.
+        self.assertTrue(world_at_chain_end, "chain-end was never sent")
+        self.assertEqual(world_at_chain_end.get("mood"), "shy")
+        self.assertEqual(world_at_chain_end.get("activity"), "idle")
+        # No extra LLM call for the reactive step.
+        self.assertEqual(llm.calls, 1)
 
 
 if __name__ == "__main__":
