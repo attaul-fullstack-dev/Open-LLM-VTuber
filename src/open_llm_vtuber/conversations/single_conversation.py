@@ -127,6 +127,10 @@ async def process_single_conversation(
                 logger.info(f"With {len(images)} images")
 
         latency.mark("agent_start")
+        # Backend semantic-emotion labels observed this turn. Collected for
+        # the reactive life-state step after the stream (group chats skip
+        # reactive observation in v1).
+        turn_emotions: List[str] = []
         try:
             if proactive:
                 proactive_chat = getattr(context.agent_engine, "chat_proactively", None)
@@ -157,6 +161,11 @@ async def process_single_conversation(
                 elif isinstance(output_item, (SentenceOutput, AudioOutput)):
                     # Handle SentenceOutput or AudioOutput
                     tts_started = time.perf_counter()
+                    actions = getattr(output_item, "actions", None)
+                    if actions is not None:
+                        for label in getattr(actions, "emotions", None) or []:
+                            if isinstance(label, str) and label.strip():
+                                turn_emotions.append(label.strip().lower())
                     response_part = await process_agent_output(
                         output=output_item,
                         character_config=context.character_config,
@@ -248,6 +257,20 @@ async def process_single_conversation(
                         "character_event_ms",
                         (time.perf_counter() - event_started) * 1000,
                     )
+                # Reactive life state: same guard as the character observer
+                # (visible normal turns only). Pure + persist, no LLM calls.
+                # The widget picks the result up on conversation-chain-end.
+                reactive = getattr(
+                    context.agent_engine, "observe_reactive_state", None
+                )
+                if callable(reactive):
+                    try:
+                        reactive(turn_emotions)
+                    except Exception as reactive_error:
+                        logger.warning(
+                            "Reactive observation skipped: type={}",
+                            type(reactive_error).__name__,
+                        )
 
         latency.mark("websocket_final_output")
         return full_response  # Return accumulated full_response

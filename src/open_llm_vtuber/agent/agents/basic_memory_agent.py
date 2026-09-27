@@ -72,8 +72,13 @@ from ..relationship_context import (
     normalize_relationship_status,
 )
 from ...world_state import (
+    apply_reactive,
     build_world_state_context,
     load_and_reconcile_world_state,
+    load_world_state,
+    reconcile,
+    save_world_state,
+    utcnow,
 )
 import time
 from ...request_latency import (
@@ -534,6 +539,43 @@ class BasicMemoryAgent(AgentInterface):
         )
         memory_updated = self._observe_character_memory_request(user_text)
         return relationship_updated or memory_updated
+
+    def observe_reactive_state(self, emotion_keys: List[str]) -> bool:
+        """Apply one deterministic reactive transition (no LLM calls).
+
+        ``emotion_keys`` are backend semantic-emotion labels observed on the
+        just-completed visible turn. The state is first lazily reconciled
+        (time), then the reactive step runs on top; a single persist covers
+        both. Fail-soft: never breaks the conversation path.
+        """
+        if not self._character_conf_uid:
+            return False
+        try:
+            moment = utcnow()
+            raw = load_world_state(self._character_conf_uid)
+            reconciled, _ = reconcile(
+                raw, moment, getattr(self, "_user_timezone", None)
+            )
+            updated, changed = apply_reactive(
+                reconciled, emotion_keys or [], moment
+            )
+            if not changed:
+                return False
+            if not save_world_state(self._character_conf_uid, updated):
+                return False
+            logger.info(
+                "Reactive state stats: mood={}, activity={}, energy={}, "
+                "reactive_updated=True",
+                updated.mood,
+                updated.activity,
+                updated.energy,
+            )
+            return True
+        except Exception as error:
+            logger.warning(
+                "Reactive state skipped: type={}", type(error).__name__
+            )
+            return False
 
     async def compact_conversation(self) -> tuple[bool, Optional[str]]:
         """Manually compress the active conversation using the rolling-summary pipeline.

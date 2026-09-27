@@ -21,6 +21,7 @@ from src.open_llm_vtuber.world_state import (
     VALID_ACTIVITIES,
     VALID_LOCATIONS,
     WorldState,
+    apply_reactive,
     build_world_state_context,
     default_state,
     derive_mood,
@@ -983,6 +984,283 @@ class _MarkerLive2D:
 
     def remove_emotion_keywords(self, text):
         return text.replace("[joy]", "").strip()
+
+
+class ReactiveLifeStateTests(unittest.TestCase):
+    """Stage 7.x reactive layer: interaction -> life state (tests A-M)."""
+
+    TZ = "Asia/Jakarta"
+
+    def _now(self):
+        return datetime(2026, 9, 27, 2, 0, tzinfo=timezone.utc)
+
+    def _state(self, activity="reading", energy=65, mood="calm", **over):
+        now = self._now()
+        base = dict(
+            location="room",
+            activity=activity,
+            energy=energy,
+            mood=mood,
+            time_context="night",
+            activity_started_at=now.isoformat(),
+            last_update_at=now.isoformat(),
+            recent_activity_history=[],
+            mood_ttl_turns=0,
+            mood_set_at=None,
+        )
+        base.update(over)
+        return WorldState(**base)
+
+    def test_a_blush_maps_to_shy(self):
+        updated, changed = apply_reactive(self._state(), ["embarrassed"], self._now())
+        self.assertTrue(changed)
+        self.assertEqual(updated.mood, "shy")
+        self.assertEqual(updated.mood_ttl_turns, 3)
+
+    def test_a2_repeated_tease_deepens_to_flustered(self):
+        first, _ = apply_reactive(self._state(), ["embarrassed"], self._now())
+        second, changed = apply_reactive(first, ["embarrassed"], self._now())
+        self.assertTrue(changed)
+        self.assertEqual(second.mood, "flustered")
+
+    def test_b_sad_emotion_maps_to_sad(self):
+        updated, changed = apply_reactive(
+            self._state(mood="content"), ["sadness"], self._now()
+        )
+        self.assertTrue(changed)
+        self.assertEqual(updated.mood, "sad")
+
+    def test_c_angry_emotions_map(self):
+        irritated, _ = apply_reactive(self._state(mood="calm"), ["anger"], self._now())
+        self.assertEqual(irritated.mood, "irritated")
+        angry, _ = apply_reactive(
+            self._state(mood="calm"), ["anger_strong"], self._now()
+        )
+        self.assertEqual(angry.mood, "angry")
+        # Strongest mapped label wins when several arrive together.
+        mixed, _ = apply_reactive(
+            self._state(mood="calm"), ["joy", "anger"], self._now()
+        )
+        self.assertEqual(mixed.mood, "irritated")
+
+    def test_d_neutral_turn_changes_nothing_randomly(self):
+        state = self._state(mood="calm")
+        updated, changed = apply_reactive(state, [], self._now())
+        self.assertFalse(changed)
+        self.assertEqual(updated.mood, "calm")
+        named, changed = apply_reactive(state, ["neutral"], self._now())
+        self.assertFalse(changed)
+        self.assertEqual(named.mood, "calm")
+
+    def test_e_decay_returns_to_baseline_stepwise(self):
+        now = self._now()
+        teased, _ = apply_reactive(self._state(), ["embarrassed"], now)
+        flustered, _ = apply_reactive(teased, ["embarrassed"], now)
+        self.assertEqual(flustered.mood, "flustered")
+        # ttl 3 -> two neutral turns keep flustered; the third exhausts
+        # the ttl and steps one rung down to shy (ttl 2).
+        s = flustered
+        for _ in range(2):
+            s, _ = apply_reactive(s, [], now)
+        self.assertEqual(s.mood, "flustered")
+        s, _ = apply_reactive(s, [], now)
+        self.assertEqual(s.mood, "shy")
+        # Two more neutrals exhaust shy -> baseline derive (reading/63).
+        s, _ = apply_reactive(s, [], now)
+        s, _ = apply_reactive(s, [], now)
+        self.assertEqual(s.mood, "calm")
+        self.assertEqual(s.mood_ttl_turns, 0)
+
+    def test_f_charged_turn_interrupts_light_activity(self):
+        now = self._now()
+        updated, changed = apply_reactive(
+            self._state(activity="reading"), ["embarrassed"], now
+        )
+        self.assertTrue(changed)
+        self.assertEqual(updated.activity, "idle")
+        self.assertEqual(len(updated.recent_activity_history), 1)
+
+    def test_g_quiet_chat_keeps_activity(self):
+        now = self._now()
+        for activity in ("reading", "playing", "eating", "sleeping", "idle"):
+            state = self._state(activity=activity)
+            updated, _ = apply_reactive(state, [], now)
+            self.assertEqual(updated.activity, activity, activity)
+        # Charged turns never break sleep/rest/meals either.
+        for activity in ("sleeping", "resting", "eating"):
+            state = self._state(activity=activity)
+            updated, _ = apply_reactive(state, ["anger"], now)
+            self.assertEqual(updated.activity, activity, activity)
+
+    def test_h_energy_nudge_is_small(self):
+        now = self._now()
+        updated, changed = apply_reactive(
+            self._state(activity="idle", energy=65), ["joy"], now
+        )
+        self.assertTrue(changed)
+        self.assertEqual(updated.energy, 64)
+        # Rest states keep time-rule recovery only: no per-turn delta.
+        rested, _ = apply_reactive(
+            self._state(activity="resting", energy=40), ["joy"], now
+        )
+        self.assertEqual(rested.energy, 40)
+        # Neutral turns never touch energy.
+        calm, changed = apply_reactive(self._state(energy=65), [], now)
+        self.assertFalse(changed)
+        self.assertEqual(calm.energy, 65)
+
+    def test_i_reactive_persists_and_reloads(self):
+        import tempfile
+
+        base_dir = tempfile.mkdtemp()
+        now = self._now()
+        seed = self._state()
+        seed.activity_started_at = now.isoformat()
+        seed.last_update_at = now.isoformat()
+        self.assertTrue(save_world_state("rx", seed, base_dir))
+        raw = load_world_state("rx", now, base_dir)
+        updated, changed = apply_reactive(raw, ["embarrassed"], now)
+        self.assertTrue(changed)
+        self.assertTrue(save_world_state("rx", updated, base_dir))
+        reloaded = load_world_state("rx", now, base_dir)
+        self.assertEqual(reloaded.mood, "shy")
+        self.assertEqual(reloaded.mood_ttl_turns, 3)
+        self.assertEqual(reloaded.activity, "idle")
+
+    def test_j_wall_backstop_clears_stale_reactive_mood(self):
+        now = self._now()
+        teased, _ = apply_reactive(self._state(), ["embarrassed"], now)
+        self.assertEqual(teased.mood, "shy")
+        # 31 minutes later with no turns: backstop returns baseline.
+        later = now + timedelta(minutes=31)
+        cleared, changed = reconcile(teased, later)
+        self.assertTrue(changed)
+        self.assertEqual(cleared.mood_ttl_turns, 0)
+        self.assertNotEqual(cleared.mood, "shy")
+        # But 10 minutes later the reactive mood survives the clock.
+        soon = now + timedelta(minutes=10)
+        kept, _ = reconcile(teased, soon)
+        self.assertEqual(kept.mood, "shy")
+
+    def test_m_fake_clock_spans_still_work(self):
+        seed = self._state(activity="sleeping", energy=10)
+        seed.activity_started_at = "2026-09-20T12:00:00+00:00"
+        seed.last_update_at = "2026-09-20T12:00:00+00:00"
+        seed.mood = "sleepy"
+        for hours, _label in [(0.08, "+5m"), (2, "+2h"), (9, "+9h"), (48, "+2d")]:
+            moment = datetime(2026, 9, 20, 12, 0, tzinfo=timezone.utc) + timedelta(
+                hours=hours
+            )
+            updated, _ = reconcile(seed, moment)
+            self.assertIn(updated.activity, VALID_ACTIVITIES)
+            self.assertGreaterEqual(updated.energy, MIN_ENERGY)
+            self.assertLessEqual(updated.energy, MAX_ENERGY)
+
+
+class ReactiveAgentTests(unittest.IsolatedAsyncioTestCase):
+    """Agent + conversation wiring for the reactive layer (tests K, L)."""
+
+    def setUp(self):
+        self._old_cwd = os.getcwd()
+        self._tmp = tempfile.TemporaryDirectory()
+        os.chdir(self._tmp.name)
+        self.conf_uid = "mili-rx"
+
+    def tearDown(self):
+        os.chdir(self._old_cwd)
+        self._tmp.cleanup()
+
+    def _agent(self, llm, history_uid=None):
+        from src.open_llm_vtuber.agent.agents.basic_memory_agent import (
+            BasicMemoryAgent,
+        )
+        from src.open_llm_vtuber.chat_history_manager import create_new_history
+        from src.open_llm_vtuber.config_manager import TTSPreprocessorConfig
+
+        if history_uid is None:
+            history_uid = create_new_history(self.conf_uid)
+        agent = BasicMemoryAgent(
+            llm=llm,
+            system="persona Mili",
+            live2d_model=_QuietLive2D(),
+            tts_preprocessor_config=TTSPreprocessorConfig(
+                remove_special_char=True,
+                translator_config={
+                    "translate_audio": False,
+                    "translate_provider": "deeplx",
+                },
+            ),
+            context_window_override=8000,
+        )
+        agent.set_memory_from_history(self.conf_uid, history_uid)
+        return agent
+
+    def test_k_reactive_change_isolated_per_character(self):
+        from src.open_llm_vtuber.world_state import utcnow
+
+        other = "mili-rx-other"
+        for conf in (self.conf_uid, other):
+            now = utcnow()
+            save_world_state(
+                conf,
+                WorldState(
+                    location="room",
+                    activity="reading",
+                    energy=65,
+                    mood="calm",
+                    time_context="night",
+                    activity_started_at=now.isoformat(),
+                    last_update_at=now.isoformat(),
+                    recent_activity_history=[],
+                    mood_ttl_turns=0,
+                    mood_set_at=None,
+                ),
+            )
+        agent = self._agent(_SilentLLM())
+        self.assertTrue(agent.observe_reactive_state(["embarrassed"]))
+        self.assertEqual(load_world_state(self.conf_uid).mood, "shy")
+        self.assertEqual(load_world_state(other).mood, "calm")
+
+    def test_k2_observe_needs_character(self):
+        agent = self._agent(_SilentLLM())
+        agent._character_conf_uid = None
+        self.assertFalse(agent.observe_reactive_state(["joy"]))
+
+    async def test_l_reactive_step_adds_no_llm_call(self):
+        from src.open_llm_vtuber.agent.input_types import (
+            BatchInput,
+            TextData,
+            TextSource,
+        )
+        from src.open_llm_vtuber.world_state import utcnow
+
+        now = utcnow()
+        save_world_state(
+            self.conf_uid,
+            WorldState(
+                location="room",
+                activity="reading",
+                energy=65,
+                mood="calm",
+                time_context="night",
+                activity_started_at=now.isoformat(),
+                last_update_at=now.isoformat(),
+                recent_activity_history=[],
+                mood_ttl_turns=0,
+                mood_set_at=None,
+            ),
+        )
+        llm = _SilentLLM()
+        agent = self._agent(llm)
+        async for _ in agent.chat(
+            BatchInput(texts=[TextData(source=TextSource.INPUT, content="hai")])
+        ):
+            pass
+        calls_after_chat = llm.calls
+        self.assertEqual(calls_after_chat, 1)
+        self.assertTrue(agent.observe_reactive_state(["joy"]))
+        self.assertEqual(llm.calls, calls_after_chat)
+        self.assertEqual(load_world_state(self.conf_uid).mood, "happy")
 
 
 if __name__ == "__main__":

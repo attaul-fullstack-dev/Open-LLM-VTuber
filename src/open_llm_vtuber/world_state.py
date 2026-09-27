@@ -24,6 +24,12 @@ Design rules (see Phase 2 scope):
   ``Actions.expressions`` / ``Actions.emotions`` and never bypasses
   ``agent/transformers.py``. Semantic Emotion stays authoritative for
   per-response avatar expression.
+* Reactive layer: backend semantic-emotion labels observed on a completed
+  turn are INPUT to ``apply_reactive`` (pure): mapped labels arm a
+  temporary mood with a turn ttl (shy/flustered ladder included);
+  neutral turns decay it stepwise back to baseline; charged turns may
+  interrupt reading/playing and nudge energy -1. No LLM, no scheduler;
+  ttl also expires on a wall-clock backstop during lazy reconciliation.
 * Clock injection: every public function accepts ``now`` so tests can use a
   fake clock (+5m / +2h / +9h / +2d) without waiting. Default is real
   server-side wall-clock time (UTC, matching ``character_state``).
@@ -80,7 +86,21 @@ WORLD_STATE_DIR = "world_state"
 
 VALID_LOCATIONS = ("room", "kitchen", "outside")
 VALID_ACTIVITIES = ("idle", "resting", "reading", "eating", "playing", "sleeping")
-VALID_MOODS = ("calm", "content", "tired", "sleepy", "exhausted")
+# Baseline moods come from derive_mood; reactive moods are set only by
+# apply_reactive from backend semantic-emotion labels (never by the clock).
+VALID_MOODS = (
+    "calm",
+    "content",
+    "tired",
+    "sleepy",
+    "exhausted",
+    "happy",
+    "sad",
+    "shy",
+    "flustered",
+    "irritated",
+    "angry",
+)
 
 DEFAULT_LOCATION = "room"
 DEFAULT_ACTIVITY = "idle"
@@ -116,6 +136,47 @@ NIGHT_START_HOUR = 22
 NIGHT_END_HOUR = 5
 DAY_OUTSIDE_START_HOUR = 6
 DAY_OUTSIDE_END_HOUR = 18
+
+# ---------------------------------------------------------------------------
+# Reactive layer (interaction -> life state). Deterministic, event-driven,
+# no LLM. Backend semantic-emotion labels (Live2D emo_map keys, lowercased)
+# act as INPUT; World mood stays a separate persistent field.
+# ---------------------------------------------------------------------------
+
+# Backend emotion label -> (reactive mood, ttl in visible turns).
+EMOTION_MOOD_MAP: Dict[str, tuple] = {
+    "anger_strong": ("angry", 3),
+    "anger": ("irritated", 3),
+    "sadness": ("sad", 3),
+    "embarrassed": ("shy", 3),
+    "joy": ("happy", 2),
+}
+
+# Priority when one turn carries several labels (first hit wins).
+EMOTION_PRIORITY = ("anger_strong", "anger", "sadness", "embarrassed", "joy")
+
+# Labels that mean "no emotional charge" for decay purposes.
+NEUTRAL_EMOTION_LABELS = frozenset({"neutral", ""})
+
+# One rung down per exhausted ttl: (next mood or None=baseline, next ttl).
+# flustered -> shy -> baseline; angry -> irritated -> baseline.
+DECAY_NEXT: Dict[str, tuple] = {
+    "flustered": ("shy", 2),
+    "angry": ("irritated", 2),
+}
+
+# Wall-clock backstop: a reactive mood older than this with no new turns
+# falls back to baseline on the next lazy reconcile (no scheduler).
+REACTIVE_MOOD_MAX_AGE_S = 30 * 60
+
+# Charged interaction interrupts only light activities; sleep/rest/meals
+# are never broken by chatting (continuity first).
+REACTIVE_INTERRUPT_ACTIVITIES = frozenset({"reading", "playing"})
+
+# Per-turn energy nudge applies only outside rest states (their time
+# rules own recovery); small by design, never a 65 -> 50 drop.
+REACTIVE_ENERGY_ACTIVITIES = frozenset({"idle", "reading", "playing"})
+REACTIVE_ENERGY_DELTA = -1
 
 _state_locks: Dict[str, threading.RLock] = {}
 _state_locks_guard = threading.Lock()
@@ -227,6 +288,10 @@ class WorldState:
     activity_started_at: Optional[str] = None
     last_update_at: Optional[str] = None
     recent_activity_history: List[Dict[str, Any]] = field(default_factory=list)
+    # Reactive layer: remaining visible turns for a reactive mood (0 means
+    # the mood is baseline-derived), plus when it was set (wall backstop).
+    mood_ttl_turns: int = 0
+    mood_set_at: Optional[str] = None
 
 
 def normalize_location(value: Any) -> str:
@@ -360,6 +425,8 @@ def transition(
         recent_activity_history=[
             dict(item) for item in (state.recent_activity_history or [])
         ],
+        mood_ttl_turns=max(0, int(getattr(state, "mood_ttl_turns", 0) or 0)),
+        mood_set_at=getattr(state, "mood_set_at", None),
     )
 
     # Energy drifts linearly with elapsed time at the activity rate.
@@ -392,7 +459,21 @@ def transition(
         new_activity = "resting"
 
     new_location = location_for(new_activity, moment, current.location, tz)
-    new_mood = derive_mood(new_activity, new_energy)
+    # Reactive moods survive the clock: only the wall backstop (stale
+    # reactive mood) or an exhausted ttl handled elsewhere clears them.
+    # Baseline derivation applies when no reactive mood is armed.
+    new_mood = current.mood
+    new_ttl = current.mood_ttl_turns
+    new_mood_set_at = current.mood_set_at
+    if new_ttl > 0:
+        age_s = (moment - _parse_iso(current.mood_set_at, moment)).total_seconds()
+        if current.mood_set_at is None or age_s > REACTIVE_MOOD_MAX_AGE_S:
+            new_mood = derive_mood(new_activity, new_energy)
+            new_ttl = 0
+            new_mood_set_at = None
+    else:
+        new_mood = derive_mood(new_activity, new_energy)
+        new_mood_set_at = None
     new_time_context = derive_time_context(moment, tz)
 
     activity_changed = new_activity != current.activity
@@ -418,6 +499,8 @@ def transition(
         ),
         last_update_at=current.last_update_at,
         recent_activity_history=history,
+        mood_ttl_turns=new_ttl,
+        mood_set_at=new_mood_set_at,
     )
     return updated, activity_changed
 
@@ -461,6 +544,8 @@ def reconcile(
         recent_activity_history=[
             dict(item) for item in (state.recent_activity_history or [])
         ],
+        mood_ttl_turns=max(0, int(getattr(state, "mood_ttl_turns", 0) or 0)),
+        mood_set_at=getattr(state, "mood_set_at", None),
     )
     last = _parse_iso(baseline.last_update_at, moment)
     if moment < last:
@@ -478,6 +563,8 @@ def reconcile(
         or updated.time_context != baseline.time_context
         or updated.activity_started_at != baseline.activity_started_at
         or updated.recent_activity_history != baseline.recent_activity_history
+        or updated.mood_ttl_turns != baseline.mood_ttl_turns
+        or updated.mood_set_at != baseline.mood_set_at
     )
     if not changed:
         # No material difference: keep the old baseline (including
@@ -492,6 +579,140 @@ def reconcile(
 # The store keeps HISTORY_CAP; the prompt carries only the latest few so
 # the model gets continuity ("tadi ngapain") without a giant history block.
 CONTEXT_RECENT_LIFE_LIMIT = 2
+
+
+def _normalize_emotion_label(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def apply_reactive(
+    state: WorldState, emotion_keys: List[str], now: datetime
+) -> Tuple[WorldState, bool]:
+    """Apply one deterministic interaction-driven transition (pure, no I/O).
+
+    ``emotion_keys`` are backend semantic-emotion labels observed on the
+    just-completed turn (e.g. ``["joy"]``). They are INPUT only: the
+    semantic-emotion pipeline is untouched, and no new emotion system is
+    created here.
+
+    Rules (all deterministic, strongest mapped label wins):
+    - mapped label -> reactive mood (+shy ladder: embarrassed while shy
+      deepens to flustered), ttl armed, mood_set_at = now;
+    - no mapped label but ttl armed -> ttl decays one turn; at zero, step
+      one DECAY_NEXT rung (flustered->shy, angry->irritated) or fall back
+      to baseline derive_mood;
+    - neutral/empty turn with no armed ttl -> no change at all;
+    - charged turn (any non-neutral label): reading/playing -> idle
+      (sleep/rest/meals are never interrupted by chatting);
+    - charged turn: energy -1 while previously idle/reading/playing
+      (rest states keep their time-rule recovery only).
+
+    Returns ``(new_state, changed)``. Callers persist when changed.
+    """
+    moment = _ensure_aware(now)
+    labels = [_normalize_emotion_label(k) for k in (emotion_keys or [])]
+    labels = [label for label in labels if label]
+
+    mapped: Optional[str] = None
+    for candidate in EMOTION_PRIORITY:
+        if candidate in labels:
+            mapped = candidate
+            break
+    charged = mapped is not None or any(
+        label not in NEUTRAL_EMOTION_LABELS for label in labels
+    )
+
+    current = WorldState(
+        location=normalize_location(state.location),
+        activity=normalize_activity(state.activity),
+        energy=clamp_energy(state.energy),
+        mood=normalize_mood(state.mood),
+        time_context=state.time_context,
+        activity_started_at=state.activity_started_at,
+        last_update_at=state.last_update_at,
+        recent_activity_history=[
+            dict(item) for item in (state.recent_activity_history or [])
+        ],
+        mood_ttl_turns=max(0, int(getattr(state, "mood_ttl_turns", 0) or 0)),
+        mood_set_at=getattr(state, "mood_set_at", None),
+    )
+
+    new_mood = current.mood
+    new_ttl = current.mood_ttl_turns
+    new_mood_set_at = current.mood_set_at
+    mood_touched = False
+
+    if mapped is not None:
+        target, ttl = EMOTION_MOOD_MAP[mapped]
+        if mapped == "embarrassed" and current.mood == "shy":
+            target, ttl = "flustered", 3
+        elif mapped == "embarrassed" and current.mood == "flustered":
+            target, ttl = "flustered", 3
+        new_mood, new_ttl = target, ttl
+        new_mood_set_at = _to_iso(moment)
+        mood_touched = True
+    elif new_ttl > 0:
+        new_ttl -= 1
+        mood_touched = True
+        if new_ttl <= 0:
+            step = DECAY_NEXT.get(current.mood)
+            if step is not None:
+                new_mood, new_ttl = step
+                new_mood_set_at = _to_iso(moment)
+            else:
+                new_mood = derive_mood(current.activity, current.energy)
+                new_ttl = 0
+                new_mood_set_at = None
+
+    new_activity = current.activity
+    activity_changed = False
+    if charged and current.activity in REACTIVE_INTERRUPT_ACTIVITIES:
+        new_activity = "idle"
+        activity_changed = True
+
+    new_energy = current.energy
+    if charged and current.activity in REACTIVE_ENERGY_ACTIVITIES:
+        new_energy = clamp_energy(current.energy + REACTIVE_ENERGY_DELTA)
+
+    history = list(current.recent_activity_history)
+    if activity_changed:
+        history = [
+            *history,
+            {
+                "from": current.activity,
+                "to": new_activity,
+                "at": _to_iso(moment),
+                "location": location_for(new_activity, moment, current.location),
+            },
+        ][-HISTORY_CAP:]
+
+    changed = (
+        mood_touched
+        or activity_changed
+        or new_energy != current.energy
+        or history != current.recent_activity_history
+    )
+    if not changed:
+        return current, False
+    return (
+        WorldState(
+            location=location_for(new_activity, moment, current.location)
+            if activity_changed
+            else current.location,
+            activity=new_activity,
+            energy=new_energy,
+            mood=new_mood,
+            time_context=current.time_context,
+            activity_started_at=(
+                _to_iso(moment) if activity_changed else current.activity_started_at
+            ),
+            last_update_at=_to_iso(moment),
+            recent_activity_history=history,
+            mood_ttl_turns=new_ttl,
+            mood_set_at=new_mood_set_at,
+        ),
+        True,
+    )
 
 
 def build_world_state_context(state: WorldState) -> str:
@@ -545,6 +766,8 @@ def _state_to_dict(state: WorldState) -> Dict[str, Any]:
         "recent_activity_history": list(state.recent_activity_history or [])[
             -HISTORY_CAP:
         ],
+        "mood_ttl_turns": max(0, int(getattr(state, "mood_ttl_turns", 0) or 0)),
+        "mood_set_at": getattr(state, "mood_set_at", None),
     }
 
 
@@ -568,6 +791,14 @@ def _state_from_dict(data: Any, now: datetime, tz: Optional[str] = None) -> Worl
                     ),
                 }
             )
+    try:
+        ttl_raw = data.get("mood_ttl_turns", 0)
+        ttl = max(0, int(ttl_raw or 0))
+    except (TypeError, ValueError):
+        ttl = 0
+    mood_set_at = data.get("mood_set_at")
+    if mood_set_at is not None:
+        mood_set_at = str(mood_set_at)
     return WorldState(
         location=normalize_location(data.get("location", fallback.location)),
         activity=normalize_activity(data.get("activity", fallback.activity)),
@@ -580,6 +811,8 @@ def _state_from_dict(data: Any, now: datetime, tz: Optional[str] = None) -> Worl
         or fallback.activity_started_at,
         last_update_at=data.get("last_update_at") or fallback.last_update_at,
         recent_activity_history=history,
+        mood_ttl_turns=ttl,
+        mood_set_at=mood_set_at,
     )
 
 
