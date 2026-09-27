@@ -393,8 +393,12 @@ class EmotionIsolationTests(unittest.IsolatedAsyncioTestCase):
             def remove_emotion_keywords(self, text):
                 return text.replace("[joy]", "").strip()
 
-        # Force a mood far from joy: sleepy/exhausted world.
-        save_world_state(self.conf_uid, state_at("sleeping", energy=5, at=noon()))
+        # Force a mood far from joy: sleepy/exhausted world. Seed at the
+        # real current time (not a fixed clock) so the sleeping activity
+        # cannot expire between seeding and the agent's lazy reconcile.
+        from src.open_llm_vtuber.world_state import utcnow
+
+        save_world_state(self.conf_uid, state_at("sleeping", energy=5, at=utcnow()))
         history_uid = create_new_history(self.conf_uid)
         llm = _CountingLLM()
         agent = BasicMemoryAgent(
@@ -691,9 +695,7 @@ class FetchReconcileEnergyTests(unittest.TestCase):
         self.assertEqual(updated.energy, 79)
         self.assertEqual(updated.activity, "idle")
         # Persisted baseline advanced to the material change.
-        reloaded = load_world_state(
-            "mili", base + timedelta(minutes=36), self.base_dir
-        )
+        reloaded = load_world_state("mili", base + timedelta(minutes=36), self.base_dir)
         self.assertEqual(reloaded.energy, 79)
 
     def test_frequent_refresh_no_longer_freezes_energy(self):
