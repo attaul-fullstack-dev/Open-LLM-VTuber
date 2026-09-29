@@ -16,7 +16,11 @@ budgets alike.
 
 from __future__ import annotations
 
-from typing import List, Optional
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from .world_state import user_local_datetime
 
 # Token budget for the rendered SELF block (measured with the repo's
 # byte//3 estimator; typical full renders stay well under it).
@@ -60,6 +64,142 @@ SELF_USAGE_RULE = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Preference derivation (Phase 2A): READ-ONLY aggregate over persisted
+# evidence. No store, no LLM, no generation.
+#
+# Evidence (all persisted, UTC, reload-safe):
+# - world recent_activity_history entries: {from, to, at, location, by?}
+# - long-term memories: {text, added_at, explicit}
+# A preference is ESTABLISHED only with >=3 evidence items spread over
+# >=2 distinct calendar days (user tz when given): a single mention or a
+# single-session burst never qualifies. Day labels are always derived at
+# render/query time; nothing relative is ever stored.
+# ---------------------------------------------------------------------------
+
+# Deterministic activity keyword stems (Indonesian + English, substring
+# match on lowered text: "main" also matches "bermain"/"mainan").
+PREFERENCE_ACTIVITY_KEYWORDS = {
+    "reading": ("baca", "read", "buku", "book", "novel", "komik", "cerita"),
+    "playing": ("main", "play", "game", "gim"),
+    "eating": ("makan", "eat", "bakso", "snack", "jajan", "minum", "kopi"),
+    "sleeping": ("tidur", "sleep", "bobok"),
+    "resting": ("istirahat", "rest", "rebahan"),
+}
+
+# idle is not a preference; everything else valid may qualify.
+PREFERENCE_ELIGIBLE_ACTIVITIES = tuple(a for a in PREFERENCE_ACTIVITY_KEYWORDS)
+
+PREFERENCE_MIN_EVIDENCE = 3
+PREFERENCE_MIN_DAYS = 2
+# Cap rendered preference items so the SELF block stays compact.
+PREFERENCE_RENDER_LIMIT = 2
+
+
+@dataclass(frozen=True)
+class PreferenceCandidate:
+    """One derived activity preference (data only, never stored)."""
+
+    activity: str
+    evidence_count: int
+    distinct_days: int
+    first_at: str
+    last_at: str
+    established: bool
+
+
+def _memory_activity(text: Any) -> Optional[str]:
+    lowered = str(text or "").lower()
+    if not lowered.strip():
+        return None
+    for activity in PREFERENCE_ELIGIBLE_ACTIVITIES:
+        for stem in PREFERENCE_ACTIVITY_KEYWORDS[activity]:
+            if stem in lowered:
+                return activity
+    return None
+
+
+def _local_day(iso_value: Any, tz: Optional[str]) -> Optional[Tuple[Any, str]]:
+    """(user-local date, original string) or None when unparseable."""
+    try:
+        parsed = datetime.fromisoformat(str(iso_value))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    local = user_local_datetime(parsed, tz)
+    return local.date(), str(iso_value)
+
+
+def derive_activity_preferences(
+    world_history: Optional[Sequence[Dict[str, Any]]] = None,
+    memories: Optional[Sequence[Dict[str, Any]]] = None,
+    *,
+    tz: Optional[str] = None,
+) -> List[PreferenceCandidate]:
+    """Aggregate persisted evidence into preference candidates (pure).
+
+    Reads world activity history + long-term memories only; writes
+    nothing, calls no LLM. Deterministic: sorted by (-evidence, activity).
+    Unparseable timestamps are skipped (evidence must stay traceable).
+    """
+    dated: Dict[str, List[Tuple[Any, str]]] = {}
+    for entry in world_history or []:
+        if not isinstance(entry, dict):
+            continue
+        activity = str(entry.get("to", "")).strip().lower()
+        if activity not in PREFERENCE_ELIGIBLE_ACTIVITIES:
+            continue
+        day = _local_day(entry.get("at"), tz)
+        if day is None:
+            continue
+        dated.setdefault(activity, []).append(day)
+    for memo in memories or []:
+        if not isinstance(memo, dict):
+            continue
+        activity = _memory_activity(memo.get("text"))
+        if activity is None:
+            continue
+        day = _local_day(memo.get("added_at"), tz)
+        if day is None:
+            continue
+        dated.setdefault(activity, []).append(day)
+    candidates = []
+    for activity, hits in dated.items():
+        days = {day for day, _ in hits}
+        ordered = sorted(hits, key=lambda h: (str(h[0]), h[1]))
+        count = len(hits)
+        candidates.append(
+            PreferenceCandidate(
+                activity=activity,
+                evidence_count=count,
+                distinct_days=len(days),
+                first_at=ordered[0][1],
+                last_at=ordered[-1][1],
+                established=(
+                    count >= PREFERENCE_MIN_EVIDENCE
+                    and len(days) >= PREFERENCE_MIN_DAYS
+                ),
+            )
+        )
+    candidates.sort(key=lambda c: (-c.evidence_count, c.activity))
+    return candidates
+
+
+def format_preference_line(
+    candidates: Sequence[PreferenceCandidate],
+    *,
+    limit: int = PREFERENCE_RENDER_LIMIT,
+) -> str:
+    """Compact render of established preferences only (pure)."""
+    shown = [c for c in candidates if c.established][: max(0, limit)]
+    if not shown:
+        return ""
+    items = ", ".join(f"{c.activity} (evidence: {c.evidence_count})" for c in shown)
+    noun = "preference" if len(shown) == 1 else "preferences"
+    return f"Emerging {noun}: {items}."
+
+
 def build_self_context(
     *,
     character_name: str = SELF_IDENTITY_NAME,
@@ -69,13 +209,17 @@ def build_self_context(
     location: Optional[str] = None,
     relationship_status: Optional[str] = None,
     memory_count: int = 0,
+    preferences: Sequence[PreferenceCandidate] = (),
     max_tokens: int = SELF_CONTEXT_MAX_TOKENS,
 ) -> str:
     """Assemble the compact SELF block for the system prompt (pure).
 
     All live arguments are read-only references rendered at call time;
-    nothing is stored here. Output stays under ``max_tokens``; overlong
-    seed lists are truncated, never the identity/boundary lines.
+    nothing is stored here. ``preferences`` is opt-in (default empty
+    renders byte-identical output); the agent does not pass it yet, so
+    the live prompt is unchanged in this phase. Output stays under
+    ``max_tokens``; overlong seed lists are truncated, never the
+    identity/boundary lines.
     """
     name = (character_name or SELF_IDENTITY_NAME).strip() or SELF_IDENTITY_NAME
     if live2d_model_name:
@@ -108,6 +252,9 @@ def build_self_context(
         + "."
     )
     lines.append("- Tendencies: " + "; ".join(SELF_SEED_TENDENCIES) + ".")
+    preference_line = format_preference_line(preferences)
+    if preference_line:
+        lines.append(f"- {preference_line}")
     lines.append(f"- {SELF_USAGE_RULE}")
     kept: List[str] = []
     used = 0
