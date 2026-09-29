@@ -94,6 +94,7 @@ def load_character_state(conf_uid: str) -> CharacterState:
                 "text": str(item.get("text", "")).strip(),
                 "added_at": str(item.get("added_at", "")),
                 "explicit": bool(item.get("explicit", False)),
+                "kind": str(item.get("kind", "") or ""),
             }
             for item in data.get("memories", [])
             if isinstance(item, dict) and str(item.get("text", "")).strip()
@@ -240,6 +241,7 @@ def add_character_memory(
     text: str,
     *,
     explicit: bool = True,
+    kind: str = "",
 ) -> Optional[CharacterState]:
     """Append one long-term fact (deduplicated); None on write failure."""
     cleaned = " ".join((text or "").split()).strip()
@@ -257,6 +259,7 @@ def add_character_memory(
             "text": cleaned,
             "added_at": _now_iso(),
             "explicit": bool(explicit),
+            "kind": str(kind or ""),
         }
     )
     if not save_character_state(conf_uid, state):

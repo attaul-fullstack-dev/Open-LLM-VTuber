@@ -456,14 +456,14 @@ class BasicMemoryAgent(AgentInterface):
         """Reset Mili's relationship for every conversation (character-level)."""
         return self.set_relationship_status("stranger", trigger="manual_reset")
 
-    def add_character_memory(self, text: str, *, explicit: bool = True) -> bool:
+    def add_character_memory(self, text: str, *, explicit: bool = True, kind: str = "") -> bool:
         """Persist one long-term fact shared across all chats."""
         if not self._character_conf_uid:
             logger.warning("Character memory update skipped: no active character")
             return False
         save_started = time.perf_counter()
         state = persist_character_memory(
-            self._character_conf_uid, text, explicit=explicit
+            self._character_conf_uid, text, explicit=explicit, kind=kind
         )
         tracker = get_latency_tracker()
         if tracker:
