@@ -79,7 +79,9 @@ async def process_single_conversation(
         try:
             conf_uid = getattr(context.character_config, "conf_uid", None)
             if conf_uid:
-                load_and_reconcile_world_state(conf_uid)
+                load_and_reconcile_world_state(
+                    conf_uid, tz=getattr(context, "user_timezone", None)
+                )
         except Exception as error:
             logger.warning(
                 "World state reconcile skipped: type={}", type(error).__name__
@@ -125,6 +127,10 @@ async def process_single_conversation(
                 logger.info(f"With {len(images)} images")
 
         latency.mark("agent_start")
+        # Backend semantic-emotion labels observed this turn. Collected for
+        # the reactive life-state step after the stream (group chats skip
+        # reactive observation in v1).
+        turn_emotions: List[str] = []
         try:
             if proactive:
                 proactive_chat = getattr(context.agent_engine, "chat_proactively", None)
@@ -155,6 +161,11 @@ async def process_single_conversation(
                 elif isinstance(output_item, (SentenceOutput, AudioOutput)):
                     # Handle SentenceOutput or AudioOutput
                     tts_started = time.perf_counter()
+                    actions = getattr(output_item, "actions", None)
+                    if actions is not None:
+                        for label in getattr(actions, "emotions", None) or []:
+                            if isinstance(label, str) and label.strip():
+                                turn_emotions.append(label.strip().lower())
                     response_part = await process_agent_output(
                         output=output_item,
                         character_config=context.character_config,
@@ -198,6 +209,22 @@ async def process_single_conversation(
             # full_response will contain partial response before error
         latency.mark("agent_end")
         # --- End processing agent response ---
+
+        # Reactive life state BEFORE finalize: the widget auto-fetches on
+        # conversation-chain-end, so the reactive persist must already be
+        # done when chain-end is emitted. Same guard as the character
+        # observer below (visible normal turns with a real response only).
+        # Pure + persist, no LLM calls.
+        if context.history_uid and full_response and not skip_history and not proactive:
+            reactive = getattr(context.agent_engine, "observe_reactive_state", None)
+            if callable(reactive):
+                try:
+                    reactive(turn_emotions)
+                except Exception as reactive_error:
+                    logger.warning(
+                        "Reactive observation skipped: type={}",
+                        type(reactive_error).__name__,
+                    )
 
         # Wait for any pending TTS tasks
         if tts_manager.task_list:

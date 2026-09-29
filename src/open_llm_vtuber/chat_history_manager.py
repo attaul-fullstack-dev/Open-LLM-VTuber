@@ -3,7 +3,7 @@ import re
 import json
 import uuid
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Literal, List, TypedDict, Optional
 from loguru import logger
 
@@ -89,7 +89,9 @@ def create_new_history(conf_uid: str) -> str:
 
     # Use uuid.uuid4().hex to generate a UUID without hyphens
     # New format: UUID_YYYY-MM-DD_HH-MM-SS
-    history_uid = f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{uuid.uuid4().hex}"
+    # Canonical persisted timestamps are tz-aware UTC. Existing naive
+    # records keep sorting/parsing fine (same ISO prefix, no parser).
+    history_uid = f"{datetime.now(timezone.utc).strftime('%Y-%m-%d_%H-%M-%S')}_{uuid.uuid4().hex}"
     conf_dir = _ensure_conf_dir(conf_uid)  # conf_uid is sanitized here
 
     # Create history file with empty metadata
@@ -98,7 +100,7 @@ def create_new_history(conf_uid: str) -> str:
         initial_data = [
             {
                 "role": "metadata",
-                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "relationship_status": "stranger",
                 "relationship_reason": "default",
             }
@@ -152,7 +154,7 @@ def store_message(
                 logger.error(f"Failed to load history file: {filepath}")
                 pass
 
-        now_str = datetime.now().isoformat(timespec="seconds")
+        now_str = datetime.now(timezone.utc).isoformat(timespec="seconds")
         new_item = {
             "role": role,
             "timestamp": now_str,
@@ -216,7 +218,7 @@ def update_metadate(conf_uid: str, history_uid: str, metadata: dict) -> bool:
                 # Create new metadata with timestamp if none exists
                 new_metadata = {
                     "role": "metadata",
-                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 }
                 new_metadata.update(metadata)  # Add new fields
                 history_data.insert(0, new_metadata)
@@ -270,7 +272,7 @@ def update_summary_metadata(
             if metadata is None:
                 metadata = {
                     "role": "metadata",
-                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 }
                 history_data.insert(0, metadata)
             metadata.update(

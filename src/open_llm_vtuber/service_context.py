@@ -110,6 +110,11 @@ class ServiceContext:
         # response lifecycle.
         self.voice_output_enabled: bool = True
 
+        # IANA timezone name reported by the frontend session (e.g.
+        # "Asia/Jakarta"), used for user-local World State time rules.
+        # None means unknown -> server-side UTC fallback.
+        self.user_timezone: str | None = None
+
     def __str__(self):
         return (
             f"ServiceContext:\n"

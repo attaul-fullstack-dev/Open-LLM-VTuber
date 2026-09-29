@@ -24,9 +24,19 @@ Design rules (see Phase 2 scope):
   ``Actions.expressions`` / ``Actions.emotions`` and never bypasses
   ``agent/transformers.py``. Semantic Emotion stays authoritative for
   per-response avatar expression.
+* Reactive layer: backend semantic-emotion labels observed on a completed
+  turn are INPUT to ``apply_reactive`` (pure): mapped labels arm a
+  temporary mood with a turn ttl (shy/flustered ladder included);
+  neutral turns decay it stepwise back to baseline; charged turns may
+  interrupt reading/playing and nudge energy -1. No LLM, no scheduler;
+  ttl also expires on a wall-clock backstop during lazy reconciliation.
 * Clock injection: every public function accepts ``now`` so tests can use a
   fake clock (+5m / +2h / +9h / +2d) without waiting. Default is real
   server-side wall-clock time (UTC, matching ``character_state``).
+* User timezone: pure functions accept an optional ``tz`` IANA name. Hour
+  derivation (time_context, night rules, playing location) then uses the
+  user-local hour; persisted timestamps always stay canonical UTC.
+  ``tz=None`` (or unknown) keeps the original server-UTC behavior.
 
 Initial transition model (intentionally small, documented here):
 
@@ -61,6 +71,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from loguru import logger
 
@@ -75,7 +86,21 @@ WORLD_STATE_DIR = "world_state"
 
 VALID_LOCATIONS = ("room", "kitchen", "outside")
 VALID_ACTIVITIES = ("idle", "resting", "reading", "eating", "playing", "sleeping")
-VALID_MOODS = ("calm", "content", "tired", "sleepy", "exhausted")
+# Baseline moods come from derive_mood; reactive moods are set only by
+# apply_reactive from backend semantic-emotion labels (never by the clock).
+VALID_MOODS = (
+    "calm",
+    "content",
+    "tired",
+    "sleepy",
+    "exhausted",
+    "happy",
+    "sad",
+    "shy",
+    "flustered",
+    "irritated",
+    "angry",
+)
 
 DEFAULT_LOCATION = "room"
 DEFAULT_ACTIVITY = "idle"
@@ -112,8 +137,52 @@ NIGHT_END_HOUR = 5
 DAY_OUTSIDE_START_HOUR = 6
 DAY_OUTSIDE_END_HOUR = 18
 
+# ---------------------------------------------------------------------------
+# Reactive layer (interaction -> life state). Deterministic, event-driven,
+# no LLM. Backend semantic-emotion labels (Live2D emo_map keys, lowercased)
+# act as INPUT; World mood stays a separate persistent field.
+# ---------------------------------------------------------------------------
+
+# Backend emotion label -> (reactive mood, ttl in visible turns).
+EMOTION_MOOD_MAP: Dict[str, tuple] = {
+    "anger_strong": ("angry", 3),
+    "anger": ("irritated", 3),
+    "sadness": ("sad", 3),
+    "embarrassed": ("shy", 3),
+    "joy": ("happy", 2),
+}
+
+# Priority when one turn carries several labels (first hit wins).
+EMOTION_PRIORITY = ("anger_strong", "anger", "sadness", "embarrassed", "joy")
+
+# Labels that mean "no emotional charge" for decay purposes.
+NEUTRAL_EMOTION_LABELS = frozenset({"neutral", ""})
+
+# One rung down per exhausted ttl: (next mood or None=baseline, next ttl).
+# flustered -> shy -> baseline; angry -> irritated -> baseline.
+DECAY_NEXT: Dict[str, tuple] = {
+    "flustered": ("shy", 2),
+    "angry": ("irritated", 2),
+}
+
+# Wall-clock backstop: a reactive mood older than this with no new turns
+# falls back to baseline on the next lazy reconcile (no scheduler).
+REACTIVE_MOOD_MAX_AGE_S = 30 * 60
+
+# Charged interaction interrupts only light activities; sleep/rest/meals
+# are never broken by chatting (continuity first).
+REACTIVE_INTERRUPT_ACTIVITIES = frozenset({"reading", "playing"})
+
+# Per-turn energy nudge applies only outside rest states (their time
+# rules own recovery); small by design, never a 65 -> 50 drop.
+REACTIVE_ENERGY_ACTIVITIES = frozenset({"idle", "reading", "playing"})
+REACTIVE_ENERGY_DELTA = -1
+
 _state_locks: Dict[str, threading.RLock] = {}
 _state_locks_guard = threading.Lock()
+
+_TZ_CACHE: Dict[str, Optional[ZoneInfo]] = {}
+_TZ_WARNED: set = set()
 
 
 def _get_state_lock(filepath: str) -> threading.RLock:
@@ -160,6 +229,48 @@ def _to_iso(value: datetime) -> str:
     return _ensure_aware(value).isoformat(timespec="seconds")
 
 
+def resolve_tz(tz: Optional[str]) -> Optional[ZoneInfo]:
+    """Return a ZoneInfo for a user/session timezone name, or None.
+
+    ``None`` (or blank/invalid) means "no user timezone known" and callers
+    fall back to server-side UTC, preserving pre-timezone behavior.
+    Persistence always stays canonical UTC; only hour derivation converts.
+    Results (including misses) are cached so an unknown name warns once.
+    """
+    name = str(tz or "").strip()
+    if not name:
+        return None
+    if name in _TZ_CACHE:
+        return _TZ_CACHE[name]
+    try:
+        zone: Optional[ZoneInfo] = ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        zone = None
+        if name not in _TZ_WARNED:
+            _TZ_WARNED.add(name)
+            logger.warning(
+                "Unknown user timezone, falling back to UTC: tz={}", name[:64]
+            )
+    _TZ_CACHE[name] = zone
+    return zone
+
+
+def local_hour(moment: datetime, tz: Optional[str]) -> int:
+    """Wall-clock hour of ``moment`` in the user timezone (pure)."""
+    aware = _ensure_aware(moment)
+    zone = resolve_tz(tz)
+    if zone is None:
+        return aware.hour
+    try:
+        return aware.astimezone(zone).hour
+    except Exception as error:
+        logger.warning(
+            "Timezone conversion failed, using UTC hour: type={}",
+            type(error).__name__,
+        )
+        return aware.hour
+
+
 # ---------------------------------------------------------------------------
 # State shape
 # ---------------------------------------------------------------------------
@@ -177,6 +288,10 @@ class WorldState:
     activity_started_at: Optional[str] = None
     last_update_at: Optional[str] = None
     recent_activity_history: List[Dict[str, Any]] = field(default_factory=list)
+    # Reactive layer: remaining visible turns for a reactive mood (0 means
+    # the mood is baseline-derived), plus when it was set (wall backstop).
+    mood_ttl_turns: int = 0
+    mood_set_at: Optional[str] = None
 
 
 def normalize_location(value: Any) -> str:
@@ -207,9 +322,13 @@ def clamp_energy(value: Any) -> int:
 # ---------------------------------------------------------------------------
 
 
-def derive_time_context(moment: datetime) -> str:
-    """Map wall-clock hour to a coarse time context (pure)."""
-    hour = _ensure_aware(moment).hour
+def derive_time_context(moment: datetime, tz: Optional[str] = None) -> str:
+    """Map wall-clock hour to a coarse time context (pure).
+
+    The hour is taken in the user/session timezone when ``tz`` (IANA name)
+    is provided, otherwise server-side UTC. Buckets are unchanged.
+    """
+    hour = local_hour(moment, tz)
     if hour >= NIGHT_START_HOUR or hour < NIGHT_END_HOUR:
         return "night"
     if hour < 11:
@@ -232,25 +351,123 @@ def derive_mood(activity: str, energy: int) -> str:
     return "exhausted"
 
 
-def location_for(activity: str, moment: datetime, current_location: str) -> str:
+# Temporal anchoring for the LLM context (pure display helpers).
+# These do NOT change transition/reconciliation logic; they only render
+# the existing UTC clock and stored timestamps in the user/session
+# timezone so relative words ("today", "yesterday") stay truthful.
+# ---------------------------------------------------------------------------
+
+
+def user_local_datetime(
+    moment: Optional[datetime] = None, tz: Optional[str] = None
+) -> datetime:
+    """Return ``moment`` (default real clock) in the user timezone (pure).
+
+    Falls back to UTC when ``tz`` is missing or invalid. Naive inputs are
+    read as UTC, matching the persistence convention.
+    """
+    aware = _ensure_aware(moment if moment is not None else utcnow())
+    zone = resolve_tz(tz)
+    return aware.astimezone(zone) if zone is not None else aware
+
+
+def format_temporal_anchor(
+    moment: Optional[datetime] = None, tz: Optional[str] = None
+) -> str:
+    """Compact "today + now" anchor for the system prompt (pure).
+
+    Gives the LLM a reliable current-date/weekday/clock-time/timezone
+    reference, rebuilt at every request from the runtime system clock, so
+    "what time is it" is answered from real time, never guessed or stale.
+    """
+    local = user_local_datetime(moment, tz)
+    date_str = f"{local:%B} {local.day}, {local.year}"
+    weekday = f"{local:%A}"
+    clock_str = f"{local:%H:%M}"
+    zone = resolve_tz(tz)
+    tz_label = tz if zone is not None else "UTC"
+    return (
+        f"Current date: {date_str} ({weekday})\n"
+        f"Current time: {clock_str}\n"
+        f"Timezone: {tz_label}"
+    )
+
+
+def relative_day_parts(
+    added_at: Any,
+    moment: Optional[datetime] = None,
+    tz: Optional[str] = None,
+) -> Optional[Tuple[str, str]]:
+    """(label, date) age of a stored ISO timestamp in the user timezone.
+
+    Pure. Day boundaries use user-local calendar dates. Returns None when
+    ``added_at`` is unparseable so callers render the original text as-is.
+    Future timestamps (clock skew) read as today, never negative.
+    """
+    try:
+        added = _ensure_aware(datetime.fromisoformat(str(added_at)))
+    except (TypeError, ValueError):
+        return None
+    local_now = user_local_datetime(moment, tz)
+    zone = resolve_tz(tz)
+    local_added = added.astimezone(zone) if zone is not None else added
+    delta_days = (local_now.date() - local_added.date()).days
+    if delta_days < 0:
+        delta_days = 0
+    if delta_days == 0:
+        label = "Today"
+    elif delta_days == 1:
+        label = "Yesterday"
+    else:
+        label = f"{delta_days} days ago"
+    date_str = f"{local_added:%b} {local_added.day}"
+    return label, date_str
+
+
+def memory_age_label(
+    added_at: Any,
+    moment: Optional[datetime] = None,
+    tz: Optional[str] = None,
+) -> str:
+    """Compact render-time age tag like ``[2 days ago | Sep 29]`` (pure).
+
+    Calculated at context-build time from the persisted timestamp; the
+    stored memory text is never rewritten. Empty string when unparseable.
+    """
+    parts = relative_day_parts(added_at, moment, tz)
+    if parts is None:
+        return ""
+    label, date_str = parts
+    return f"[{label} | {date_str}]"
+
+
+def location_for(
+    activity: str,
+    moment: datetime,
+    current_location: str,
+    tz: Optional[str] = None,
+) -> str:
     """Enforce activity/location consistency (pure).
 
     ``idle`` keeps its location; every other activity has a home so the
     world cannot drift into impossible states (e.g. sleeping outside).
+    Day/night for ``playing`` uses the user-local hour when ``tz`` is set.
     """
     if activity in ("sleeping", "resting", "reading"):
         return "room"
     if activity == "eating":
         return "kitchen"
     if activity == "playing":
-        hour = _ensure_aware(moment).hour
+        hour = local_hour(moment, tz)
         if DAY_OUTSIDE_START_HOUR <= hour < DAY_OUTSIDE_END_HOUR:
             return "outside"
         return "room"
     return normalize_location(current_location)
 
 
-def default_state(now: Optional[datetime] = None) -> WorldState:
+def default_state(
+    now: Optional[datetime] = None, tz: Optional[str] = None
+) -> WorldState:
     """Build the initial world state for a character (pure)."""
     moment = _ensure_aware(now) if now is not None else utcnow()
     stamp = _to_iso(moment)
@@ -259,26 +476,30 @@ def default_state(now: Optional[datetime] = None) -> WorldState:
         activity=DEFAULT_ACTIVITY,
         energy=DEFAULT_ENERGY,
         mood=derive_mood(DEFAULT_ACTIVITY, DEFAULT_ENERGY),
-        time_context=derive_time_context(moment),
+        time_context=derive_time_context(moment, tz),
         activity_started_at=stamp,
         last_update_at=stamp,
         recent_activity_history=[],
     )
 
 
-def _is_night(moment: datetime) -> bool:
-    hour = _ensure_aware(moment).hour
+def _is_night(moment: datetime, tz: Optional[str] = None) -> bool:
+    hour = local_hour(moment, tz)
     return hour >= NIGHT_START_HOUR or hour < NIGHT_END_HOUR
 
 
 def transition(
-    state: WorldState, elapsed_s: float, now: datetime
+    state: WorldState,
+    elapsed_s: float,
+    now: datetime,
+    tz: Optional[str] = None,
 ) -> Tuple[WorldState, bool]:
     """Apply one deterministic transition step (pure, no I/O).
 
     Returns ``(new_state, activity_changed)``. Energy, mood, location and
     timestamps are updated in place on a copy; history is appended only
-    when the activity itself changes.
+    when the activity itself changes. Day/night-dependent rules use the
+    user-local hour when ``tz`` (IANA name) is provided, else server UTC.
     """
     moment = _ensure_aware(now)
     elapsed = max(0.0, float(elapsed_s or 0.0))
@@ -294,6 +515,8 @@ def transition(
         recent_activity_history=[
             dict(item) for item in (state.recent_activity_history or [])
         ],
+        mood_ttl_turns=max(0, int(getattr(state, "mood_ttl_turns", 0) or 0)),
+        mood_set_at=getattr(state, "mood_set_at", None),
     )
 
     # Energy drifts linearly with elapsed time at the activity rate.
@@ -318,16 +541,30 @@ def transition(
     ):
         new_activity = "idle"
     elif current.activity == "idle":
-        if _is_night(moment) and new_energy <= 30:
+        if _is_night(moment, tz) and new_energy <= 30:
             new_activity = "sleeping"
         elif new_energy <= 10:
             new_activity = "resting"
     elif current.activity == "playing" and new_energy <= 5:
         new_activity = "resting"
 
-    new_location = location_for(new_activity, moment, current.location)
-    new_mood = derive_mood(new_activity, new_energy)
-    new_time_context = derive_time_context(moment)
+    new_location = location_for(new_activity, moment, current.location, tz)
+    # Reactive moods survive the clock: only the wall backstop (stale
+    # reactive mood) or an exhausted ttl handled elsewhere clears them.
+    # Baseline derivation applies when no reactive mood is armed.
+    new_mood = current.mood
+    new_ttl = current.mood_ttl_turns
+    new_mood_set_at = current.mood_set_at
+    if new_ttl > 0:
+        age_s = (moment - _parse_iso(current.mood_set_at, moment)).total_seconds()
+        if current.mood_set_at is None or age_s > REACTIVE_MOOD_MAX_AGE_S:
+            new_mood = derive_mood(new_activity, new_energy)
+            new_ttl = 0
+            new_mood_set_at = None
+    else:
+        new_mood = derive_mood(new_activity, new_energy)
+        new_mood_set_at = None
+    new_time_context = derive_time_context(moment, tz)
 
     activity_changed = new_activity != current.activity
     if activity_changed:
@@ -352,12 +589,16 @@ def transition(
         ),
         last_update_at=current.last_update_at,
         recent_activity_history=history,
+        mood_ttl_turns=new_ttl,
+        mood_set_at=new_mood_set_at,
     )
     return updated, activity_changed
 
 
 def reconcile(
-    state: WorldState, now: Optional[datetime] = None
+    state: WorldState,
+    now: Optional[datetime] = None,
+    tz: Optional[str] = None,
 ) -> Tuple[WorldState, bool]:
     """Lazily reconcile state against wall-clock time (pure, no I/O).
 
@@ -366,9 +607,20 @@ def reconcile(
     long offline gaps collapse into a single step (e.g. sleeping through
     a 2-day gap wakes to idle with full energy, not 48 hourly ticks).
 
+    ``tz`` is the user/session IANA timezone name. Day/night-dependent
+    rules and ``time_context`` use the user-local hour; persistence
+    timestamps stay canonical UTC. ``None`` keeps server-UTC behavior.
+
     Returns ``(new_state, changed)`` where ``changed`` covers any field
     difference, including timestamp / time_context / energy-only updates.
     A second call with the same ``now`` is always a no-op.
+
+    Only material field changes advance ``last_update_at``. Timestamp-only
+    touches are deliberately NOT persisted: integer energy cannot represent
+    sub-unit drift, so moving the baseline on every read would freeze
+    slow drains (e.g. idle -1/hour) under frequent refreshes. Keeping the
+    baseline at the last material change lets fractional elapsed time
+    accumulate correctly across sparse AND frequent reconciles.
     """
     moment = _ensure_aware(now) if now is not None else utcnow()
     baseline = WorldState(
@@ -382,6 +634,8 @@ def reconcile(
         recent_activity_history=[
             dict(item) for item in (state.recent_activity_history or [])
         ],
+        mood_ttl_turns=max(0, int(getattr(state, "mood_ttl_turns", 0) or 0)),
+        mood_set_at=getattr(state, "mood_set_at", None),
     )
     last = _parse_iso(baseline.last_update_at, moment)
     if moment < last:
@@ -389,7 +643,7 @@ def reconcile(
         return baseline, False
 
     elapsed = (moment - last).total_seconds()
-    updated, _ = transition(baseline, elapsed, moment)
+    updated, _ = transition(baseline, elapsed, moment, tz)
 
     changed = (
         updated.location != baseline.location
@@ -399,28 +653,181 @@ def reconcile(
         or updated.time_context != baseline.time_context
         or updated.activity_started_at != baseline.activity_started_at
         or updated.recent_activity_history != baseline.recent_activity_history
+        or updated.mood_ttl_turns != baseline.mood_ttl_turns
+        or updated.mood_set_at != baseline.mood_set_at
     )
-    if not changed and baseline.last_update_at == _to_iso(moment):
-        return baseline, False
     if not changed:
-        # Timestamps still advance so the next call with the same ``now``
-        # is a strict no-op (idempotent reconcile).
-        baseline.last_update_at = _to_iso(moment)
-        return baseline, True
+        # No material difference: keep the old baseline (including
+        # last_update_at) so sub-unit energy drift can still accumulate
+        # on later reconciles. Still a strict no-op for identical ``now``.
+        return baseline, False
     updated.last_update_at = _to_iso(moment)
     return updated, True
 
 
-def build_world_state_context(state: WorldState) -> str:
-    """Render the VERY COMPACT world line injected into the system prompt."""
+# Maximum recent transitions exposed to character context (selective).
+# The store keeps HISTORY_CAP; the prompt carries only the latest few so
+# the model gets continuity ("tadi ngapain") without a giant history block.
+CONTEXT_RECENT_LIFE_LIMIT = 2
+
+
+def _normalize_emotion_label(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def apply_reactive(
+    state: WorldState, emotion_keys: List[str], now: datetime
+) -> Tuple[WorldState, bool]:
+    """Apply one deterministic interaction-driven transition (pure, no I/O).
+
+    ``emotion_keys`` are backend semantic-emotion labels observed on the
+    just-completed turn (e.g. ``["joy"]``). They are INPUT only: the
+    semantic-emotion pipeline is untouched, and no new emotion system is
+    created here.
+
+    Rules (all deterministic, strongest mapped label wins):
+    - mapped label -> reactive mood (+shy ladder: embarrassed while shy
+      deepens to flustered), ttl armed, mood_set_at = now;
+    - no mapped label but ttl armed -> ttl decays one turn; at zero, step
+      one DECAY_NEXT rung (flustered->shy, angry->irritated) or fall back
+      to baseline derive_mood;
+    - neutral/empty turn with no armed ttl -> no change at all;
+    - charged turn (any non-neutral label): reading/playing -> idle
+      (sleep/rest/meals are never interrupted by chatting);
+    - charged turn: energy -1 while previously idle/reading/playing
+      (rest states keep their time-rule recovery only).
+
+    Returns ``(new_state, changed)``. Callers persist when changed.
+    """
+    moment = _ensure_aware(now)
+    labels = [_normalize_emotion_label(k) for k in (emotion_keys or [])]
+    labels = [label for label in labels if label]
+
+    mapped: Optional[str] = None
+    for candidate in EMOTION_PRIORITY:
+        if candidate in labels:
+            mapped = candidate
+            break
+    charged = mapped is not None or any(
+        label not in NEUTRAL_EMOTION_LABELS for label in labels
+    )
+
+    current = WorldState(
+        location=normalize_location(state.location),
+        activity=normalize_activity(state.activity),
+        energy=clamp_energy(state.energy),
+        mood=normalize_mood(state.mood),
+        time_context=state.time_context,
+        activity_started_at=state.activity_started_at,
+        last_update_at=state.last_update_at,
+        recent_activity_history=[
+            dict(item) for item in (state.recent_activity_history or [])
+        ],
+        mood_ttl_turns=max(0, int(getattr(state, "mood_ttl_turns", 0) or 0)),
+        mood_set_at=getattr(state, "mood_set_at", None),
+    )
+
+    new_mood = current.mood
+    new_ttl = current.mood_ttl_turns
+    new_mood_set_at = current.mood_set_at
+    mood_touched = False
+
+    if mapped is not None:
+        target, ttl = EMOTION_MOOD_MAP[mapped]
+        if mapped == "embarrassed" and current.mood == "shy":
+            target, ttl = "flustered", 3
+        elif mapped == "embarrassed" and current.mood == "flustered":
+            target, ttl = "flustered", 3
+        new_mood, new_ttl = target, ttl
+        new_mood_set_at = _to_iso(moment)
+        mood_touched = True
+    elif new_ttl > 0:
+        new_ttl -= 1
+        mood_touched = True
+        if new_ttl <= 0:
+            step = DECAY_NEXT.get(current.mood)
+            if step is not None:
+                new_mood, new_ttl = step
+                new_mood_set_at = _to_iso(moment)
+            else:
+                new_mood = derive_mood(current.activity, current.energy)
+                new_ttl = 0
+                new_mood_set_at = None
+
+    new_activity = current.activity
+    activity_changed = False
+    if charged and current.activity in REACTIVE_INTERRUPT_ACTIVITIES:
+        new_activity = "idle"
+        activity_changed = True
+
+    new_energy = current.energy
+    if charged and current.activity in REACTIVE_ENERGY_ACTIVITIES:
+        new_energy = clamp_energy(current.energy + REACTIVE_ENERGY_DELTA)
+
+    history = list(current.recent_activity_history)
+    if activity_changed:
+        history = [
+            *history,
+            {
+                "from": current.activity,
+                "to": new_activity,
+                "at": _to_iso(moment),
+                "location": location_for(new_activity, moment, current.location),
+            },
+        ][-HISTORY_CAP:]
+
+    changed = (
+        mood_touched
+        or activity_changed
+        or new_energy != current.energy
+        or history != current.recent_activity_history
+    )
+    if not changed:
+        return current, False
     return (
-        "[Mili World State]\n"
+        WorldState(
+            location=location_for(new_activity, moment, current.location)
+            if activity_changed
+            else current.location,
+            activity=new_activity,
+            energy=new_energy,
+            mood=new_mood,
+            time_context=current.time_context,
+            activity_started_at=(
+                _to_iso(moment) if activity_changed else current.activity_started_at
+            ),
+            last_update_at=_to_iso(moment),
+            recent_activity_history=history,
+            mood_ttl_turns=new_ttl,
+            mood_set_at=new_mood_set_at,
+        ),
+        True,
+    )
+
+
+def build_world_state_context(state: WorldState) -> str:
+    """Render the VERY COMPACT world context injected into the system prompt.
+
+    Current life (activity/location/energy/mood/time) plus at most the last
+    two activity transitions for continuity. No chat text, no full history.
+    """
+    lines = [
+        "[Mili World State]",
         f"location={normalize_location(state.location)}; "
         f"activity={normalize_activity(state.activity)}; "
         f"energy={clamp_energy(state.energy)}; "
         f"mood={normalize_mood(state.mood)}; "
-        f"time_context={state.time_context or derive_time_context(utcnow())}"
-    )
+        f"time_context={state.time_context or derive_time_context(utcnow())}",
+    ]
+    recent = list(state.recent_activity_history or [])[-CONTEXT_RECENT_LIFE_LIMIT:]
+    moves = [
+        f"{normalize_activity(item.get('from'))} → {normalize_activity(item.get('to'))}"
+        for item in recent
+        if isinstance(item, dict)
+    ]
+    if moves:
+        lines.append("Recent life: " + ", ".join(moves))
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -449,11 +856,13 @@ def _state_to_dict(state: WorldState) -> Dict[str, Any]:
         "recent_activity_history": list(state.recent_activity_history or [])[
             -HISTORY_CAP:
         ],
+        "mood_ttl_turns": max(0, int(getattr(state, "mood_ttl_turns", 0) or 0)),
+        "mood_set_at": getattr(state, "mood_set_at", None),
     }
 
 
-def _state_from_dict(data: Any, now: datetime) -> WorldState:
-    fallback = default_state(now)
+def _state_from_dict(data: Any, now: datetime, tz: Optional[str] = None) -> WorldState:
+    fallback = default_state(now, tz)
     if not isinstance(data, dict):
         return fallback
     history: List[Dict[str, Any]] = []
@@ -472,6 +881,14 @@ def _state_from_dict(data: Any, now: datetime) -> WorldState:
                     ),
                 }
             )
+    try:
+        ttl_raw = data.get("mood_ttl_turns", 0)
+        ttl = max(0, int(ttl_raw or 0))
+    except (TypeError, ValueError):
+        ttl = 0
+    mood_set_at = data.get("mood_set_at")
+    if mood_set_at is not None:
+        mood_set_at = str(mood_set_at)
     return WorldState(
         location=normalize_location(data.get("location", fallback.location)),
         activity=normalize_activity(data.get("activity", fallback.activity)),
@@ -484,6 +901,8 @@ def _state_from_dict(data: Any, now: datetime) -> WorldState:
         or fallback.activity_started_at,
         last_update_at=data.get("last_update_at") or fallback.last_update_at,
         recent_activity_history=history,
+        mood_ttl_turns=ttl,
+        mood_set_at=mood_set_at,
     )
 
 
@@ -491,19 +910,20 @@ def load_world_state(
     conf_uid: str,
     now: Optional[datetime] = None,
     base_dir: str = WORLD_STATE_DIR,
+    tz: Optional[str] = None,
 ) -> WorldState:
     """Load world state without reconciling; missing/corrupt -> safe default."""
     moment = _ensure_aware(now) if now is not None else utcnow()
     filepath = get_world_state_path(conf_uid, base_dir)
     if not os.path.exists(filepath):
-        return default_state(moment)
+        return default_state(moment, tz)
     try:
         with open(filepath, "r", encoding="utf-8") as file:
             data = json.load(file)
-        return _state_from_dict(data, moment)
+        return _state_from_dict(data, moment, tz)
     except Exception as error:
         logger.error("Failed to load world state: error_type={}", type(error).__name__)
-        return default_state(moment)
+        return default_state(moment, tz)
 
 
 def save_world_state(
@@ -528,20 +948,22 @@ def load_and_reconcile_world_state(
     conf_uid: str,
     now: Optional[datetime] = None,
     base_dir: str = WORLD_STATE_DIR,
+    tz: Optional[str] = None,
 ) -> WorldState:
     """Load, lazily reconcile against ``now``, persist only if changed.
 
     This is the single entry point for conversation triggers, proactive
     checks, reconnect/history-switch and character load paths. It never
     raises: on any failure the caller gets a usable in-memory state and
-    the conversation path continues unchanged.
+    the conversation path continues unchanged. ``tz`` selects the
+    user-local hour for time rules; stored timestamps stay UTC.
     """
     try:
         moment = _ensure_aware(now) if now is not None else utcnow()
         filepath = get_world_state_path(conf_uid, base_dir)
         existed = os.path.exists(filepath)
-        state = load_world_state(conf_uid, moment, base_dir)
-        reconciled, changed = reconcile(state, moment)
+        state = load_world_state(conf_uid, moment, base_dir, tz)
+        reconciled, changed = reconcile(state, moment, tz)
         if changed or not existed:
             save_world_state(conf_uid, reconciled, base_dir)
         return reconciled

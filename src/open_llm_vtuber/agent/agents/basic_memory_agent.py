@@ -72,8 +72,14 @@ from ..relationship_context import (
     normalize_relationship_status,
 )
 from ...world_state import (
+    apply_reactive,
     build_world_state_context,
+    format_temporal_anchor,
     load_and_reconcile_world_state,
+    load_world_state,
+    reconcile,
+    save_world_state,
+    utcnow,
 )
 import time
 from ...request_latency import (
@@ -156,6 +162,8 @@ class BasicMemoryAgent(AgentInterface):
         self._relationship_state = RelationshipState()
         self._character_state = CharacterState()
         self._character_conf_uid: Optional[str] = None
+        # IANA timezone for user-local World State time rules (None = UTC).
+        self._user_timezone: Optional[str] = None
 
         self._formatted_tools_openai = []
         self._formatted_tools_claude = []
@@ -317,7 +325,7 @@ class BasicMemoryAgent(AgentInterface):
         # gap / server restart) the character-scoped World/Life State.
         # Fail-soft by design: world problems must never break history load.
         try:
-            load_and_reconcile_world_state(conf_uid)
+            load_and_reconcile_world_state(conf_uid, tz=self._user_timezone)
         except Exception as error:
             logger.warning("World state init skipped: type={}", type(error).__name__)
         logger.info(
@@ -335,9 +343,19 @@ class BasicMemoryAgent(AgentInterface):
     def _relationship_system_prompt(self, base_prompt: str) -> str:
         parts = [
             base_prompt,
-            build_relationship_context(self._relationship_state.status),
+            # Temporal anchor: reliable "today" (date + weekday + user tz).
+            # Real clock by design (a date, not a ticking clock); the pure
+            # formatter stays deterministic under test via fixed moments.
+            format_temporal_anchor(tz=self._user_timezone),
+            build_relationship_context(
+                self._relationship_state.status,
+                updated_at=self._relationship_state.updated_at,
+                tz=self._user_timezone,
+            ),
         ]
-        memory_context = build_character_memory_context(self._character_state)
+        memory_context = build_character_memory_context(
+            self._character_state, tz=self._user_timezone
+        )
         if memory_context:
             parts.append(memory_context)
         # Stage 7: VERY COMPACT read-only World/Life snapshot. Reconciled
@@ -347,7 +365,9 @@ class BasicMemoryAgent(AgentInterface):
         # store is unavailable. Never touches Emotion/transformers output.
         if self._character_conf_uid:
             try:
-                snapshot = load_and_reconcile_world_state(self._character_conf_uid)
+                snapshot = load_and_reconcile_world_state(
+                    self._character_conf_uid, tz=self._user_timezone
+                )
                 parts.append(build_world_state_context(snapshot))
             except Exception as error:
                 logger.warning(
@@ -530,6 +550,43 @@ class BasicMemoryAgent(AgentInterface):
         )
         memory_updated = self._observe_character_memory_request(user_text)
         return relationship_updated or memory_updated
+
+    def observe_reactive_state(self, emotion_keys: List[str]) -> bool:
+        """Apply one deterministic reactive transition (no LLM calls).
+
+        ``emotion_keys`` are backend semantic-emotion labels observed on the
+        just-completed visible turn. The state is first lazily reconciled
+        (time), then the reactive step runs on top; a single persist covers
+        both. Fail-soft: never breaks the conversation path.
+        """
+        if not self._character_conf_uid:
+            return False
+        try:
+            moment = utcnow()
+            raw = load_world_state(self._character_conf_uid)
+            reconciled, _ = reconcile(
+                raw, moment, getattr(self, "_user_timezone", None)
+            )
+            updated, changed = apply_reactive(
+                reconciled, emotion_keys or [], moment
+            )
+            if not changed:
+                return False
+            if not save_world_state(self._character_conf_uid, updated):
+                return False
+            logger.info(
+                "Reactive state stats: mood={}, activity={}, energy={}, "
+                "reactive_updated=True",
+                updated.mood,
+                updated.activity,
+                updated.energy,
+            )
+            return True
+        except Exception as error:
+            logger.warning(
+                "Reactive state skipped: type={}", type(error).__name__
+            )
+            return False
 
     async def compact_conversation(self) -> tuple[bool, Optional[str]]:
         """Manually compress the active conversation using the rolling-summary pipeline.
@@ -853,8 +910,11 @@ class BasicMemoryAgent(AgentInterface):
 
         self._memory.append(message_data)
 
-    def set_memory_from_history(self, conf_uid: str, history_uid: str) -> None:
+    def set_memory_from_history(
+        self, conf_uid: str, history_uid: str, user_timezone: str | None = None
+    ) -> None:
         """Load memory from chat history."""
+        self._user_timezone = user_timezone
         messages = get_history(conf_uid, history_uid)
 
         self._memory = []
