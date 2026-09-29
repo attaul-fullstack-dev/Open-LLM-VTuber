@@ -54,6 +54,42 @@ class TemporalAnchorTest(unittest.TestCase):
         anchor = format_temporal_anchor(NOW_OCT1, "Not/AZone")
         self.assertIn("UTC", anchor)
 
+    def test_b_anchor_contains_current_clock_time(self):
+        anchor = format_temporal_anchor(
+            datetime(2026, 9, 29, 9, 44, tzinfo=timezone.utc), JAKARTA
+        )
+        self.assertIn("Current time: 16:44", anchor)
+
+    def test_c_utc_to_jakarta_conversion(self):
+        anchor = format_temporal_anchor(
+            datetime(2026, 9, 29, 9, 44, tzinfo=timezone.utc), JAKARTA
+        )
+        self.assertIn("September 29, 2026 (Tuesday)", anchor)
+        self.assertIn("Current time: 16:44", anchor)
+        self.assertIn("Asia/Jakarta", anchor)
+
+    def test_d_advancing_clock_changes_rendered_time(self):
+        earlier = format_temporal_anchor(
+            datetime(2026, 9, 29, 9, 44, tzinfo=timezone.utc), JAKARTA
+        )
+        later = format_temporal_anchor(
+            datetime(2026, 9, 29, 9, 49, tzinfo=timezone.utc), JAKARTA
+        )
+        self.assertIn("Current time: 16:44", earlier)
+        self.assertIn("Current time: 16:49", later)
+        self.assertNotEqual(earlier, later)
+
+    def test_e_no_static_time_across_moments(self):
+        first = format_temporal_anchor(
+            datetime(2026, 9, 29, 9, 44, tzinfo=timezone.utc), JAKARTA
+        )
+        second = format_temporal_anchor(
+            datetime(2026, 10, 5, 3, 7, tzinfo=timezone.utc), JAKARTA
+        )
+        self.assertNotIn("16:44", second)
+        self.assertIn("Current time: 10:07", second)
+        self.assertNotEqual(first, second)
+
 
 class MemoryAgeLabelTest(unittest.TestCase):
     def test_b_memory_today(self):

@@ -374,17 +374,23 @@ def user_local_datetime(
 def format_temporal_anchor(
     moment: Optional[datetime] = None, tz: Optional[str] = None
 ) -> str:
-    """Compact "today" anchor for the system prompt (pure).
+    """Compact "today + now" anchor for the system prompt (pure).
 
-    Gives the LLM a reliable current-date/weekday/timezone reference so
-    deictic words in conversation resolve against the right day.
+    Gives the LLM a reliable current-date/weekday/clock-time/timezone
+    reference, rebuilt at every request from the runtime system clock, so
+    "what time is it" is answered from real time, never guessed or stale.
     """
     local = user_local_datetime(moment, tz)
     date_str = f"{local:%B} {local.day}, {local.year}"
     weekday = f"{local:%A}"
+    clock_str = f"{local:%H:%M}"
     zone = resolve_tz(tz)
     tz_label = tz if zone is not None else "UTC"
-    return f"Current date: {date_str} ({weekday})\nTimezone: {tz_label}"
+    return (
+        f"Current date: {date_str} ({weekday})\n"
+        f"Current time: {clock_str}\n"
+        f"Timezone: {tz_label}"
+    )
 
 
 def relative_day_parts(
