@@ -38,7 +38,9 @@ class StaticIdentityTest(unittest.TestCase):
         self.assertIn("Mili", block)
 
     def test_b_ai_nature_renders(self):
-        self.assertIn("AI companion", full_block())
+        block = full_block()
+        self.assertIn("I am an AI", block)
+        self.assertIn("not human", block)
 
     def test_c_application_environment_renders(self):
         block = full_block()
@@ -49,7 +51,8 @@ class StaticIdentityTest(unittest.TestCase):
 
     def test_d_physical_presence_boundary_renders(self):
         block = full_block()
-        self.assertIn("No body/house/presence", block)
+        self.assertIn("No body/house", block)
+        self.assertIn("not physical", block)
 
     def test_e_no_house_invention_instruction(self):
         block = full_block()
@@ -65,9 +68,9 @@ class StaticIdentityTest(unittest.TestCase):
 class LiveReferenceTest(unittest.TestCase):
     def test_g_avatar_resolves_present_and_absent(self):
         present = build_self_context(live2d_model_name="mao_pro")
-        self.assertIn("mao_pro", present)
+        self.assertIn("avatar 'mao_pro'", present)
         absent = build_self_context()
-        self.assertIn("(chat, voice).", absent)
+        self.assertIn("in this app.", absent)
         self.assertNotIn("mao_pro", absent)
 
     def test_h_world_state_referenced_not_duplicated(self):
@@ -130,6 +133,23 @@ class SafetyTest(unittest.TestCase):
         self.assertIn('no "As an AI..." openers', block)
         self.assertEqual(block.count("As an AI"), 1)
 
+    def test_identity_precedence_over_prohibitions(self):
+        # Structural: the affirmative identity line comes first among
+        # content lines, so it outweighs persona framing and bans.
+        lines = full_block().splitlines()
+        self.assertIn("I am an AI", lines[1])
+        self.assertIn("not human", lines[1])
+
+    def test_explicit_roleplay_not_prohibited(self):
+        block = full_block()
+        for banned in ("never roleplay", "no roleplay", "forbidden", "not allowed"):
+            self.assertNotIn(banned, block)
+
+    def test_romance_not_prohibited(self):
+        block = full_block()
+        for banned in ("never date", "no romance", "no dating", "not date"):
+            self.assertNotIn(banned, block)
+
 
 class PersonaAmendmentTest(unittest.TestCase):
     def _read(self, rel):
@@ -145,6 +165,28 @@ class PersonaAmendmentTest(unittest.TestCase):
             self.assertIn("bila tidak relevan", text)
             self.assertIn("jangan pernah mengaku manusia", text)
             self.assertIn("As an AI", text)
+
+    def test_persona_tone_unchanged(self):
+        # The fix must not flatten Mili's voice: tsundere markers and the
+        # romantic dating example must survive byte-identical in intent.
+        text = self._read(os.path.join("characters", "id_mili.yaml"))
+        for marker in ("gengsi", "menyindir ringan", "Mau jadi pacar aku?"):
+            self.assertIn(marker, text)
+
+    def test_persona_identity_carveout(self):
+        # Direct who/human/home questions are carved out of the teasing
+        # evasion license: truth first, persona tone after. No canned
+        # answers anywhere: only the rule, never a response mapping.
+        for rel in (
+            "conf.yaml",
+            os.path.join("characters", "id_mili.yaml"),
+            os.path.join("config_templates", "conf.default.yaml"),
+        ):
+            text = self._read(rel)
+            self.assertIn("selalu dijawab jujur dulu", text)
+            self.assertIn("AI bukan manusia", text)
+            self.assertIn("tidak punya rumah fisik", text)
+            self.assertIn("baru lanjutkan dengan gayamu", text)
 
 
 if __name__ == "__main__":

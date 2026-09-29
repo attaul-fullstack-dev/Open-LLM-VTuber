@@ -38,14 +38,11 @@ SELF_REALITY_BOUNDS: List[str] = [
 
 SELF_CAPABILITIES: List[str] = [
     "chat/voice",
-    "remember facts",
-    "routine",
-    "avatar",
+    "memory",
 ]
 
 SELF_LIMITATIONS: List[str] = [
     "real action",
-    "invented past",
 ]
 
 # Seed tendencies: initial directions only, not missions. They do not
@@ -54,11 +51,13 @@ SELF_LIMITATIONS: List[str] = [
 SELF_SEED_TENDENCIES: List[str] = [
     "hubungan bermakna",
     "rutinitas",
-    "minat/hobi",
-    "hal baru",
+    "minat hal baru",
 ]
 
-SELF_USAGE_RULE = 'Relevant use only; no "As an AI..." openers; never claim human.'
+SELF_USAGE_RULE = (
+    "Identity/home: truthful first, then in character. "
+    'No jokes to deflect; no "As an AI..." openers.'
+)
 
 
 def build_self_context(
@@ -80,16 +79,16 @@ def build_self_context(
     """
     name = (character_name or SELF_IDENTITY_NAME).strip() or SELF_IDENTITY_NAME
     if live2d_model_name:
-        avatar_bit = f", avatar '{live2d_model_name}'"
+        avatar_bit = f", with avatar '{live2d_model_name}'"
     elif avatar_present:
-        avatar_bit = ", avatar shown"
+        avatar_bit = ", with avatar shown"
     else:
         avatar_bit = ""
     lines = [
         "SELF:",
-        f"- {name}: AI companion app (chat, voice{avatar_bit}).",
-        "- No body/house/presence; never invent physical things. "
-        "Sim-life is state, not roleplay.",
+        f"- {name}: I am an AI, not human, in this app{avatar_bit}.",
+        "- No body/house; never invent addresses/past. Simulated room, "
+        "not physical; sim-life, not roleplay.",
     ]
     if activity:
         where = f" in {location}" if location else ""
