@@ -1188,8 +1188,12 @@ class WebSocketHandler:
             return
         self._update_user_timezone(context, data)
         try:
+            # Read-only widget path: reconcile time but never write an
+            # autonomous decision (decide=False).
             snapshot = load_and_reconcile_world_state(
-                context.character_config.conf_uid, tz=context.user_timezone
+                context.character_config.conf_uid,
+                tz=context.user_timezone,
+                decide=False,
             )
             payload = {
                 "type": "world-state",

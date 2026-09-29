@@ -70,7 +70,7 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from loguru import logger
@@ -292,6 +292,9 @@ class WorldState:
     # the mood is baseline-derived), plus when it was set (wall backstop).
     mood_ttl_turns: int = 0
     mood_set_at: Optional[str] = None
+    # Autonomous Decision Layer v1: wall-clock stamp of the last autonomous
+    # activity pick. Old files lack it (None = no cooldown). Never a ticker.
+    last_autonomous_decision_at: Optional[str] = None
 
 
 def normalize_location(value: Any) -> str:
@@ -488,6 +491,200 @@ def _is_night(moment: datetime, tz: Optional[str] = None) -> bool:
     return hour >= NIGHT_START_HOUR or hour < NIGHT_END_HOUR
 
 
+# ---------------------------------------------------------------------------
+# Autonomous Decision Layer v1 (deterministic policy; no LLM, no scheduler).
+#
+# Thin policy between the reconciled WorldState and the existing
+# transition/persistence mechanics: decide_activity() chooses WHAT should
+# happen; transition() stays authoritative for validity, location,
+# energy, history and timestamps. Evaluated lazily inside reconcile();
+# read-only callers pass decide=False.
+# ---------------------------------------------------------------------------
+
+# Idle this long (user-local activity age) before an autonomous pick.
+# Above the 36-minute pinned no-change window in the existing suite.
+IDLE_STALE_AFTER_S = 60 * 60
+# Minimum gap between autonomous picks (persisted wall-clock).
+DECISION_COOLDOWN_S = 15 * 60
+# Minimum energy for an active pick (reading/playing/eating).
+DECISION_ACTIVE_MIN_ENERGY = 40
+# Below this at night, idle picks sleeping instead of holding.
+DECISION_NIGHT_REST_ENERGY = 50
+# Morning eating window (user-local hour); eating is a scheduled activity
+# here, never biological hunger (no hunger state exists).
+DECISION_MORNING_EAT_START_HOUR = 6
+DECISION_MORNING_EAT_END_HOUR = 9
+
+DecisionReason = Literal[
+    "low_energy",
+    "stale_idle",
+    "duration_limit",
+    "night_rest",
+    "cooldown_active",
+    "no_change",
+]
+
+
+@dataclass(frozen=True)
+class DecisionResult:
+    """Minimum explainable autonomous decision (pure data, no I/O)."""
+
+    action: Optional[str]  # target activity, or None = hold current state
+    reason: DecisionReason
+    decided_at: str  # ISO UTC wall-clock of this evaluation
+    state_version: Optional[str]  # baseline last_update_at being decided on
+
+
+def _decision_hold(
+    state: WorldState, moment: datetime, reason: DecisionReason
+) -> DecisionResult:
+    return DecisionResult(
+        action=None,
+        reason=reason,
+        decided_at=_to_iso(moment),
+        state_version=state.last_update_at,
+    )
+
+
+def _decision_cooldown_active(state: WorldState, moment: datetime) -> bool:
+    raw = getattr(state, "last_autonomous_decision_at", None)
+    if not raw:
+        return False
+    try:
+        stamp = _ensure_aware(datetime.fromisoformat(str(raw)))
+    except (TypeError, ValueError):
+        return False
+    delta_s = (moment - stamp).total_seconds()
+    if delta_s < 0:
+        return False
+    return delta_s < DECISION_COOLDOWN_S
+
+
+def _activity_age_s(state: WorldState, moment: datetime) -> float:
+    return max(
+        0.0,
+        (moment - _parse_iso(state.activity_started_at, moment)).total_seconds(),
+    )
+
+
+def _pick_stale_idle_activity(
+    state: WorldState, moment: datetime, tz: Optional[str]
+) -> Optional[Tuple[str, DecisionReason]]:
+    """Deterministic pick for long-idle; None = hold. No personality logic."""
+    energy = clamp_energy(state.energy)
+    if energy < DECISION_ACTIVE_MIN_ENERGY:
+        return "resting", "low_energy"
+    context = derive_time_context(moment, tz)
+    recent_to = [
+        str(item.get("to", ""))
+        for item in (state.recent_activity_history or [])[-3:]
+        if isinstance(item, dict)
+    ]
+    if context == "night":
+        if energy < DECISION_NIGHT_REST_ENERGY:
+            return "sleeping", "night_rest"
+        return None
+    if context == "morning":
+        hour = local_hour(moment, tz)
+        if (
+            DECISION_MORNING_EAT_START_HOUR <= hour < DECISION_MORNING_EAT_END_HOUR
+            and "eating" not in recent_to
+        ):
+            return "eating", "stale_idle"
+    candidates = ["reading", "playing"]
+    if recent_to and recent_to[-1] in candidates:
+        candidates.remove(recent_to[-1])
+    return candidates[0], "stale_idle"
+
+
+def decide_activity(
+    state: WorldState, moment: datetime, tz: Optional[str] = None
+) -> DecisionResult:
+    """Pure deterministic life-activity policy (no I/O, no LLM).
+
+    Priority: sleeping holds; duration-limit mirror; stale-idle pick
+    (cooldown-gated, energy-banded); otherwise hold. Extreme low-energy
+    cases are already resolved by transition() before this runs (idle<=10,
+    playing<=5, night<=30); the decision layer only acts on stale idle,
+    so fresh states and pinned transition behavior are never overridden.
+    Returned actions are always valid activities; the existing transition
+    mechanics stay authoritative at apply time.
+    """
+    aware = _ensure_aware(moment)
+    activity = normalize_activity(state.activity)
+
+    if activity == "sleeping":
+        return _decision_hold(state, aware, "no_change")
+
+    limit = ACTIVITY_DURATION_LIMIT_S.get(activity)
+    if (
+        limit is not None
+        and activity != "idle"
+        and _activity_age_s(state, aware) >= limit
+    ):
+        return DecisionResult(
+            "idle", "duration_limit", _to_iso(aware), state.last_update_at
+        )
+
+    if activity == "idle" and _activity_age_s(state, aware) >= IDLE_STALE_AFTER_S:
+        if _decision_cooldown_active(state, aware):
+            return _decision_hold(state, aware, "cooldown_active")
+        pick = _pick_stale_idle_activity(state, aware, tz)
+        if pick is None:
+            return _decision_hold(state, aware, "no_change")
+        target, reason = pick
+        return DecisionResult(target, reason, _to_iso(aware), state.last_update_at)
+
+    return _decision_hold(state, aware, "no_change")
+
+
+def _apply_decision(
+    state: WorldState, decision: DecisionResult, moment: datetime, tz: Optional[str]
+) -> WorldState:
+    """Execute a decision through existing transition mechanics (pure).
+
+    Validity, location, mood-ttl respect, history bounding and timestamps
+    follow the same rules as transition(); the record carries by="decision".
+    Unknown targets are ignored (transition wins).
+    """
+    if decision.action is None:
+        return state
+    target = normalize_activity(decision.action)
+    if target not in VALID_ACTIVITIES or target == state.activity:
+        return state
+    aware = _ensure_aware(moment)
+    new_location = location_for(target, aware, state.location, tz)
+    record: Dict[str, Any] = {
+        "from": state.activity,
+        "to": target,
+        "at": _to_iso(aware),
+        "location": new_location,
+        "by": "decision",
+    }
+    history = [*state.recent_activity_history, record][-HISTORY_CAP:]
+    if state.mood_ttl_turns > 0:
+        new_mood, new_ttl, new_mood_set_at = (
+            state.mood,
+            state.mood_ttl_turns,
+            state.mood_set_at,
+        )
+    else:
+        new_mood, new_ttl, new_mood_set_at = derive_mood(target, state.energy), 0, None
+    return WorldState(
+        location=new_location,
+        activity=target,
+        energy=state.energy,
+        mood=new_mood,
+        time_context=derive_time_context(aware, tz),
+        activity_started_at=_to_iso(aware),
+        last_update_at=state.last_update_at,
+        recent_activity_history=history,
+        mood_ttl_turns=new_ttl,
+        mood_set_at=new_mood_set_at,
+        last_autonomous_decision_at=_to_iso(aware),
+    )
+
+
 def transition(
     state: WorldState,
     elapsed_s: float,
@@ -517,6 +714,7 @@ def transition(
         ],
         mood_ttl_turns=max(0, int(getattr(state, "mood_ttl_turns", 0) or 0)),
         mood_set_at=getattr(state, "mood_set_at", None),
+        last_autonomous_decision_at=getattr(state, "last_autonomous_decision_at", None),
     )
 
     # Energy drifts linearly with elapsed time at the activity rate.
@@ -591,6 +789,7 @@ def transition(
         recent_activity_history=history,
         mood_ttl_turns=new_ttl,
         mood_set_at=new_mood_set_at,
+        last_autonomous_decision_at=current.last_autonomous_decision_at,
     )
     return updated, activity_changed
 
@@ -599,6 +798,7 @@ def reconcile(
     state: WorldState,
     now: Optional[datetime] = None,
     tz: Optional[str] = None,
+    decide: bool = True,
 ) -> Tuple[WorldState, bool]:
     """Lazily reconcile state against wall-clock time (pure, no I/O).
 
@@ -621,6 +821,12 @@ def reconcile(
     slow drains (e.g. idle -1/hour) under frequent refreshes. Keeping the
     baseline at the last material change lets fractional elapsed time
     accumulate correctly across sparse AND frequent reconciles.
+
+    ``decide`` runs the Autonomous Decision Layer v1 policy on the
+    post-transition state and applies the pick through the same
+    mechanics. Read-only callers (widget fetch) pass ``decide=False``.
+    Decision evaluation is fail-soft: any error keeps the transitioned
+    state intact.
     """
     moment = _ensure_aware(now) if now is not None else utcnow()
     baseline = WorldState(
@@ -636,6 +842,7 @@ def reconcile(
         ],
         mood_ttl_turns=max(0, int(getattr(state, "mood_ttl_turns", 0) or 0)),
         mood_set_at=getattr(state, "mood_set_at", None),
+        last_autonomous_decision_at=getattr(state, "last_autonomous_decision_at", None),
     )
     last = _parse_iso(baseline.last_update_at, moment)
     if moment < last:
@@ -644,6 +851,23 @@ def reconcile(
 
     elapsed = (moment - last).total_seconds()
     updated, _ = transition(baseline, elapsed, moment, tz)
+
+    if decide:
+        try:
+            decision = decide_activity(updated, moment, tz)
+            applied = _apply_decision(updated, decision, moment, tz)
+            if applied is not updated:
+                logger.debug(
+                    "Autonomous decision: action={} reason={}",
+                    decision.action,
+                    decision.reason,
+                )
+            updated = applied
+        except Exception as error:
+            logger.warning(
+                "Autonomous decision skipped: error_type={}",
+                type(error).__name__,
+            )
 
     changed = (
         updated.location != baseline.location
@@ -655,6 +879,7 @@ def reconcile(
         or updated.recent_activity_history != baseline.recent_activity_history
         or updated.mood_ttl_turns != baseline.mood_ttl_turns
         or updated.mood_set_at != baseline.mood_set_at
+        or updated.last_autonomous_decision_at != baseline.last_autonomous_decision_at
     )
     if not changed:
         # No material difference: keep the old baseline (including
@@ -858,6 +1083,9 @@ def _state_to_dict(state: WorldState) -> Dict[str, Any]:
         ],
         "mood_ttl_turns": max(0, int(getattr(state, "mood_ttl_turns", 0) or 0)),
         "mood_set_at": getattr(state, "mood_set_at", None),
+        "last_autonomous_decision_at": getattr(
+            state, "last_autonomous_decision_at", None
+        ),
     }
 
 
@@ -871,16 +1099,17 @@ def _state_from_dict(data: Any, now: datetime, tz: Optional[str] = None) -> Worl
         for item in raw_history[-HISTORY_CAP:]:
             if not isinstance(item, dict):
                 continue
-            history.append(
-                {
-                    "from": normalize_activity(item.get("from")),
-                    "to": normalize_activity(item.get("to")),
-                    "at": str(item.get("at", "")),
-                    "location": normalize_location(
-                        item.get("location", DEFAULT_LOCATION)
-                    ),
-                }
-            )
+            entry: Dict[str, Any] = {
+                "from": normalize_activity(item.get("from")),
+                "to": normalize_activity(item.get("to")),
+                "at": str(item.get("at", "")),
+                "location": normalize_location(item.get("location", DEFAULT_LOCATION)),
+            }
+            # Additive decision tag only (old entries simply lack it).
+            by_tag = str(item.get("by") or "")
+            if by_tag:
+                entry["by"] = by_tag
+            history.append(entry)
     try:
         ttl_raw = data.get("mood_ttl_turns", 0)
         ttl = max(0, int(ttl_raw or 0))
@@ -889,6 +1118,9 @@ def _state_from_dict(data: Any, now: datetime, tz: Optional[str] = None) -> Worl
     mood_set_at = data.get("mood_set_at")
     if mood_set_at is not None:
         mood_set_at = str(mood_set_at)
+    decision_at = data.get("last_autonomous_decision_at")
+    if decision_at is not None:
+        decision_at = str(decision_at)
     return WorldState(
         location=normalize_location(data.get("location", fallback.location)),
         activity=normalize_activity(data.get("activity", fallback.activity)),
@@ -903,6 +1135,7 @@ def _state_from_dict(data: Any, now: datetime, tz: Optional[str] = None) -> Worl
         recent_activity_history=history,
         mood_ttl_turns=ttl,
         mood_set_at=mood_set_at,
+        last_autonomous_decision_at=decision_at,
     )
 
 
@@ -949,6 +1182,7 @@ def load_and_reconcile_world_state(
     now: Optional[datetime] = None,
     base_dir: str = WORLD_STATE_DIR,
     tz: Optional[str] = None,
+    decide: bool = True,
 ) -> WorldState:
     """Load, lazily reconcile against ``now``, persist only if changed.
 
@@ -957,13 +1191,14 @@ def load_and_reconcile_world_state(
     raises: on any failure the caller gets a usable in-memory state and
     the conversation path continues unchanged. ``tz`` selects the
     user-local hour for time rules; stored timestamps stay UTC.
+    ``decide=False`` keeps read-only callers (widget fetch) decision-free.
     """
     try:
         moment = _ensure_aware(now) if now is not None else utcnow()
         filepath = get_world_state_path(conf_uid, base_dir)
         existed = os.path.exists(filepath)
         state = load_world_state(conf_uid, moment, base_dir, tz)
-        reconciled, changed = reconcile(state, moment, tz)
+        reconciled, changed = reconcile(state, moment, tz, decide)
         if changed or not existed:
             save_world_state(conf_uid, reconciled, base_dir)
         return reconciled
