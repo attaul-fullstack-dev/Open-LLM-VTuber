@@ -17,7 +17,7 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from loguru import logger
 
@@ -67,6 +67,149 @@ class CharacterState:
     relationship_reason: str = "default"
     relationship_migrated: bool = False
     memories: List[Dict[str, Any]] = field(default_factory=list)
+    goals: List[Dict[str, Any]] = field(default_factory=list)
+
+
+GoalStatus = Literal["seed", "active", "done"]
+GoalSource = Literal["seed"]
+
+_VALID_GOAL_STATUSES = frozenset({"seed", "active", "done"})
+
+
+@dataclass(frozen=True)
+class Goal:
+    """Finite, completable self-model goal (foundation data only).
+
+    Ongoing aspirations stay as static tendencies in self_model.py; a Goal
+    always has a verifiable completion criterion (documented per seed in
+    ``default_seed_goals``). Transitions are explicit only; there is no
+    auto-complete, no reactivation, no planner.
+    """
+
+    id: str
+    text: str
+    status: GoalStatus = "seed"
+    created_at: Optional[str] = None
+    activated_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    source: GoalSource = "seed"
+
+
+def goal_to_dict(goal: Goal) -> Dict[str, Any]:
+    return {
+        "id": goal.id,
+        "text": goal.text,
+        "status": goal.status,
+        "created_at": goal.created_at,
+        "activated_at": goal.activated_at,
+        "completed_at": goal.completed_at,
+        "source": goal.source,
+    }
+
+
+def goal_from_dict(item: Any) -> Optional[Goal]:
+    """Tolerant parse; None for entries without id/text (fail-soft)."""
+    if not isinstance(item, dict):
+        return None
+    goal_id = str(item.get("id", "") or "").strip()
+    text = str(item.get("text", "") or "").strip()
+    if not goal_id or not text:
+        return None
+    status = str(item.get("status", "seed") or "seed")
+    if status not in _VALID_GOAL_STATUSES:
+        status = "seed"
+    source = str(item.get("source", "seed") or "seed")
+    if source != "seed":
+        source = "seed"
+    return Goal(
+        id=goal_id,
+        text=text,
+        status=status,  # type: ignore[arg-type]
+        created_at=item.get("created_at"),
+        activated_at=item.get("activated_at"),
+        completed_at=item.get("completed_at"),
+        source=source,  # type: ignore[arg-type]
+    )
+
+
+def default_seed_goals(now: Optional[datetime] = None) -> List[Dict[str, Any]]:
+    """The 3 approved finite seed goals with creation stamp (pure).
+
+    Completion criteria (verified explicitly, never auto-completed):
+    - morning-reading-week: 7 consecutive user-local days with a reading entry.
+    - try-three-dishes: 3 distinct eating-related evidence items.
+    - finish-one-book: explicit user statement that the book is finished.
+    """
+    stamp = (now if now is not None else datetime.now(timezone.utc)).isoformat(
+        timespec="seconds"
+    )
+    if not stamp.endswith("+00:00"):
+        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    seeds = [
+        ("morning-reading-week", "membaca pagi 7 hari berturut-turut"),
+        ("try-three-dishes", "mencoba 3 makanan berbeda"),
+        ("finish-one-book", "menyelesaikan satu buku"),
+    ]
+    return [
+        {
+            "id": goal_id,
+            "text": text,
+            "status": "seed",
+            "created_at": stamp,
+            "activated_at": None,
+            "completed_at": None,
+            "source": "seed",
+        }
+        for goal_id, text in seeds
+    ]
+
+
+def _with_goal_status(
+    goals: List[Dict[str, Any]],
+    goal_id: str,
+    from_status: str,
+    to_status: GoalStatus,
+    stamp_field: str,
+    now: Optional[datetime],
+) -> tuple:
+    """Shared explicit-transition helper; (new_list, ok). Never mutates input."""
+    moment = now if now is not None else datetime.now(timezone.utc)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    stamp = moment.isoformat(timespec="seconds")
+    changed = False
+    out: List[Dict[str, Any]] = []
+    for item in goals or []:
+        if (
+            isinstance(item, dict)
+            and str(item.get("id", "")) == goal_id
+            and str(item.get("status", "seed")) == from_status
+            and not changed
+        ):
+            updated = dict(item)
+            updated["status"] = to_status
+            updated[stamp_field] = stamp
+            out.append(updated)
+            changed = True
+        else:
+            out.append(item)
+    return out, changed
+
+
+def activate_goal(
+    goals: List[Dict[str, Any]], goal_id: str, now: Optional[datetime] = None
+) -> tuple:
+    """seed -> active with activation stamp (pure). Unknown/non-seed: no-op."""
+    return _with_goal_status(goals, goal_id, "seed", "active", "activated_at", now)
+
+
+def complete_goal(
+    goals: List[Dict[str, Any]], goal_id: str, now: Optional[datetime] = None
+) -> tuple:
+    """active -> done with completion stamp (pure). No auto-complete."""
+    return _with_goal_status(
+        goals, goal_id, "active", "done", "completed_at", now
+    )
 
 
 def _now_iso() -> str:
@@ -99,6 +242,13 @@ def load_character_state(conf_uid: str) -> CharacterState:
             for item in data.get("memories", [])
             if isinstance(item, dict) and str(item.get("text", "")).strip()
         ]
+        goals: List[Dict[str, Any]] = []
+        raw_goals = data.get("goals", [])
+        if isinstance(raw_goals, list):
+            for item in raw_goals:
+                parsed = goal_from_dict(item)
+                if parsed is not None:
+                    goals.append(goal_to_dict(parsed))
         return CharacterState(
             relationship_status=normalize_relationship_status(
                 data.get("relationship_status", "stranger")
@@ -107,6 +257,7 @@ def load_character_state(conf_uid: str) -> CharacterState:
             relationship_reason=str(data.get("relationship_reason", "default")),
             relationship_migrated=bool(data.get("relationship_migrated", False)),
             memories=memories,
+            goals=goals,
         )
     except Exception as error:
         logger.error(
@@ -128,6 +279,7 @@ def save_character_state(conf_uid: str, state: CharacterState) -> bool:
                 "relationship_reason": state.relationship_reason,
                 "relationship_migrated": state.relationship_migrated,
                 "memories": state.memories,
+                "goals": state.goals,
             }
             _write_state_atomic(filepath, data)
         return True
