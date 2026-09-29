@@ -27,6 +27,7 @@ from .agent.relationship_context import (
     normalize_relationship_status,
 )
 from .chat_history_manager import _sanitize_path_component
+from .world_state import memory_age_label
 
 # Conservative target for the character-memory block injected into the prompt.
 # Kept inside the 500-1000 estimated token range from the v2 spec.
@@ -313,11 +314,17 @@ def build_character_memory_context(
     state: CharacterState,
     *,
     max_tokens: int = CHARACTER_MEMORY_MAX_TOKENS,
+    tz: Optional[str] = None,
+    now: Optional[datetime] = None,
 ) -> str:
     """Return a compact, bounded character-memory block for the system prompt.
 
     Explicit (manual) memories are prioritized, then the most recent facts.
     Memory is never dumped wholesale; the block stays well under the budget.
+
+    Each bullet carries a render-time age tag (e.g. ``[2 days ago | Sep 29]``)
+    computed from the persisted ``added_at`` in the user timezone. Stored
+    text and ordering are unchanged; unparseable timestamps render untagged.
     """
     if not state.memories:
         return ""
@@ -334,7 +341,8 @@ def build_character_memory_context(
         text = " ".join(str(item.get("text", "")).split())
         if not text:
             continue
-        line = f"- {text}"
+        age = memory_age_label(item.get("added_at", ""), now, tz)
+        line = f"- {age} {text}" if age else f"- {text}"
         line_tokens = estimate_tokens(line) + 4
         if used_tokens + line_tokens > max_tokens:
             break

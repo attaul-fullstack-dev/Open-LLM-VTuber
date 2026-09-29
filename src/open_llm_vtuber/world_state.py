@@ -351,6 +351,90 @@ def derive_mood(activity: str, energy: int) -> str:
     return "exhausted"
 
 
+# Temporal anchoring for the LLM context (pure display helpers).
+# These do NOT change transition/reconciliation logic; they only render
+# the existing UTC clock and stored timestamps in the user/session
+# timezone so relative words ("today", "yesterday") stay truthful.
+# ---------------------------------------------------------------------------
+
+
+def user_local_datetime(
+    moment: Optional[datetime] = None, tz: Optional[str] = None
+) -> datetime:
+    """Return ``moment`` (default real clock) in the user timezone (pure).
+
+    Falls back to UTC when ``tz`` is missing or invalid. Naive inputs are
+    read as UTC, matching the persistence convention.
+    """
+    aware = _ensure_aware(moment if moment is not None else utcnow())
+    zone = resolve_tz(tz)
+    return aware.astimezone(zone) if zone is not None else aware
+
+
+def format_temporal_anchor(
+    moment: Optional[datetime] = None, tz: Optional[str] = None
+) -> str:
+    """Compact "today" anchor for the system prompt (pure).
+
+    Gives the LLM a reliable current-date/weekday/timezone reference so
+    deictic words in conversation resolve against the right day.
+    """
+    local = user_local_datetime(moment, tz)
+    date_str = f"{local:%B} {local.day}, {local.year}"
+    weekday = f"{local:%A}"
+    zone = resolve_tz(tz)
+    tz_label = tz if zone is not None else "UTC"
+    return f"Current date: {date_str} ({weekday})\nTimezone: {tz_label}"
+
+
+def relative_day_parts(
+    added_at: Any,
+    moment: Optional[datetime] = None,
+    tz: Optional[str] = None,
+) -> Optional[Tuple[str, str]]:
+    """(label, date) age of a stored ISO timestamp in the user timezone.
+
+    Pure. Day boundaries use user-local calendar dates. Returns None when
+    ``added_at`` is unparseable so callers render the original text as-is.
+    Future timestamps (clock skew) read as today, never negative.
+    """
+    try:
+        added = _ensure_aware(datetime.fromisoformat(str(added_at)))
+    except (TypeError, ValueError):
+        return None
+    local_now = user_local_datetime(moment, tz)
+    zone = resolve_tz(tz)
+    local_added = added.astimezone(zone) if zone is not None else added
+    delta_days = (local_now.date() - local_added.date()).days
+    if delta_days < 0:
+        delta_days = 0
+    if delta_days == 0:
+        label = "Today"
+    elif delta_days == 1:
+        label = "Yesterday"
+    else:
+        label = f"{delta_days} days ago"
+    date_str = f"{local_added:%b} {local_added.day}"
+    return label, date_str
+
+
+def memory_age_label(
+    added_at: Any,
+    moment: Optional[datetime] = None,
+    tz: Optional[str] = None,
+) -> str:
+    """Compact render-time age tag like ``[2 days ago | Sep 29]`` (pure).
+
+    Calculated at context-build time from the persisted timestamp; the
+    stored memory text is never rewritten. Empty string when unparseable.
+    """
+    parts = relative_day_parts(added_at, moment, tz)
+    if parts is None:
+        return ""
+    label, date_str = parts
+    return f"[{label} | {date_str}]"
+
+
 def location_for(
     activity: str,
     moment: datetime,

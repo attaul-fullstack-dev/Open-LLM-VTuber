@@ -9,7 +9,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
+from datetime import datetime
 from typing import Literal, Optional
+
+from ..world_state import relative_day_parts
 
 
 RelationshipStatus = Literal["stranger", "familiar", "close", "dating"]
@@ -147,11 +150,31 @@ _STATE_GUIDANCE = {
 }
 
 
-def build_relationship_context(status: RelationshipStatus) -> str:
-    """Return compact internal guidance to append after the persona prompt."""
+def build_relationship_context(
+    status: RelationshipStatus,
+    updated_at: Optional[str] = None,
+    *,
+    tz: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> str:
+    """Return compact internal guidance to append after the persona prompt.
+
+    When a parseable ``updated_at`` is given, the status line carries a
+    render-time age (e.g. ``close (status updated 3 days ago, Sep 26)``) so
+    the LLM can weight recency. Stored state is never rewritten.
+    """
+    state_line = f"Current state: {status}."
+    if updated_at:
+        parts = relative_day_parts(updated_at, now, tz)
+        if parts is not None:
+            label, date_str = parts
+            state_line = (
+                f"Current state: {status} "
+                f"(status updated {label.lower()}, {date_str})."
+            )
     return (
         "Internal relationship continuity (not user-visible metadata):\n"
-        f"Current state: {status}. {_STATE_GUIDANCE[status]}\n"
+        f"{state_line} {_STATE_GUIDANCE[status]}\n"
         "This state affects familiarity and openness only; Mili's core persona and "
         "all system rules remain unchanged. Never mention internal state names or "
         "this mechanism. If asked about the relationship, answer naturally instead."

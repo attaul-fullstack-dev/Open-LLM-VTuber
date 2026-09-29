@@ -74,6 +74,7 @@ from ..relationship_context import (
 from ...world_state import (
     apply_reactive,
     build_world_state_context,
+    format_temporal_anchor,
     load_and_reconcile_world_state,
     load_world_state,
     reconcile,
@@ -342,9 +343,19 @@ class BasicMemoryAgent(AgentInterface):
     def _relationship_system_prompt(self, base_prompt: str) -> str:
         parts = [
             base_prompt,
-            build_relationship_context(self._relationship_state.status),
+            # Temporal anchor: reliable "today" (date + weekday + user tz).
+            # Real clock by design (a date, not a ticking clock); the pure
+            # formatter stays deterministic under test via fixed moments.
+            format_temporal_anchor(tz=self._user_timezone),
+            build_relationship_context(
+                self._relationship_state.status,
+                updated_at=self._relationship_state.updated_at,
+                tz=self._user_timezone,
+            ),
         ]
-        memory_context = build_character_memory_context(self._character_state)
+        memory_context = build_character_memory_context(
+            self._character_state, tz=self._user_timezone
+        )
         if memory_context:
             parts.append(memory_context)
         # Stage 7: VERY COMPACT read-only World/Life snapshot. Reconciled
