@@ -104,6 +104,8 @@ class AgentFactory:
                 summary_min_new_messages=basic_memory_settings.get(
                     "summary_min_new_messages", 4
                 ),
+                character_name=kwargs.get("character_name"),
+                character_avatar=kwargs.get("character_avatar"),
             )
 
         elif conversation_agent_choice == "mem0_agent":

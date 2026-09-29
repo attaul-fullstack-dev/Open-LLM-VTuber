@@ -40,6 +40,7 @@ from ...character_state import (
     set_character_relationship,
 )
 from ...character_memory_commands import parse_memory_command
+from ...self_model import build_self_context
 from ..transformers import (
     sentence_divider,
     actions_extractor,
@@ -127,9 +128,13 @@ class BasicMemoryAgent(AgentInterface):
         summary_target_tokens: int = 320,
         summary_max_tokens: int = 384,
         summary_min_new_messages: int = 4,
+        character_name: Optional[str] = None,
+        character_avatar: Optional[str] = None,
     ):
         """Initialize agent with LLM and configuration."""
         super().__init__()
+        self._character_name = (character_name or "Mili").strip() or "Mili"
+        self._character_avatar = character_avatar or ""
         self._memory = []
         self._live2d_model = live2d_model
         self._tts_preprocessor_config = tts_preprocessor_config
@@ -347,32 +352,52 @@ class BasicMemoryAgent(AgentInterface):
             # Real clock by design (a date, not a ticking clock); the pure
             # formatter stays deterministic under test via fixed moments.
             format_temporal_anchor(tz=self._user_timezone),
-            build_relationship_context(
-                self._relationship_state.status,
-                updated_at=self._relationship_state.updated_at,
-                tz=self._user_timezone,
-            ),
         ]
-        memory_context = build_character_memory_context(
-            self._character_state, tz=self._user_timezone
-        )
-        if memory_context:
-            parts.append(memory_context)
         # Stage 7: VERY COMPACT read-only World/Life snapshot. Reconciled
         # lazily on every turn (conversation + proactive share this path),
         # persisted only when something actually changed. Fail-soft: the
         # prompt simply omits the line when no character is loaded or the
         # store is unavailable. Never touches Emotion/transformers output.
+        snapshot = None
+        world_line = ""
         if self._character_conf_uid:
             try:
                 snapshot = load_and_reconcile_world_state(
                     self._character_conf_uid, tz=self._user_timezone
                 )
-                parts.append(build_world_state_context(snapshot))
+                world_line = build_world_state_context(snapshot)
             except Exception as error:
                 logger.warning(
                     "World state context skipped: type={}", type(error).__name__
                 )
+        # Self Model v1: static identity + read-only live references. Pure
+        # composer, no store, no LLM call. See self_model.py.
+        live2d_name = getattr(self._live2d_model, "live2d_model_name", None)
+        parts.append(
+            build_self_context(
+                character_name=self._character_name,
+                avatar_present=bool(self._live2d_model) or bool(self._character_avatar),
+                live2d_model_name=live2d_name,
+                activity=getattr(snapshot, "activity", None),
+                location=getattr(snapshot, "location", None),
+                relationship_status=self._relationship_state.status,
+                memory_count=len(self._character_state.memories),
+            )
+        )
+        parts.append(
+            build_relationship_context(
+                self._relationship_state.status,
+                updated_at=self._relationship_state.updated_at,
+                tz=self._user_timezone,
+            ),
+        )
+        memory_context = build_character_memory_context(
+            self._character_state, tz=self._user_timezone
+        )
+        if memory_context:
+            parts.append(memory_context)
+        if world_line:
+            parts.append(world_line)
         return "\n\n".join(parts)
 
     def set_relationship_status(
