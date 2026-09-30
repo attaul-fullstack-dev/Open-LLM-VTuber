@@ -72,6 +72,11 @@ async def handle_conversation_trigger(
     else:  # mic-audio-end
         user_input = received_data_buffers[client_uid]
         received_data_buffers[client_uid] = np.array([])
+        if isinstance(user_input, np.ndarray) and user_input.size == 0:
+            # Empty voice turn (silence/misfire/double-end): never start
+            # a ghost conversation on zero audio.
+            logger.info("Ignoring empty mic-audio-end: no audio buffered")
+            return
 
     images = data.get("images")
     session_emoji = np.random.choice(EMOJI_LIST)
@@ -100,7 +105,16 @@ async def handle_conversation_trigger(
                 )
             )
     else:
-        # Use client_uid as task key for individual conversations
+        # Use client_uid as task key for individual conversations.
+        # ONE ACTIVE TURN PER CLIENT: cancel any in-flight turn first so a
+        # new trigger never runs parallel to the old one (no duplicate
+        # history, no interleaved TTS). The cancelled task cleans its own
+        # TTS queue in `finally` and stores no AI response (CancelledError
+        # skips the persist step); already-sent audio cannot be recalled.
+        previous = current_conversation_tasks.get(client_uid)
+        if previous is not None and not previous.done():
+            logger.info("Cancelling in-flight turn for new trigger")
+            previous.cancel()
         current_conversation_tasks[client_uid] = asyncio.create_task(
             process_single_conversation(
                 context=context,

@@ -1122,6 +1122,12 @@ class WebSocketHandler:
     ) -> None:
         """Handle incoming raw audio data for VAD processing"""
         context = self.client_contexts[client_uid]
+        if context.vad_engine is None:
+            # Backend VAD disabled: raw-audio endpointing unavailable.
+            # Fail safe without crashing the voice session; the client
+            # uses explicit mic-audio-end instead.
+            logger.debug("Ignoring raw-audio-data: backend VAD is disabled")
+            return
         chunk = data.get("audio", [])
         if chunk:
             for audio_bytes in context.vad_engine.detect_speech(chunk):
