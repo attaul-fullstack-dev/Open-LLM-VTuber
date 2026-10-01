@@ -30,6 +30,45 @@ SUMMARY_CONTEXT_PREFIX = (
 )
 
 
+# Cross-session continuity bounds. At most this many previous-session
+# summaries enter a new session's context, each truncated to this many
+# characters. Full transcripts are never injected.
+PREV_SESSION_MAX_COUNT = 2
+PREV_SESSION_MAX_CHARS = 600
+
+
+def build_previous_session_context(
+    items: List[Dict[str, str]],
+) -> str:
+    """Render cached previous-session summaries as one prompt block (pure).
+
+    ``items`` are ``{"age_tag": "[Yesterday | Sep 30]", "text": "..."}``
+    dicts, newest first. Empty string when there is nothing to show, so
+    callers simply omit the block. Texts are already truncated by the
+    loader; this function never touches the store.
+    """
+    blocks = []
+    for item in items or []:
+        text = str((item or {}).get("text", "")).strip()
+        if not text:
+            continue
+        age_tag = str((item or {}).get("age_tag", "")).strip()
+        header = f"{age_tag}\n" if age_tag else ""
+        blocks.append(f"{header}{text}")
+    if not blocks:
+        return ""
+    label = (
+        "RELEVANT PREVIOUS SESSION:"
+        if len(blocks) == 1
+        else "RELEVANT PREVIOUS SESSIONS:"
+    )
+    return (
+        f"{label} (earlier conversations, not the current one; "
+        "the current session is authoritative if they conflict)\n"
+        + "\n---\n".join(blocks)
+    )
+
+
 @dataclass(frozen=True)
 class SummaryState:
     text: str = ""

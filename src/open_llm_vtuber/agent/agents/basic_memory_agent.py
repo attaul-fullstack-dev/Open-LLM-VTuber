@@ -62,8 +62,11 @@ from ..context_window import (
     select_messages_for_context,
 )
 from ..conversation_summary import (
+    PREV_SESSION_MAX_CHARS,
+    PREV_SESSION_MAX_COUNT,
     IncrementalSummarizer,
     SummaryState,
+    build_previous_session_context,
     build_summary_message,
 )
 from ..relationship_context import (
@@ -177,6 +180,11 @@ class BasicMemoryAgent(AgentInterface):
         # rendered per turn so midnight crossings stay correct with zero
         # per-iteration I/O.
         self._prev_session_at: Optional[str] = None
+        # Cached previous-session summaries (newest first), each
+        # {"at": <absolute ISO stamp>, "text": ...}. Resolved once per
+        # history load from persisted rolling summaries; age labels render
+        # per turn below so midnight crossings stay correct.
+        self._prev_session_summaries: List[Dict[str, str]] = []
 
         self._formatted_tools_openai = []
         self._formatted_tools_claude = []
@@ -380,6 +388,57 @@ class BasicMemoryAgent(AgentInterface):
                 best = stamp
         return best or None
 
+    @staticmethod
+    def _load_previous_session_summaries(
+        conf_uid: str, current_history_uid: str
+    ) -> List[Dict[str, str]]:
+        """Persisted rolling summaries of previous sessions (newest first).
+
+        Read-only and bounded: at most PREV_SESSION_MAX_COUNT sessions,
+        each truncated to PREV_SESSION_MAX_CHARS. Skips the current
+        session, empty/corrupt stores, and sessions without a usable
+        summary. Each item keeps the absolute ``at`` stamp
+        (``summary_updated_at``, falling back to the session timestamp);
+        relative age labels render per turn, so nothing relative is ever
+        stored.
+        """
+        try:
+            histories = get_history_list(conf_uid, cleanup=False)
+        except Exception:
+            return []
+        ranked = []
+        for item in histories or []:
+            try:
+                uid = str((item or {}).get("uid", ""))
+                if not uid or uid == str(current_history_uid):
+                    continue
+                stamp = str((item or {}).get("timestamp") or "")
+            except Exception:
+                continue
+            if stamp:
+                ranked.append((stamp, uid))
+        ranked.sort(reverse=True)
+        out: List[Dict[str, str]] = []
+        for stamp, uid in ranked:
+            if len(out) >= PREV_SESSION_MAX_COUNT:
+                break
+            try:
+                metadata = get_metadata(conf_uid, uid)
+            except Exception:
+                continue
+            if not isinstance(metadata, dict):
+                continue
+            text = metadata.get("conversation_summary", "")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            at = metadata.get("summary_updated_at") or stamp
+            if not isinstance(at, str) or not at.strip():
+                continue
+            out.append(
+                {"at": at.strip(), "text": text.strip()[:PREV_SESSION_MAX_CHARS]}
+            )
+        return out
+
     @property
     def relationship_status(self) -> RelationshipStatus:
         """Expose the character-level relationship state for backend/tests."""
@@ -400,6 +459,26 @@ class BasicMemoryAgent(AgentInterface):
         )
         if recency_line:
             parts.append(recency_line)
+        # Cross-session continuity: cached previous-session summaries,
+        # rendered per turn with dynamic age tags. Read-only cache from
+        # history load; never the current session; bounded count/chars.
+        prev_items = []
+        for cached in getattr(self, "_prev_session_summaries", None) or []:
+            try:
+                text = str((cached or {}).get("text", ""))
+                at = str((cached or {}).get("at", ""))
+            except Exception:
+                continue
+            if text.strip() and at.strip():
+                prev_items.append(
+                    {
+                        "age_tag": memory_age_label(at, tz=self._user_timezone),
+                        "text": text,
+                    }
+                )
+        prev_block = build_previous_session_context(prev_items)
+        if prev_block:
+            parts.append(prev_block)
         # Stage 7: VERY COMPACT read-only World/Life snapshot. Reconciled
         # lazily on every turn (conversation + proactive share this path),
         # persisted only when something actually changed. Fail-soft: the
@@ -998,6 +1077,9 @@ class BasicMemoryAgent(AgentInterface):
         self._user_timezone = user_timezone
         messages = get_history(conf_uid, history_uid)
         self._prev_session_at = self._latest_other_session_at(conf_uid, history_uid)
+        self._prev_session_summaries = self._load_previous_session_summaries(
+            conf_uid, history_uid
+        )
 
         self._memory = []
         for msg in messages:
