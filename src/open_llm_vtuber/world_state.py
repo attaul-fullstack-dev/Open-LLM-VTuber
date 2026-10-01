@@ -444,6 +444,26 @@ def memory_age_label(
     return f"[{label} | {date_str}]"
 
 
+def format_session_recency(
+    last_at: Any,
+    moment: Optional[datetime] = None,
+    tz: Optional[str] = None,
+) -> str:
+    """One-line "previous conversation" recency for the system prompt (pure).
+
+    Derived at context-build time from the previous session's absolute
+    timestamp — never stored. Empty string when there is no previous
+    session or the timestamp is unparseable, so callers simply omit it.
+    """
+    if not last_at:
+        return ""
+    parts = relative_day_parts(last_at, moment, tz)
+    if parts is None:
+        return ""
+    label, date_str = parts
+    return f"Previous conversation: {label.lower()} ({date_str})."
+
+
 def location_for(
     activity: str,
     moment: datetime,
@@ -901,7 +921,10 @@ def _normalize_emotion_label(value: Any) -> str:
 
 
 def apply_reactive(
-    state: WorldState, emotion_keys: List[str], now: datetime
+    state: WorldState,
+    emotion_keys: List[str],
+    now: datetime,
+    tz: Optional[str] = None,
 ) -> Tuple[WorldState, bool]:
     """Apply one deterministic interaction-driven transition (pure, no I/O).
 
@@ -997,7 +1020,7 @@ def apply_reactive(
                 "from": current.activity,
                 "to": new_activity,
                 "at": _to_iso(moment),
-                "location": location_for(new_activity, moment, current.location),
+                "location": location_for(new_activity, moment, current.location, tz),
             },
         ][-HISTORY_CAP:]
 
@@ -1011,7 +1034,7 @@ def apply_reactive(
         return current, False
     return (
         WorldState(
-            location=location_for(new_activity, moment, current.location)
+            location=location_for(new_activity, moment, current.location, tz)
             if activity_changed
             else current.location,
             activity=new_activity,

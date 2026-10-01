@@ -54,11 +54,19 @@ def format_turns_for_summary(messages: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def build_summary_message(summary: str, role: str = "system") -> Dict[str, str]:
-    """Build clearly-labelled internal context; never masquerade as user input."""
+def build_summary_message(
+    summary: str, role: str = "system", age_tag: str = ""
+) -> Dict[str, str]:
+    """Build clearly-labelled internal context; never masquerade as user input.
+
+    ``age_tag`` (e.g. ``[Yesterday | Sep 30]``) prefixes the summary with
+    its render-time age so the persisted ``summary_updated_at`` is not
+    silently stripped at retrieval.
+    """
+    tag = f"{age_tag.strip()} " if age_tag and age_tag.strip() else ""
     return {
         "role": role,
-        "content": f"{SUMMARY_CONTEXT_PREFIX}{summary.strip()}",
+        "content": f"{SUMMARY_CONTEXT_PREFIX}{tag}{summary.strip()}",
     }
 
 

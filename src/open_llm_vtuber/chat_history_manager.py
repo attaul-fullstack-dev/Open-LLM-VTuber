@@ -330,8 +330,13 @@ def delete_history(conf_uid: str, history_uid: str) -> bool:
     return False
 
 
-def get_history_list(conf_uid: str) -> List[dict]:
-    """Get list of histories with their latest messages"""
+def get_history_list(conf_uid: str, cleanup: bool = True) -> List[dict]:
+    """Get list of histories with their latest messages.
+
+    ``cleanup=False`` makes the scan strictly read-only (no empty-history
+    deletion) for callers like session-recency that must never mutate the
+    store as a side effect.
+    """
     if not conf_uid:
         return []
 
@@ -383,7 +388,7 @@ def get_history_list(conf_uid: str) -> List[dict]:
                 continue
 
         # Clean up empty histories if there are other non-empty ones
-        if len(empty_history_uids) > 0 and len(os.listdir(conf_dir)) > 1:
+        if cleanup and len(empty_history_uids) > 0 and len(os.listdir(conf_dir)) > 1:
             for uid in empty_history_uids:
                 try:
                     os.remove(os.path.join(conf_dir, f"{uid}.json"))

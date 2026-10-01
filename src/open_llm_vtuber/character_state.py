@@ -68,6 +68,10 @@ class CharacterState:
     relationship_migrated: bool = False
     memories: List[Dict[str, Any]] = field(default_factory=list)
     goals: List[Dict[str, Any]] = field(default_factory=list)
+    # Last known user timezone (IANA name, e.g. "Asia/Jakarta"). Session
+    # scope by design: refreshed whenever the frontend sends a valid value,
+    # used as fallback when a turn carries no timezone (restart/proactive).
+    user_timezone: Optional[str] = None
 
 
 GoalStatus = Literal["seed", "active", "done"]
@@ -140,11 +144,10 @@ def default_seed_goals(now: Optional[datetime] = None) -> List[Dict[str, Any]]:
     - try-three-dishes: 3 distinct eating-related evidence items.
     - finish-one-book: explicit user statement that the book is finished.
     """
-    stamp = (now if now is not None else datetime.now(timezone.utc)).isoformat(
-        timespec="seconds"
-    )
-    if not stamp.endswith("+00:00"):
-        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    moment = now if now is not None else datetime.now(timezone.utc)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    stamp = moment.astimezone(timezone.utc).isoformat(timespec="seconds")
     seeds = [
         ("morning-reading-week", "membaca pagi 7 hari berturut-turut"),
         ("try-three-dishes", "mencoba 3 makanan berbeda"),
@@ -258,6 +261,7 @@ def load_character_state(conf_uid: str) -> CharacterState:
             relationship_migrated=bool(data.get("relationship_migrated", False)),
             memories=memories,
             goals=goals,
+            user_timezone=str(data.get("user_timezone") or "") or None,
         )
     except Exception as error:
         logger.error(
@@ -280,6 +284,7 @@ def save_character_state(conf_uid: str, state: CharacterState) -> bool:
                 "relationship_migrated": state.relationship_migrated,
                 "memories": state.memories,
                 "goals": state.goals,
+                "user_timezone": state.user_timezone,
             }
             _write_state_atomic(filepath, data)
         return True
@@ -379,6 +384,25 @@ def set_character_relationship(
     state.relationship_updated_at = updated_at or _now_iso()
     state.relationship_reason = trigger
     state.relationship_migrated = True
+    if not save_character_state(conf_uid, state):
+        return None
+    return state
+
+
+def set_character_timezone(
+    conf_uid: str, tz: Optional[str]
+) -> Optional[CharacterState]:
+    """Persist the last known user timezone; None on write failure.
+
+    Fail-soft by design: blank/unknown values never wipe a stored one.
+    """
+    name = str(tz or "").strip()
+    if not name:
+        return None
+    state = load_character_state(conf_uid)
+    if state.user_timezone == name:
+        return state
+    state.user_timezone = name
     if not save_character_state(conf_uid, state):
         return None
     return state

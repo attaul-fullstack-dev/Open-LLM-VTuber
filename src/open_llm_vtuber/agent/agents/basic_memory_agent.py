@@ -18,6 +18,7 @@ from ..stateless_llm.claude_llm import AsyncLLM as ClaudeAsyncLLM
 from ..stateless_llm.openai_compatible_llm import AsyncLLM as OpenAICompatibleAsyncLLM
 from ...chat_history_manager import (
     get_history,
+    get_history_list,
     get_metadata,
     update_summary_metadata,
 )
@@ -75,9 +76,11 @@ from ..relationship_context import (
 from ...world_state import (
     apply_reactive,
     build_world_state_context,
+    format_session_recency,
     format_temporal_anchor,
     load_and_reconcile_world_state,
     load_world_state,
+    memory_age_label,
     reconcile,
     save_world_state,
     utcnow,
@@ -169,6 +172,11 @@ class BasicMemoryAgent(AgentInterface):
         self._character_conf_uid: Optional[str] = None
         # IANA timezone for user-local World State time rules (None = UTC).
         self._user_timezone: Optional[str] = None
+        # Absolute timestamp (UTC ISO) of the latest message in a *previous*
+        # session. Cached once per history load; the recency line itself is
+        # rendered per turn so midnight crossings stay correct with zero
+        # per-iteration I/O.
+        self._prev_session_at: Optional[str] = None
 
         self._formatted_tools_openai = []
         self._formatted_tools_claude = []
@@ -321,6 +329,11 @@ class BasicMemoryAgent(AgentInterface):
         state = migrate_relationship_if_needed(conf_uid, state)
         self._character_state = state
         self._character_conf_uid = conf_uid
+        # Restart/offline fallback: a turn may carry no timezone (proactive,
+        # reconnect). The persisted last-known zone keeps local
+        # interpretation stable; a fresh session value always wins.
+        if not self._user_timezone:
+            self._user_timezone = state.user_timezone
         self._relationship_state = RelationshipState(
             status=state.relationship_status,
             updated_at=state.relationship_updated_at,
@@ -340,6 +353,33 @@ class BasicMemoryAgent(AgentInterface):
             len(state.memories),
         )
 
+    @staticmethod
+    def _latest_other_session_at(
+        conf_uid: str, current_history_uid: str
+    ) -> Optional[str]:
+        """Latest message timestamp of any session except the current one.
+
+        Fail-soft: unreadable store or no previous session yields None and
+        the recency line is simply omitted from the prompt.
+        """
+        try:
+            # Read-only scan: must never delete empty histories (legacy
+            # migration reads them later in this same load path).
+            histories = get_history_list(conf_uid, cleanup=False)
+        except Exception:
+            return None
+        best = ""
+        for item in histories or []:
+            try:
+                if str(item.get("uid", "")) == str(current_history_uid):
+                    continue
+                stamp = str(item.get("timestamp") or "")
+            except Exception:
+                continue
+            if stamp and stamp > best:
+                best = stamp
+        return best or None
+
     @property
     def relationship_status(self) -> RelationshipStatus:
         """Expose the character-level relationship state for backend/tests."""
@@ -353,6 +393,13 @@ class BasicMemoryAgent(AgentInterface):
             # formatter stays deterministic under test via fixed moments.
             format_temporal_anchor(tz=self._user_timezone),
         ]
+        # Previous-session recency: absolute timestamp rendered per turn
+        # (midnight-safe), cached timestamp resolved once per history load.
+        recency_line = format_session_recency(
+            getattr(self, "_prev_session_at", None), tz=self._user_timezone
+        )
+        if recency_line:
+            parts.append(recency_line)
         # Stage 7: VERY COMPACT read-only World/Life snapshot. Reconciled
         # lazily on every turn (conversation + proactive share this path),
         # persisted only when something actually changed. Fail-soft: the
@@ -593,7 +640,10 @@ class BasicMemoryAgent(AgentInterface):
                 raw, moment, getattr(self, "_user_timezone", None)
             )
             updated, changed = apply_reactive(
-                reconciled, emotion_keys or [], moment
+                reconciled,
+                emotion_keys or [],
+                moment,
+                tz=getattr(self, "_user_timezone", None),
             )
             if not changed:
                 return False
@@ -841,7 +891,13 @@ class BasicMemoryAgent(AgentInterface):
                 "assistant" if isinstance(self._llm, ClaudeAsyncLLM) else "system"
             )
             request_source = [
-                build_summary_message(self._summary_state.text, role=summary_role),
+                build_summary_message(
+                    self._summary_state.text,
+                    role=summary_role,
+                    age_tag=memory_age_label(
+                        self._summary_state.updated_at, tz=self._user_timezone
+                    ),
+                ),
                 *messages[through:],
             ]
             final_protected_start = 1 + protected_start - through
@@ -941,6 +997,7 @@ class BasicMemoryAgent(AgentInterface):
         """Load memory from chat history."""
         self._user_timezone = user_timezone
         messages = get_history(conf_uid, history_uid)
+        self._prev_session_at = self._latest_other_session_at(conf_uid, history_uid)
 
         self._memory = []
         for msg in messages:

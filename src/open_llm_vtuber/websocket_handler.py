@@ -29,6 +29,7 @@ from .conversations.conversation_handler import (
     handle_individual_interrupt,
 )
 from .world_state import load_and_reconcile_world_state
+from .character_state import set_character_timezone
 from .conversations.single_conversation import process_single_conversation
 from .conversations.conversation_utils import EMOJI_LIST
 from .proactive_chat import (
@@ -146,6 +147,16 @@ class WebSocketHandler:
             agent = getattr(context, "agent_engine", None)
             if agent is not None and hasattr(agent, "_user_timezone"):
                 agent._user_timezone = context.user_timezone
+            # Persist last-known zone so restart/proactive turns keep
+            # user-local interpretation before the next frontend message.
+            try:
+                conf_uid = getattr(
+                    getattr(context, "character_config", None), "conf_uid", None
+                )
+                if conf_uid:
+                    set_character_timezone(conf_uid, context.user_timezone)
+            except Exception:
+                pass
 
     @staticmethod
     def _proactive_config(context: ServiceContext) -> ProactiveChatConfig:
