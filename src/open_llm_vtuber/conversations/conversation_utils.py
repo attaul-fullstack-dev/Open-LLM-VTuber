@@ -16,6 +16,33 @@ from ..tts.tts_interface import TTSInterface
 from ..utils.stream_audio import prepare_audio_payload
 
 
+# Upper bound for waiting on the frontend playback-complete signal. The
+# frontend emits it after full audio playback; if it never arrives (dead
+# socket, missed audio), the turn must still finish its lifecycle instead
+# of hanging forever and blocking the receive loop via proactive shield.
+PLAYBACK_COMPLETE_TIMEOUT_S = 120.0
+
+
+async def safe_send(websocket_send: WebSocketSend, payload: str) -> bool:
+    """Best-effort lifecycle send; never raises, never retries.
+
+    A dead socket must not kill turn finalization: log once and let the
+    caller continue the lifecycle (chain-end etc.). No retry — redelivery
+    to a dead socket only produces duplicates or cascaded failures.
+    """
+    try:
+        await websocket_send(payload)
+        return True
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        logger.warning(
+            "Lifecycle send skipped (connection unavailable): type={}",
+            type(error).__name__,
+        )
+        return False
+
+
 # Convert class methods to standalone functions
 def create_batch_input(
     input_text: str,
@@ -140,14 +167,15 @@ async def handle_audio_output(
 
 
 async def send_conversation_start_signals(websocket_send: WebSocketSend) -> None:
-    """Send initial conversation signals"""
-    await websocket_send(
+    """Send initial conversation signals (best-effort; see safe_send)."""
+    await safe_send(
+        websocket_send,
         json.dumps(
             {
                 "type": "control",
                 "text": "conversation-chain-start",
             }
-        )
+        ),
     )
 
 
@@ -179,12 +207,16 @@ async def finalize_conversation_turn(
     tracker = get_latency_tracker()
     if tts_manager.task_list:
         await asyncio.gather(*tts_manager.task_list)
-        await websocket_send(json.dumps({"type": "backend-synth-complete"}))
+        await safe_send(
+            websocket_send, json.dumps({"type": "backend-synth-complete"})
+        )
 
         if tracker:
             tracker.mark("playback_start")
         response = await message_handler.wait_for_response(
-            client_uid, "frontend-playback-complete"
+            client_uid,
+            "frontend-playback-complete",
+            timeout=PLAYBACK_COMPLETE_TIMEOUT_S,
         )
         if tracker:
             tracker.mark("playback_end")
@@ -193,10 +225,17 @@ async def finalize_conversation_turn(
             )
 
         if not response:
-            logger.warning(f"No playback completion response from {client_uid}")
-            return
+            # Frontend never confirmed playback (dead socket or missed
+            # audio). The turn still ends: emit the lifecycle tail so no
+            # task hangs and the next trigger starts clean.
+            logger.warning(
+                "No playback completion response from {} "
+                "(timeout={}s); ending turn anyway",
+                client_uid,
+                PLAYBACK_COMPLETE_TIMEOUT_S,
+            )
 
-    await websocket_send(json.dumps({"type": "force-new-message"}))
+    await safe_send(websocket_send, json.dumps({"type": "force-new-message"}))
 
     if broadcast_ctx and broadcast_ctx.broadcast_func:
         await broadcast_ctx.broadcast_func(
@@ -219,7 +258,7 @@ async def send_conversation_end_signal(
         "text": "conversation-chain-end",
     }
 
-    await websocket_send(json.dumps(chain_end_msg))
+    await safe_send(websocket_send, json.dumps(chain_end_msg))
 
     if broadcast_ctx and broadcast_ctx.broadcast_func and broadcast_ctx.group_members:
         await broadcast_ctx.broadcast_func(

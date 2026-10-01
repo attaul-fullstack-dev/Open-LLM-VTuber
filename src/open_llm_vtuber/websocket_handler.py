@@ -740,25 +740,41 @@ class WebSocketHandler:
             await self._activate_proactive_for_history(client_uid, context.history_uid)
 
     async def handle_disconnect(self, client_uid: str) -> None:
-        """Handle client disconnection"""
+        """Handle client disconnection (idempotent; safe to run twice)."""
+        # Capture the context BEFORE popping: group notify and close()
+        # need it, and a second cleanup call must not crash on lookups.
+        context = self.client_contexts.get(client_uid)
         await self._cancel_proactive_timer(client_uid)
         group = self.chat_group_manager.get_client_group(client_uid)
         if group:
-            await handle_group_interrupt(
-                group_id=group.group_id,
-                heard_response="",
-                current_conversation_tasks=self.current_conversation_tasks,
-                chat_group_manager=self.chat_group_manager,
-                client_contexts=self.client_contexts,
-                broadcast_to_group=self.broadcast_to_group,
-            )
+            try:
+                await handle_group_interrupt(
+                    group_id=group.group_id,
+                    heard_response="",
+                    current_conversation_tasks=self.current_conversation_tasks,
+                    chat_group_manager=self.chat_group_manager,
+                    client_contexts=self.client_contexts,
+                    broadcast_to_group=self.broadcast_to_group,
+                )
+            except Exception as error:
+                # A broken peer socket must never abort our own cleanup.
+                logger.warning(
+                    "Group interrupt notify skipped: type={}",
+                    type(error).__name__,
+                )
 
-        await handle_client_disconnect(
-            client_uid=client_uid,
-            chat_group_manager=self.chat_group_manager,
-            client_connections=self.client_connections,
-            send_group_update=self.send_group_update,
-        )
+        try:
+            await handle_client_disconnect(
+                client_uid=client_uid,
+                chat_group_manager=self.chat_group_manager,
+                client_connections=self.client_connections,
+                send_group_update=self.send_group_update,
+            )
+        except Exception as error:
+            logger.warning(
+                "Group disconnect notify skipped: type={}",
+                type(error).__name__,
+            )
 
         # Clean up other client data
         self.client_connections.pop(client_uid, None)
@@ -774,9 +790,14 @@ class WebSocketHandler:
             self.current_conversation_tasks.pop(client_uid, None)
 
         # Call context close to clean up resources (e.g., MCPClient)
-        context = self.client_contexts.get(client_uid)
         if context:
-            await context.close()
+            try:
+                await context.close()
+            except Exception as error:
+                logger.warning(
+                    "Service context close skipped: type={}",
+                    type(error).__name__,
+                )
 
         logger.info(f"Client {client_uid} disconnected")
         message_handler.cleanup_client(client_uid)
@@ -841,7 +862,12 @@ class WebSocketHandler:
     ) -> None:
         """Handle conversation interruption"""
         heard_response = data.get("text", "")
-        context = self.client_contexts[client_uid]
+        # Safe lookup: the context may already be gone if a disconnect
+        # cleanup raced this message. Never crash the receive loop here.
+        context = self.client_contexts.get(client_uid)
+        if context is None:
+            logger.warning("Interrupt ignored: unknown client (post-cleanup?)")
+            return
         group = self.chat_group_manager.get_client_group(client_uid)
 
         if group and len(group.members) > 1:
@@ -1169,11 +1195,30 @@ class WebSocketHandler:
             context = self.client_contexts.get(client_uid)
             if context is not None:
                 self._update_user_timezone(context, data)
+        trigger_context = self.client_contexts.get(client_uid)
+        if trigger_context is None:
+            # Disconnect cleanup raced this trigger: answer with an error
+            # event instead of crashing the receive loop with KeyError.
+            logger.warning(
+                "Conversation trigger ignored: unknown client (post-cleanup?)"
+            )
+            try:
+                await websocket.send_text(
+                    json.dumps(
+                        {
+                            "type": "error",
+                            "message": "Session ended during send; please resend.",
+                        }
+                    )
+                )
+            except Exception:
+                pass
+            return
         await handle_conversation_trigger(
             msg_type=msg_type,
             data=data,
             client_uid=client_uid,
-            context=self.client_contexts[client_uid],
+            context=trigger_context,
             websocket=websocket,
             client_contexts=self.client_contexts,
             client_connections=self.client_connections,

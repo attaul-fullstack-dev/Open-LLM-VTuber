@@ -83,27 +83,34 @@ async def handle_conversation_trigger(
 
     group = chat_group_manager.get_client_group(client_uid)
     if group and len(group.members) > 1:
-        # Use group_id as task key for group conversations
+        # Use group_id as task key for group conversations. Same
+        # one-active-turn rule as the single path: cancel the in-flight
+        # group turn so a new trigger is never silently dropped and two
+        # turns never run in parallel.
         task_key = group.group_id
-        if (
-            task_key not in current_conversation_tasks
-            or current_conversation_tasks[task_key].done()
-        ):
+        previous = current_conversation_tasks.get(task_key)
+        if previous is not None and not previous.done():
+            logger.info(
+                "Cancelling in-flight group turn for new trigger: group_id={}",
+                task_key,
+            )
+            previous.cancel()
+        else:
             logger.info(f"Starting new group conversation for {task_key}")
 
-            current_conversation_tasks[task_key] = asyncio.create_task(
-                process_group_conversation(
-                    client_contexts=client_contexts,
-                    client_connections=client_connections,
-                    broadcast_func=broadcast_to_group,
-                    group_members=group.members,
-                    initiator_client_uid=client_uid,
-                    user_input=user_input,
-                    images=images,
-                    session_emoji=session_emoji,
-                    metadata=metadata,
-                )
+        current_conversation_tasks[task_key] = asyncio.create_task(
+            process_group_conversation(
+                client_contexts=client_contexts,
+                client_connections=client_connections,
+                broadcast_func=broadcast_to_group,
+                group_members=group.members,
+                initiator_client_uid=client_uid,
+                user_input=user_input,
+                images=images,
+                session_emoji=session_emoji,
+                metadata=metadata,
             )
+        )
     else:
         # Use client_uid as task key for individual conversations.
         # ONE ACTIVE TURN PER CLIENT: cancel any in-flight turn first so a

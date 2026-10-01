@@ -13,6 +13,7 @@ from .conversation_utils import (
     process_user_input,
     finalize_conversation_turn,
     cleanup_conversation,
+    safe_send,
     EMOJI_LIST,
 )
 from .types import WebSocketSend
@@ -284,8 +285,9 @@ async def process_single_conversation(
     except Exception as e:
         latency.internal_error = type(e).__name__
         logger.error(f"Error in conversation chain: {e}")
-        await websocket_send(
-            json.dumps({"type": "error", "message": f"Conversation error: {str(e)}"})
+        await safe_send(
+            websocket_send,
+            json.dumps({"type": "error", "message": f"Conversation error: {str(e)}"}),
         )
         raise
     finally:
