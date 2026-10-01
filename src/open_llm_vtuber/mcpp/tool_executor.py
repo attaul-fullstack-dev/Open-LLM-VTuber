@@ -24,6 +24,47 @@ class ToolExecutor:
     ):
         self._mcp_client = mcp_client
         self._tool_manager = tool_manager
+        # Turn-scoped router-search results: normalized query -> prior
+        # result text. Filled by note_router_search() when the Phase 3
+        # router executes a search, drained by clear_router_search() in
+        # the turn finally. Lets execute_tools() serve an identical
+        # same-turn model search from cache instead of a second MCP call.
+        self._router_search_cache: Dict[str, str] = {}
+
+    def note_router_search(self, query: Any, result_text: str) -> None:
+        """Cache one router-executed search for this turn (Phase 3 guard).
+
+        A later identical model-issued ``search`` in the same turn is
+        served from this cache. Cleared per turn via clear_router_search;
+        never persisted anywhere.
+        """
+        from .search_router import normalize_search_query
+
+        normalized = normalize_search_query(query).lower()
+        if normalized:
+            self._router_search_cache[normalized] = str(result_text or "")
+
+    def clear_router_search(self) -> None:
+        """Drop turn-scoped router-search state (idempotent)."""
+        self._router_search_cache.clear()
+
+    def _router_cached_result(self, tool_name: str, tool_input: Any) -> Any:
+        """Prior result text for a duplicate same-turn search, else None.
+
+        Only applies to tool_name == "search" with an exact normalized
+        query match. Non-search tools, missing/non-dict inputs, and
+        different queries always return None (execute normally).
+        """
+        from .search_router import normalize_search_query
+
+        if tool_name != SEARCH_TOOL_NAME:
+            return None
+        if not isinstance(tool_input, dict):
+            return None
+        normalized = normalize_search_query(tool_input.get("query", "")).lower()
+        if not normalized:
+            return None
+        return self._router_search_cache.get(normalized)
 
     def parse_tool_call(self, call: Union[Dict[str, Any], ToolCallObject]) -> tuple:
         """Parse tool call from different formats.
@@ -203,6 +244,34 @@ class ToolExecutor:
                 if formatted_result:
                     tool_results_for_llm.append(formatted_result)
                 continue  # Skip execution logic for this call
+
+            # Phase 3 duplicate-search guard: a model-issued search
+            # identical to this turn's router search is served from the
+            # cached prior result — no second MCP call, no Phase 1 retry,
+            # no error. Anything else executes normally.
+            cached_text = self._router_cached_result(tool_name, tool_input)
+            if cached_text is not None:
+                logger.info(
+                    "Serving duplicate same-turn search from router cache (no MCP call)"
+                )
+                status_update = {
+                    "type": "tool_call_status",
+                    "tool_id": tool_id,
+                    "tool_name": tool_name,
+                    "status": "completed",
+                    "content": cached_text,
+                    "timestamp": datetime.datetime.now(
+                        datetime.timezone.utc
+                    ).isoformat()
+                    + "Z",
+                }
+                yield status_update
+                formatted_result = self.format_tool_result(
+                    caller_mode, tool_id, cached_text, False
+                )
+                if formatted_result:
+                    tool_results_for_llm.append(formatted_result)
+                continue
 
             # Yield 'running' status before execution
             yield {

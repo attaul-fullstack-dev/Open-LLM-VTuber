@@ -102,8 +102,58 @@ async def process_single_conversation(
             input_text = await process_user_input(
                 user_input, context.asr_engine, websocket_send
             )
+            # Phase 3 deterministic search routing: runs once per user
+            # turn, before the agent. On SEARCH_REQUIRED the existing
+            # ToolExecutor (with Phase 1 reliability) runs the search and
+            # its labeled block joins the LLM input text. History keeps
+            # the clean user text; nothing router-related is persisted.
+            llm_text = input_text
+            if input_text.strip():
+                from ..mcpp.search_router import (
+                    SEARCH_EXECUTED_NO_RESULTS,
+                    SEARCH_EXECUTED_SUCCESS,
+                    SEARCH_EXECUTION_ERROR,
+                    SEARCH_REQUIRED_NOT_EXECUTED,
+                    execute_router_search,
+                    is_search_required,
+                )
+
+                if is_search_required(input_text):
+                    router_executor = getattr(
+                        context.agent_engine, "_tool_executor", None
+                    )
+                    if router_executor is None:
+                        logger.warning(
+                            "Search router required search but no tool "
+                            "executor is available; continuing without "
+                            "search results"
+                        )
+                        latency.set_search_state(SEARCH_REQUIRED_NOT_EXECUTED)
+                    else:
+                        router_result = await execute_router_search(
+                            router_executor, input_text
+                        )
+                        latency.set_search_state(
+                            router_result.state, router_result.result_count
+                        )
+                        # Register the executed query so a duplicate
+                        # same-turn model search is served from cache
+                        # (application-level guard; cleared in finally).
+                        try:
+                            router_executor.note_router_search(
+                                router_result.query,
+                                router_result.block_text,
+                            )
+                        except Exception:
+                            pass
+                        if router_result.state in (
+                            SEARCH_EXECUTED_SUCCESS,
+                            SEARCH_EXECUTED_NO_RESULTS,
+                            SEARCH_EXECUTION_ERROR,
+                        ):
+                            llm_text = f"{input_text}\n\n{router_result.block_text}"
             batch_input = create_batch_input(
-                input_text=input_text,
+                input_text=llm_text,
                 images=images,
                 from_name=context.character_config.human_name,
                 metadata=metadata,
@@ -291,6 +341,16 @@ async def process_single_conversation(
         )
         raise
     finally:
+        # Turn-scoped router-search guard state is always dropped here:
+        # normal completion, cancellation, exception, and early return.
+        try:
+            router_executor_for_cleanup = getattr(
+                context.agent_engine, "_tool_executor", None
+            )
+            if router_executor_for_cleanup is not None:
+                router_executor_for_cleanup.clear_router_search()
+        except Exception:
+            pass
         try:
             await latency.complete()
         except Exception as latency_error:

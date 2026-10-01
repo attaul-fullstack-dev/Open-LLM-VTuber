@@ -334,6 +334,11 @@ class RequestLatencyTracker:
     client_disconnected: bool = False
     internal_error: Optional[str] = None
     provider_call_expected: bool = True
+    # Phase 3 deterministic search routing: per-turn application-level
+    # search state, kept outside _memory and surfaced in metrics/TRACE so
+    # "model claimed search" can be checked against actual execution.
+    search_state: str = "SEARCH_NOT_REQUESTED"
+    search_result_count: Optional[int] = None
 
     _provider_stream_completed: bool = False
     _first_token_emitted: bool = False
@@ -395,6 +400,11 @@ class RequestLatencyTracker:
     def add_tool(self, duration_ms: float) -> None:
         self.add_time("tool_ms", duration_ms)
         self.tool_used = True
+
+    def set_search_state(self, state: str, result_count: Optional[int] = None) -> None:
+        """Record the router's per-turn search state (Phase 3)."""
+        self.search_state = state
+        self.search_result_count = result_count
 
     def add_tts_enqueue(self, duration_ms: float) -> None:
         self.add_time("tts_enqueue_ms", duration_ms)
@@ -693,6 +703,8 @@ class RequestLatencyTracker:
             "summary_triggered": self.summary_triggered,
             "tool_ms": round(self.tool_ms, 2),
             "tool_used": self.tool_used,
+            "search_state": self.search_state,
+            "search_result_count": self.search_result_count,
             "character_event_ms": round(self.character_event_ms, 2),
             "tts_enqueue_ms": round(self.tts_enqueue_ms, 2),
             "tts_synthesis_ms": round(self.tts_synthesis_ms, 2),
