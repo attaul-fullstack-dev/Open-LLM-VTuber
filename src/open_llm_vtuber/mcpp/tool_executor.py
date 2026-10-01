@@ -13,6 +13,7 @@ from typing import (
 from .types import ToolCallObject
 from .mcp_client import MCPClient
 from .tool_manager import ToolManager
+from .search_reliability import SEARCH_TOOL_NAME, execute_search_with_reliability
 
 
 class ToolExecutor:
@@ -329,11 +330,34 @@ class ToolExecutor:
             is_error = True
         else:
             try:
-                result_dict = await self._mcp_client.call_tool(
-                    server_name=tool_info.related_server,
-                    tool_name=tool_name,
-                    tool_args=tool_input,
-                )
+                if tool_name == SEARCH_TOOL_NAME:
+                    # Structured web-search reliability: status
+                    # classification + at most one safe retry on empty
+                    # results. Schema and downstream handling unchanged.
+                    server_name = tool_info.related_server
+
+                    async def _call_search(
+                        attempt_args: Dict[str, Any],
+                    ) -> Dict[str, Any]:
+                        return await self._mcp_client.call_tool(
+                            server_name=server_name,
+                            tool_name=tool_name,
+                            tool_args=attempt_args,
+                        )
+
+                    (
+                        result_dict,
+                        _search_outcome,
+                    ) = await execute_search_with_reliability(
+                        _call_search,
+                        tool_input,
+                    )
+                else:
+                    result_dict = await self._mcp_client.call_tool(
+                        server_name=tool_info.related_server,
+                        tool_name=tool_name,
+                        tool_args=tool_input,
+                    )
 
                 metadata = result_dict.get("metadata", {})
                 content_items = result_dict.get("content_items", [])
