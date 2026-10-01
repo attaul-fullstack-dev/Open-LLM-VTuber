@@ -83,8 +83,14 @@ _EXPLICIT_INFO = re.compile(
     r"|\b(informasi|berita|sumber|artikel)\b.{0,25}\b(tentang|terkini|"
     r"terbaru)\b"
 )
+# List/quote prefixes users put in front of an imperative ("1. Cari X",
+# "- Cari X", '"Cari X"'). Stripped before the verb match; the verb itself
+# is still mandatory, so "2. charger ..." never matches here.
+_LIST_PREFIX = r"(?:\d+[.)]\s*|[-•*]\s*|[\"'“”‘’]+\s*)?"
 _IMPERATIVE_HEAD = re.compile(
-    r"^(cari|carikan|search|find|cek|coba cek|coba cari|tolong cari|"
+    r"^"
+    + _LIST_PREFIX
+    + r"(cari|carikan|search|find|cek|coba cek|coba cari|tolong cari|"
     r"tolong carikan)\b\s*(.+)$"
 )
 _VERIFY = re.compile(

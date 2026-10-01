@@ -43,6 +43,21 @@ class ExplicitSearchTest(unittest.TestCase):
                 self.assertEqual(classify_search_intent(text), SEARCH_REQUIRED)
                 self.assertTrue(is_search_required(text))
 
+    def test_a_numbered_list_prefix(self):
+        # Phase 4: browser inputs arrive as numbered list items.
+        for text in [
+            "1. Cari game The NOexistenceN of you AND me",
+            "2. Cari MiMo-V2.6-Flash",
+            "1) Cari MiMo-V2.6-Flash",
+            "- Cari MiMo-V2.6-Flash",
+            "• Cari MiMo-V2.6-Flash",
+            '"Cari MiMo-V2.6-Flash"',
+            "Cari MiMo-V2.6-Flash",
+        ]:
+            with self.subTest(text=text):
+                self.assertEqual(classify_search_intent(text), SEARCH_REQUIRED)
+                self.assertTrue(is_search_required(text))
+
 
 class FreshnessTest(unittest.TestCase):
     def test_b_current_info(self):
@@ -78,6 +93,8 @@ class AmbiguousTest(unittest.TestCase):
     def test_d_personal_physical_stays_chat(self):
         for text in [
             "Aku cari charger tadi tapi nggak ketemu",
+            "Aku 2 kali cari charger tadi tapi nggak ketemu",
+            "Tadi aku cari charger",
             "Aku lagi cari dompet",
             "Tadi aku cari file itu",
             "Aku mau cari makan",
