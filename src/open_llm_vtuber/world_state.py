@@ -70,7 +70,7 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from loguru import logger
@@ -542,7 +542,43 @@ DecisionReason = Literal[
     "night_rest",
     "cooldown_active",
     "no_change",
+    "goal_related",
+    "relationship_bias",
+    "preference",
+    "mood_bias",
 ]
+
+# Explicit goal -> activity hints, keyed by seeded goal id only (read-only).
+# The decision layer may move toward these activities; it never completes,
+# reactivates, or rewrites a goal, and unknown ids simply never hint.
+DECISION_GOAL_ACTIVITY_HINTS: Dict[str, str] = {
+    "morning-reading-week": "reading",
+    "finish-one-book": "reading",
+    "try-three-dishes": "eating",
+}
+# Relationship only chooses between these two classes; it never touches the
+# scheduled eating slot, resting, or sleeping.
+DECISION_QUIET_ACTIVITIES = ("reading",)
+DECISION_PLAYFUL_ACTIVITIES = ("playing",)
+# Relationship statuses that permit the playful class.
+DECISION_CLOSE_RELATIONSHIPS = ("close", "dating")
+DECISION_MOODS_QUIET = ("tired", "exhausted", "sleepy")
+DECISION_MOODS_PLAYFUL = ("content",)
+
+
+@dataclass(frozen=True)
+class DecisionInputs:
+    """Optional read-only context for the influence stage (pure data).
+
+    Every field is optional and defaults to empty, so a caller that knows
+    nothing about relationship/preferences/goals keeps exactly the previous
+    behaviour. Nothing here is persisted: the layer only reads it.
+    """
+
+    relationship_status: Optional[str] = None
+    goal_activities: tuple = ()  # mapped activities from active goals
+    preferred_activities: tuple = ()  # established preference activities
+    mood_bias: bool = False  # explicit opt-in; an all-default object is inert
 
 
 @dataclass(frozen=True)
@@ -587,30 +623,136 @@ def _activity_age_s(state: WorldState, moment: datetime) -> float:
     )
 
 
-def _pick_stale_idle_activity(
-    state: WorldState, moment: datetime, tz: Optional[str]
-) -> Optional[Tuple[str, DecisionReason]]:
-    """Deterministic pick for long-idle; None = hold. No personality logic."""
-    energy = clamp_energy(state.energy)
-    if energy < DECISION_ACTIVE_MIN_ENERGY:
-        return "resting", "low_energy"
-    context = derive_time_context(moment, tz)
-    recent_to = [
+def _recent_to(state: WorldState) -> List[str]:
+    """Last three transition targets, oldest first (pure)."""
+    return [
         str(item.get("to", ""))
         for item in (state.recent_activity_history or [])[-3:]
         if isinstance(item, dict)
     ]
+
+
+def _eligible_from(
+    activities: object, recent_to: Sequence[str], allowed: Sequence[str]
+) -> Optional[str]:
+    """First activity in ``activities`` that is valid, allowed, and not a repeat."""
+    for activity in activities or ():
+        target = normalize_activity(activity)
+        if target not in allowed or target not in VALID_ACTIVITIES:
+            continue
+        if target in recent_to:
+            continue
+        return target
+    return None
+
+
+def _normalized_relationship(value: object) -> Optional[str]:
+    """Relationship allowlist duplicated locally on purpose.
+
+    ``agent.relationship_context`` imports this module, so importing it back
+    would create a cycle. ``None`` means "no relationship signal" (unknown or
+    not supplied) and skips the relationship stage entirely.
+    """
+    normalized = str(value or "").strip().lower()
+    if normalized in ("stranger", "familiar", "close", "dating"):
+        return normalized
+    return None
+
+
+def _pick_influence_activity(
+    state: WorldState,
+    moment: datetime,
+    tz: Optional[str],
+    recent_to: Sequence[str],
+    inputs: Optional[DecisionInputs],
+) -> Optional[Tuple[str, DecisionReason]]:
+    """Influence stage: goal > relationship > preference > mood (pure).
+
+    Returns ``None`` when no factor names an eligible activity, so the caller
+    falls through to the existing morning/alternation rules unchanged.
+    """
+    if inputs is None:
+        return None
+
+    # 1. Goal: explicit finite objective wins. Eating is only ever reachable
+    #    through its existing morning window, so a goal never invents a meal
+    #    time; outside that window the hint simply falls through.
+    goal_allowed = (
+        ("reading", "eating")
+        if hour_in_eating_window(moment, tz)
+        else ("reading", "playing")
+    )
+    goal_hit = _eligible_from(inputs.goal_activities, recent_to, goal_allowed)
+    if goal_hit is not None:
+        return goal_hit, "goal_related"
+
+    # 2. Relationship: chooses the class, never overrides the goal above.
+    status = _normalized_relationship(inputs.relationship_status)
+    if status is not None:
+        class_order = (
+            DECISION_PLAYFUL_ACTIVITIES
+            if status in DECISION_CLOSE_RELATIONSHIPS
+            else DECISION_QUIET_ACTIVITIES
+        )
+        class_hit = _eligible_from(class_order, recent_to, ("reading", "playing"))
+        if class_hit is not None:
+            return class_hit, "relationship_bias"
+
+    # 3. Preference: established evidence of past behaviour.
+    preferred = _eligible_from(
+        inputs.preferred_activities, recent_to, ("reading", "playing")
+    )
+    if preferred is not None:
+        return preferred, "preference"
+
+    # 4. Mood: weakest, tie-break only inside the same class.
+    if not inputs.mood_bias:
+        return None
+    mood = normalize_mood(state.mood)
+    if mood in DECISION_MOODS_QUIET:
+        mood_order = DECISION_QUIET_ACTIVITIES
+    elif mood in DECISION_MOODS_PLAYFUL:
+        mood_order = DECISION_PLAYFUL_ACTIVITIES
+    else:
+        return None
+    mood_hit = _eligible_from(mood_order, recent_to, ("reading", "playing"))
+    if mood_hit is not None:
+        return mood_hit, "mood_bias"
+    return None
+
+
+def hour_in_eating_window(moment: datetime, tz: Optional[str] = None) -> bool:
+    """True inside the existing morning eating window (user-local hour)."""
+    hour = local_hour(moment, tz)
+    return DECISION_MORNING_EAT_START_HOUR <= hour < DECISION_MORNING_EAT_END_HOUR
+
+
+def _pick_stale_idle_activity(
+    state: WorldState,
+    moment: datetime,
+    tz: Optional[str],
+    inputs: Optional[DecisionInputs] = None,
+) -> Optional[Tuple[str, DecisionReason]]:
+    """Deterministic pick for long-idle; None = hold. No personality logic.
+
+    Precedence: energy -> night -> influence (goal, relationship,
+    preference, mood) -> morning eating -> existing alternation. Every
+    candidate is filtered through the recent-activity anti-repeat rule.
+    """
+    energy = clamp_energy(state.energy)
+    if energy < DECISION_ACTIVE_MIN_ENERGY:
+        return "resting", "low_energy"
+    context = derive_time_context(moment, tz)
+    recent_to = _recent_to(state)
     if context == "night":
         if energy < DECISION_NIGHT_REST_ENERGY:
             return "sleeping", "night_rest"
         return None
-    if context == "morning":
-        hour = local_hour(moment, tz)
-        if (
-            DECISION_MORNING_EAT_START_HOUR <= hour < DECISION_MORNING_EAT_END_HOUR
-            and "eating" not in recent_to
-        ):
-            return "eating", "stale_idle"
+    influence = _pick_influence_activity(state, moment, tz, recent_to, inputs)
+    if influence is not None:
+        return influence
+    if hour_in_eating_window(moment, tz) and "eating" not in recent_to:
+        return "eating", "stale_idle"
     candidates = ["reading", "playing"]
     if recent_to and recent_to[-1] in candidates:
         candidates.remove(recent_to[-1])
@@ -618,17 +760,25 @@ def _pick_stale_idle_activity(
 
 
 def decide_activity(
-    state: WorldState, moment: datetime, tz: Optional[str] = None
+    state: WorldState,
+    moment: datetime,
+    tz: Optional[str] = None,
+    inputs: Optional[DecisionInputs] = None,
 ) -> DecisionResult:
     """Pure deterministic life-activity policy (no I/O, no LLM).
 
     Priority: sleeping holds; duration-limit mirror; stale-idle pick
-    (cooldown-gated, energy-banded); otherwise hold. Extreme low-energy
-    cases are already resolved by transition() before this runs (idle<=10,
+    (cooldown-gated, energy-banded, then the goal/relationship/preference/
+    mood influence stage); otherwise hold. Extreme low-energy cases are
+    already resolved by transition() before this runs (idle<=10,
     playing<=5, night<=30); the decision layer only acts on stale idle,
     so fresh states and pinned transition behavior are never overridden.
     Returned actions are always valid activities; the existing transition
     mechanics stay authoritative at apply time.
+
+    ``inputs`` is optional read-only context (relationship, active goals,
+    established preferences). Omitting it reproduces the previous behaviour
+    exactly, so existing callers and persisted state are unaffected.
     """
     aware = _ensure_aware(moment)
     activity = normalize_activity(state.activity)
@@ -649,7 +799,7 @@ def decide_activity(
     if activity == "idle" and _activity_age_s(state, aware) >= IDLE_STALE_AFTER_S:
         if _decision_cooldown_active(state, aware):
             return _decision_hold(state, aware, "cooldown_active")
-        pick = _pick_stale_idle_activity(state, aware, tz)
+        pick = _pick_stale_idle_activity(state, aware, tz, inputs)
         if pick is None:
             return _decision_hold(state, aware, "no_change")
         target, reason = pick
@@ -819,6 +969,7 @@ def reconcile(
     now: Optional[datetime] = None,
     tz: Optional[str] = None,
     decide: bool = True,
+    inputs: Optional[DecisionInputs] = None,
 ) -> Tuple[WorldState, bool]:
     """Lazily reconcile state against wall-clock time (pure, no I/O).
 
@@ -874,7 +1025,7 @@ def reconcile(
 
     if decide:
         try:
-            decision = decide_activity(updated, moment, tz)
+            decision = decide_activity(updated, moment, tz, inputs)
             applied = _apply_decision(updated, decision, moment, tz)
             if applied is not updated:
                 logger.debug(
@@ -973,6 +1124,7 @@ def apply_reactive(
         ],
         mood_ttl_turns=max(0, int(getattr(state, "mood_ttl_turns", 0) or 0)),
         mood_set_at=getattr(state, "mood_set_at", None),
+        last_autonomous_decision_at=getattr(state, "last_autonomous_decision_at", None),
     )
 
     new_mood = current.mood
@@ -1048,6 +1200,7 @@ def apply_reactive(
             recent_activity_history=history,
             mood_ttl_turns=new_ttl,
             mood_set_at=new_mood_set_at,
+            last_autonomous_decision_at=current.last_autonomous_decision_at,
         ),
         True,
     )
@@ -1206,6 +1359,7 @@ def load_and_reconcile_world_state(
     base_dir: str = WORLD_STATE_DIR,
     tz: Optional[str] = None,
     decide: bool = True,
+    inputs: Optional[DecisionInputs] = None,
 ) -> WorldState:
     """Load, lazily reconcile against ``now``, persist only if changed.
 
@@ -1215,13 +1369,15 @@ def load_and_reconcile_world_state(
     the conversation path continues unchanged. ``tz`` selects the
     user-local hour for time rules; stored timestamps stay UTC.
     ``decide=False`` keeps read-only callers (widget fetch) decision-free.
+    ``inputs`` is optional read-only influence context for the decision
+    stage; omitting it keeps the previous behaviour byte-for-byte.
     """
     try:
         moment = _ensure_aware(now) if now is not None else utcnow()
         filepath = get_world_state_path(conf_uid, base_dir)
         existed = os.path.exists(filepath)
         state = load_world_state(conf_uid, moment, base_dir, tz)
-        reconciled, changed = reconcile(state, moment, tz, decide)
+        reconciled, changed = reconcile(state, moment, tz, decide, inputs)
         if changed or not existed:
             save_world_state(conf_uid, reconciled, base_dir)
         return reconciled

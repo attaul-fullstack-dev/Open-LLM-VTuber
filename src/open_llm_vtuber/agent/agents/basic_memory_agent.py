@@ -41,7 +41,7 @@ from ...character_state import (
     set_character_relationship,
 )
 from ...character_memory_commands import parse_memory_command
-from ...self_model import build_self_context
+from ...self_model import build_self_context, derive_activity_preferences
 from ..transformers import (
     sentence_divider,
     actions_extractor,
@@ -77,6 +77,8 @@ from ..relationship_context import (
     normalize_relationship_status,
 )
 from ...world_state import (
+    DECISION_GOAL_ACTIVITY_HINTS,
+    DecisionInputs,
     apply_reactive,
     build_world_state_context,
     format_session_recency,
@@ -502,7 +504,9 @@ class BasicMemoryAgent(AgentInterface):
         if self._character_conf_uid:
             try:
                 snapshot = load_and_reconcile_world_state(
-                    self._character_conf_uid, tz=self._user_timezone
+                    self._character_conf_uid,
+                    tz=self._user_timezone,
+                    inputs=self._decision_inputs(),
                 )
                 world_line = build_world_state_context(snapshot)
             except Exception as error:
@@ -714,6 +718,52 @@ class BasicMemoryAgent(AgentInterface):
             success,
         )
         return success
+
+    def _decision_inputs(self) -> Optional[DecisionInputs]:
+        """Read-only influence context for the autonomous decision stage.
+
+        Built only from state already loaded for this character (relationship,
+        non-completed goals, established activity preferences derived from
+        long-term memories). Pure, no I/O beyond what is already in memory, no
+        LLM, and fail-soft: any problem returns None, which keeps the previous
+        decision behaviour unchanged. Goals are read only — never completed,
+        reactivated, or rewritten here.
+        """
+        try:
+            state = getattr(self, "_character_state", None)
+            if state is None:
+                return None
+            goal_activities = tuple(
+                DECISION_GOAL_ACTIVITY_HINTS[str(goal.get("id", ""))]
+                for goal in (state.goals or [])
+                if isinstance(goal, dict)
+                and str(goal.get("status", "seed")) != "done"
+                and str(goal.get("id", "")) in DECISION_GOAL_ACTIVITY_HINTS
+            )
+            preferences = derive_activity_preferences(
+                memories=state.memories, tz=getattr(self, "_user_timezone", None)
+            )
+            preferred_activities = tuple(
+                candidate.activity
+                for candidate in preferences
+                if getattr(candidate, "established", False)
+            )
+            if not goal_activities and not preferred_activities:
+                relationship = str(state.relationship_status or "").strip().lower()
+                if relationship in ("", "stranger"):
+                    return DecisionInputs(mood_bias=True)
+            return DecisionInputs(
+                relationship_status=str(state.relationship_status or "stranger"),
+                goal_activities=goal_activities,
+                preferred_activities=preferred_activities,
+                mood_bias=True,
+            )
+        except Exception as error:
+            logger.debug(
+                "Decision inputs unavailable (defaults kept): type={}",
+                type(error).__name__,
+            )
+            return None
 
     def _episodic_context_for_prompt(self) -> str:
         """Render relevant episodic experiences for the current turn (pure I/O).
