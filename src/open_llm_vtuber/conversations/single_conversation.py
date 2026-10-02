@@ -326,6 +326,20 @@ async def process_single_conversation(
                     )
 
         latency.mark("websocket_final_output")
+        # Episodic capture runs after the user-visible response, never
+        # blocking it: gate + one LLM call + validated store, fail-soft.
+        if input_text and not proactive and context.history_uid:
+            capture = getattr(context.agent_engine, "capture_episodic_event", None)
+            if callable(capture):
+                try:
+                    asyncio.create_task(
+                        capture(input_text, context.history_uid)
+                    )
+                except Exception as error:
+                    logger.debug(
+                        "Episodic capture scheduling skipped: type={}",
+                        type(error).__name__,
+                    )
         return full_response  # Return accumulated full_response
 
     except asyncio.CancelledError:

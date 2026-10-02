@@ -88,6 +88,13 @@ from ...world_state import (
     save_world_state,
     utcnow,
 )
+from ...episodic_memory import (
+    extract_and_store_episodic,
+    is_episodic_candidate,
+    load_episodic_events,
+    render_episodic_context,
+    retrieve_episodic_events,
+)
 import time
 from ...request_latency import (
     get_latency_tracker,
@@ -522,6 +529,18 @@ class BasicMemoryAgent(AgentInterface):
         )
         if memory_context:
             parts.append(memory_context)
+        # Episodic experiences: selected past events from any session,
+        # retrieved against the latest user turn. Separate block from
+        # long-term facts; empty when nothing relevant scores.
+        try:
+            episodic_block = self._episodic_context_for_prompt()
+        except Exception as error:
+            logger.warning(
+                "Episodic retrieval skipped: type={}", type(error).__name__
+            )
+            episodic_block = ""
+        if episodic_block:
+            parts.append(episodic_block)
         if world_line:
             parts.append(world_line)
         return "\n\n".join(parts)
@@ -689,6 +708,72 @@ class BasicMemoryAgent(AgentInterface):
             success,
         )
         return success
+
+    def _episodic_context_for_prompt(self) -> str:
+        """Render relevant episodic experiences for the current turn (pure I/O).
+
+        Retrieval query is the latest user message in this session's
+        transcript. Fail-soft: any problem yields "" and the turn is
+        unaffected. Never writes.
+        """
+        if not self._character_conf_uid:
+            return ""
+        query = ""
+        for message in reversed(self._memory or []):
+            if message.get("role") == "user" and str(
+                message.get("content", "")
+            ).strip():
+                query = str(message.get("content", ""))
+                break
+        if not query.strip():
+            return ""
+        events = load_episodic_events(self._character_conf_uid)
+        if not events:
+            return ""
+        selected = retrieve_episodic_events(events, query)
+        if not selected:
+            return ""
+        return render_episodic_context(
+            selected, tz=getattr(self, "_user_timezone", None)
+        )
+
+    async def capture_episodic_event(
+        self, user_text: str, history_uid: str
+    ) -> None:
+        """Fire-and-forget episodic capture for one completed turn.
+
+        Runs after the user-visible response; gate + single LLM call +
+        validated store. Never raises; never blocks the conversation.
+        """
+        started = time.perf_counter()
+        try:
+            if not self._character_conf_uid or not history_uid:
+                return
+            if not is_episodic_candidate(user_text):
+                return
+            llm = getattr(self, "_llm", None)
+            chat_fn = getattr(llm, "chat_completion", None)
+            if not callable(chat_fn):
+                return
+            await extract_and_store_episodic(
+                chat_fn,
+                self._character_conf_uid,
+                user_text,
+                history_uid,
+                utcnow(),
+                getattr(self, "_user_timezone", None),
+            )
+        except Exception as error:
+            logger.warning(
+                "Episodic capture failed (turn unaffected): type={}",
+                type(error).__name__,
+            )
+        finally:
+            tracker = get_latency_tracker()
+            if tracker:
+                tracker.add_time(
+                    "episodic_ms", (time.perf_counter() - started) * 1000.0
+                )
 
     def observe_character_events(
         self,

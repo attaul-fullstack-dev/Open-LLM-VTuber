@@ -316,6 +316,7 @@ class RequestLatencyTracker:
     history_save_ms: float = 0.0
     metadata_save_ms: float = 0.0
     character_state_save_ms: float = 0.0
+    episodic_ms: float = 0.0
 
     # --- phase boundaries (monotonic absolute ms) ---
     _marks: dict[str, float] = field(default_factory=dict)
@@ -716,6 +717,7 @@ class RequestLatencyTracker:
             "history_save_ms": round(self.history_save_ms, 2),
             "metadata_save_ms": round(self.metadata_save_ms, 2),
             "character_state_save_ms": round(self.character_state_save_ms, 2),
+            "episodic_ms": round(self.episodic_ms, 2),
             "response_processing_ms": round(response_processing, 2),
             "provider_call_expected": self.provider_call_expected,
             "provider_started": provider_started,
