@@ -52,6 +52,7 @@ Rules: only real experiences that already happened (did, spent time on, finished
 _PAST_MARKERS = (
     "tadi",
     "kemarin",
+    "semalam",
     "hari ini",
     "minggu lalu",
     "bulan lalu",
@@ -82,6 +83,17 @@ _PAST_MARKERS = (
 # Deterministic "N days ago" references (ID + EN). Resolved arithmetically
 # from the request date; see resolve_occurred_at.
 _N_DAYS_AGO = re.compile(r"(\d{1,3})\s*hari\s*(yang\s+)?lalu|(\d{1,3})\s*days?\s+ago")
+# Relative-day expressions: day-precision only unless a clock time is stated.
+_YESTERDAY_RE = re.compile(r"\b(kemarin|kemaren|semalam|yesterday)\b")
+_TODAY_RE = re.compile(
+    r"\b(hari ini|tadi|baru saja|barusan|today|earlier today|"
+    r"this morning|this afternoon|this evening|just now)\b"
+)
+_CLOCK_MENTION_RE = re.compile(
+    r"\b(?:jam|pukul|at)\s*\d{1,2}(?:[:.]\d{2})?\b"
+    r"|\b\d{1,2}[:.]\d{2}\s*(?:am|pm)?\b"
+    r"|\b\d{1,2}\s*(?:am|pm|pagi|siang|sore|malam|night|morning|evening)\b"
+)
 _FUTURE_MARKERS = (
     "besok",
     "nanti",
@@ -447,13 +459,60 @@ def _resolve_n_days_ago(
     return _local_day_start_utc(request_dt, tz, days)
 
 
+def _has_explicit_clock_time(lowered: str) -> bool:
+    """True when the user states a clock time for the event itself.
+
+    A clock mentioned only as a range end ("sampai jam 2 pagi") is incidental
+    and does not make a relative-day expression time-precise.
+    """
+    for match in _CLOCK_MENTION_RE.finditer(lowered):
+        prefix = lowered[max(0, match.start() - 16) : match.start()]
+        if re.search(r"\b(sampai|sampe|hingga|til|until)\s*$", prefix):
+            continue
+        return True
+    return False
+
+
+def resolve_relative_day_override(
+    text: Any, request_dt: datetime, tz: Optional[str] = None
+) -> Optional[str]:
+    """Deterministic day-precision anchor for relative-day expressions.
+
+    Returns local-day-start UTC ISO when the turn expresses a relative day
+    ("N hari lalu" / "N days ago" / "kemarin" / "semalam" / "hari ini" /
+    "tadi") and states no clock time for the event. Returns None otherwise,
+    so an explicit absolute date or a user-stated clock time keeps priority
+    and the model never becomes the source of truth for the day.
+    """
+    cleaned = " ".join(str(text or "").split()).strip()
+    if not cleaned:
+        return None
+    lowered = cleaned.lower()
+    if _resolve_absolute_date(cleaned, request_dt, tz) is not None:
+        return None
+    if not (
+        _N_DAYS_AGO.search(lowered)
+        or _YESTERDAY_RE.search(lowered)
+        or _TODAY_RE.search(lowered)
+    ):
+        return None
+    if _has_explicit_clock_time(lowered):
+        return None
+    if _N_DAYS_AGO.search(lowered):
+        return _resolve_n_days_ago(cleaned, request_dt, tz)
+    if _YESTERDAY_RE.search(lowered):
+        # "kemarin" and "semalam" both anchor to the previous local day.
+        return _local_day_start_utc(request_dt, tz, 1)
+    return _local_day_start_utc(request_dt, tz, 0)
+
+
 def resolve_occurred_at(
     text: Any, request_dt: datetime, tz: Optional[str] = None
 ) -> Optional[str]:
     """Resolve when the event happened to absolute UTC ISO (pure).
 
     Precedence (most specific first): explicit calendar date, then
-    "N days ago", then "yesterday", then "today/just now". Vague
+    "N days ago", then "yesterday/last night", then "today/just now". Vague
     references ("minggu lalu", weekday names without date) and anything
     unresolvable yield None — never an invented timestamp. Day precision
     is local-midnight converted to UTC.
@@ -468,13 +527,9 @@ def resolve_occurred_at(
     n_days = _resolve_n_days_ago(cleaned, request_dt, tz)
     if n_days is not None:
         return n_days
-    if re.search(r"\b(kemarin|kemaren|yesterday)\b", lowered):
+    if _YESTERDAY_RE.search(lowered):
         return _local_day_start_utc(request_dt, tz, 1)
-    if re.search(
-        r"\b(hari ini|tadi|baru saja|barusan|today|earlier today|"
-        r"this morning|this afternoon|this evening|just now)\b",
-        lowered,
-    ):
+    if _TODAY_RE.search(lowered):
         return _local_day_start_utc(request_dt, tz, 0)
     return None
 
@@ -493,36 +548,54 @@ def build_extraction_prompt(
     return EPISODIC_EXTRACTION_SYSTEM, f"{context}\nUser turn: {user_text.strip()}"
 
 
-def parse_extraction_result(raw: Any) -> Optional[Dict[str, Any]]:
-    """Parse LLM extraction JSON defensively (pure, None on any doubt)."""
+def _parse_extraction_result_detail(
+    raw: Any,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[float]]:
+    """Parse LLM extraction JSON defensively, with a stable failure reason.
+
+    Returns ``(event, None, confidence)`` on success, otherwise
+    ``(None, reason, confidence)`` where ``reason`` is one of
+    ``empty_response``, ``invalid_json``, ``invalid_schema``, ``event_null``,
+    ``empty_event_text``, or ``confidence_below_threshold``. Callers use the
+    reason to log why a gate-passing candidate produced no event.
+    """
     if not isinstance(raw, str) or not raw.strip():
-        return None
+        return None, "empty_response", None
     match = re.search(r"\{.*\}", raw.strip(), re.DOTALL)
     if not match:
-        return None
+        return None, "invalid_json", None
     try:
         data = json.loads(match.group(0))
     except (json.JSONDecodeError, TypeError, ValueError):
-        return None
+        return None, "invalid_json", None
     if not isinstance(data, dict):
-        return None
+        return None, "invalid_schema", None
     if data.get("event") is None and "event_text" not in data:
-        return None
+        return None, "event_null", None
     text = " ".join(str(data.get("event_text", "") or "").split()).strip()
     if not text:
-        return None
+        return None, "empty_event_text", None
     try:
         confidence = float(data.get("confidence", 0.0))
     except (TypeError, ValueError):
-        return None
+        return None, "invalid_schema", None
     if not 0.0 <= confidence <= 1.0:
-        return None
+        return None, "invalid_schema", confidence
     if confidence < EPISODIC_CONFIDENCE_THRESHOLD:
-        return None
+        return None, "confidence_below_threshold", confidence
     occurred = data.get("occurred_at")
     if occurred is not None and not isinstance(occurred, str):
-        return None
-    return {"event_text": text, "occurred_at": occurred, "confidence": confidence}
+        return None, "invalid_schema", confidence
+    return (
+        {"event_text": text, "occurred_at": occurred, "confidence": confidence},
+        None,
+        confidence,
+    )
+
+
+def parse_extraction_result(raw: Any) -> Optional[Dict[str, Any]]:
+    """Parse LLM extraction JSON defensively (pure, None on any doubt)."""
+    return _parse_extraction_result_detail(raw)[0]
 
 
 def _parse_iso_or_none(value: Any) -> Optional[datetime]:
@@ -680,6 +753,30 @@ def render_episodic_context(
     return f"{header}\n" + "\n".join(lines)
 
 
+def _log_extraction_rejection(
+    reason: str,
+    *,
+    confidence: Optional[float] = None,
+    event_chars: Optional[int] = None,
+    session_uid: Optional[str] = None,
+    error_type: Optional[str] = None,
+) -> None:
+    """Warn-level trace for a gate-passing candidate that produced no event.
+
+    Metadata only: never logs user text, prompts, or credentials. Logging is
+    side-effect free, so rejection stays fail-soft for the conversation.
+    """
+    logger.warning(
+        "Episodic extraction rejected: reason={} confidence={} event_chars={} "
+        "session={} error_type={}",
+        reason,
+        "none" if confidence is None else round(float(confidence), 2),
+        "none" if event_chars is None else event_chars,
+        session_uid or "none",
+        error_type or "none",
+    )
+
+
 async def extract_and_store_episodic(
     llm_chat_fn: Any,
     conf_uid: str,
@@ -692,7 +789,9 @@ async def extract_and_store_episodic(
 
     ``llm_chat_fn`` mirrors the summarizer call shape:
     ``await llm_chat_fn(messages, system)`` yielding str/dict chunks.
-    Returns the stored event or None. Never raises.
+    Returns the stored event or None. Never raises. Every rejection after the
+    heuristic gate passes is logged with a reason code so a missing event is
+    always explainable.
     """
     try:
         if not conf_uid or not is_episodic_candidate(user_text):
@@ -707,29 +806,47 @@ async def extract_and_store_episodic(
                 elif isinstance(event, dict) and event.get("type") == "text_delta":
                     chunks.append(str(event.get("text", "")))
         except Exception as error:
-            logger.warning(
-                "Episodic extraction LLM call failed: type={}",
-                type(error).__name__,
+            _log_extraction_rejection(
+                "llm_error", session_uid=history_uid, error_type=type(error).__name__
             )
             return None
-        parsed = parse_extraction_result("".join(chunks))
+        parsed, reason, confidence = _parse_extraction_result_detail("".join(chunks))
         if parsed is None:
+            _log_extraction_rejection(
+                reason or "invalid_json",
+                confidence=confidence,
+                session_uid=history_uid,
+            )
             return None
         occurred = parsed.get("occurred_at")
-        if occurred is not None:
-            valid = _parse_iso_or_none(occurred)
-            if valid is None:
-                return None
-            skew = (
-                valid - request_dt.replace(tzinfo=timezone.utc)
-                if request_dt.tzinfo is None
-                else valid - request_dt
-            )
-            if skew.total_seconds() > 3600:
-                occurred = None
-        if occurred is None:
-            occurred = resolve_occurred_at(user_text, request_dt, tz)
-        return append_episodic_event(
+        event_chars = len(parsed["event_text"])
+        # A relative-day expression with no stated clock time is day-precision:
+        # the deterministic resolver owns occurred_at and the model's value is
+        # ignored entirely, even when it is malformed.
+        override = resolve_relative_day_override(user_text, request_dt, tz)
+        if override is not None:
+            occurred = override
+        else:
+            if occurred is not None:
+                valid = _parse_iso_or_none(occurred)
+                if valid is None:
+                    _log_extraction_rejection(
+                        "invalid_event",
+                        confidence=confidence,
+                        event_chars=event_chars,
+                        session_uid=history_uid,
+                    )
+                    return None
+                skew = (
+                    valid - request_dt.replace(tzinfo=timezone.utc)
+                    if request_dt.tzinfo is None
+                    else valid - request_dt
+                )
+                if skew.total_seconds() > 3600:
+                    occurred = None
+            if occurred is None:
+                occurred = resolve_occurred_at(user_text, request_dt, tz)
+        stored = append_episodic_event(
             conf_uid,
             {
                 "event_text": parsed["event_text"],
@@ -739,9 +856,16 @@ async def extract_and_store_episodic(
                 "tz": tz,
             },
         )
+        if stored is None:
+            _log_extraction_rejection(
+                "storage_rejected",
+                confidence=confidence,
+                event_chars=event_chars,
+                session_uid=history_uid,
+            )
+        return stored
     except Exception as error:
-        logger.warning(
-            "Episodic capture failed (turn unaffected): type={}",
-            type(error).__name__,
+        _log_extraction_rejection(
+            "unexpected_error", session_uid=history_uid, error_type=type(error).__name__
         )
         return None

@@ -5,8 +5,10 @@ storage roundtrip/dedup/corruption, retrieval/recency/budget,
 cross-session flow, and failure safety. No network, no real LLM.
 """
 
+import asyncio
 import json
 import os
+import pathlib
 import tempfile
 import unittest
 import unittest.mock
@@ -502,6 +504,319 @@ class FailureTest(unittest.IsolatedAsyncioTestCase):
         # Heuristic fallback resolves "tadi" to request local day.
         self.assertEqual(stored["occurred_at"], "2026-10-01T17:00:00+00:00")
         self.assertEqual(stored["session_uid"], "sess-a")
+
+
+class ProviderOutcomeTest(unittest.IsolatedAsyncioTestCase):
+    """Gate-passing candidate: store vs rejection, with a logged reason."""
+
+    CANDIDATE = "Gw tadi habisin 3 jam benerin bug WebSocket yang besar."
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old = os.getcwd()
+        os.chdir(self._tmp.name)
+
+    def tearDown(self):
+        os.chdir(self._old)
+        self._tmp.cleanup()
+
+    def _llm_yielding(self, payload):
+        async def fake_llm(messages, system):
+            if isinstance(payload, Exception):
+                raise payload
+            yield payload
+
+        return fake_llm
+
+    async def _run(self, payload, text=None):
+        with unittest.mock.patch.object(em, "_log_extraction_rejection") as log:
+            stored = await em.extract_and_store_episodic(
+                self._llm_yielding(payload),
+                "c1",
+                text or self.CANDIDATE,
+                "sess-a",
+                T0,
+                JAKARTA,
+            )
+        return stored, log
+
+    def _reason(self, log):
+        self.assertTrue(log.called, "rejection was not logged")
+        return log.call_args.args[0]
+
+    async def test_a_valid_event_is_stored(self):
+        stored, log = await self._run(
+            '{"event_text": "User spent 3 hours fixing a WebSocket bug.",'
+            ' "occurred_at": null, "confidence": 0.9}'
+        )
+        self.assertIsNotNone(stored)
+        self.assertEqual(len(load_episodic_events("c1")), 1)
+        log.assert_not_called()
+
+    async def test_b_low_confidence_rejected_and_logged(self):
+        stored, log = await self._run(
+            '{"event_text": "User spent 3 hours fixing a WebSocket bug.",'
+            ' "occurred_at": null, "confidence": 0.4}'
+        )
+        self.assertIsNone(stored)
+        self.assertEqual(load_episodic_events("c1"), [])
+        self.assertEqual(self._reason(log), "confidence_below_threshold")
+
+    async def test_c_null_event_rejected_and_logged(self):
+        stored, log = await self._run('{"event": null, "confidence": 0.9}')
+        self.assertIsNone(stored)
+        self.assertEqual(load_episodic_events("c1"), [])
+        self.assertEqual(self._reason(log), "event_null")
+
+    async def test_d_invalid_json_rejected_and_logged(self):
+        stored, log = await self._run("mendingin bug WebSocket, jadi gitu")
+        self.assertIsNone(stored)
+        self.assertEqual(load_episodic_events("c1"), [])
+        self.assertEqual(self._reason(log), "invalid_json")
+
+    async def test_e_llm_exception_rejected_and_logged(self):
+        stored, log = await self._run(RuntimeError("provider down"))
+        self.assertIsNone(stored)
+        self.assertEqual(load_episodic_events("c1"), [])
+        self.assertEqual(self._reason(log), "llm_error")
+
+    async def test_invalid_event_timestamp_rejected_and_logged(self):
+        # No relative-day expression: the model's timestamp is validated.
+        text = "Gw habisin 3 jam memperbaiki backend production."
+        self.assertTrue(is_episodic_candidate(text))
+        stored, log = await self._run(
+            '{"event_text": "User spent 3 hours fixing production.",'
+            ' "occurred_at": "someday", "confidence": 0.9}',
+            text,
+        )
+        self.assertIsNone(stored)
+        self.assertEqual(load_episodic_events("c1"), [])
+        self.assertEqual(self._reason(log), "invalid_event")
+
+    async def test_storage_rejected_logged_on_duplicate(self):
+        stored, log = await self._run(
+            '{"event_text": "User spent 3 hours fixing a WebSocket bug.",'
+            ' "occurred_at": null, "confidence": 0.9}'
+        )
+        self.assertIsNotNone(stored)
+        stored_again, log = await self._run(
+            '{"event_text": "User spent 3 hours fixing a WebSocket bug.",'
+            ' "occurred_at": null, "confidence": 0.9}'
+        )
+        self.assertIsNone(stored_again)
+        self.assertEqual(len(load_episodic_events("c1")), 1)
+        self.assertEqual(self._reason(log), "storage_rejected")
+
+    async def test_rejection_reason_parsing_matrix(self):
+        cases = {
+            "": "empty_response",
+            "not json at all": "invalid_json",
+            "{oops": "invalid_json",
+            "[1, 2]": "invalid_json",
+            '{"event_text": "spent hours", "confidence": "high"}': "invalid_schema",
+            '{"event_text": "spent hours", "confidence": 5}': "invalid_schema",
+            '{"event_text": "spent hours", "occurred_at": 7, "confidence": 0.9}': "invalid_schema",
+            '{"event": null}': "event_null",
+            '{"event_text": "   ", "confidence": 0.9}': "empty_event_text",
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                _, reason, _ = em._parse_extraction_result_detail(raw)
+                self.assertEqual(reason, expected)
+
+
+class NonBlockingTest(unittest.IsolatedAsyncioTestCase):
+    """Extraction must never delay the user-visible response."""
+
+    @staticmethod
+    def _handler_source() -> str:
+        source = (
+            pathlib.Path(em.__file__).parent
+            / "conversations"
+            / "single_conversation.py"
+        ).read_text(encoding="utf-8")
+        return source[source.index("Episodic capture runs after") :]
+
+    def test_scheduling_does_not_await_extraction(self):
+        segment = self._handler_source()
+        self.assertIn("asyncio.create_task(", segment)
+        self.assertNotIn("await capture(", segment)
+        self.assertIn("_EPISODIC_CAPTURE_TASKS.add(task)", segment)
+
+    async def test_slow_extraction_does_not_block_response_return(self):
+        released = asyncio.Event()
+        observed = {}
+
+        async def capture(user_text, history_uid):
+            observed["started"] = True
+            await released.wait()
+            observed["finished"] = True
+
+        tasks = set()
+
+        async def handler():
+            task = asyncio.create_task(capture("text", "sess-a"))
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+            return "user-visible response"
+
+        # The handler returns without waiting for extraction.
+        self.assertEqual(
+            await asyncio.wait_for(handler(), timeout=1.0), "user-visible response"
+        )
+        await asyncio.sleep(0)
+        self.assertTrue(observed.get("started"))
+        self.assertIsNone(observed.get("finished"))
+        released.set()
+        await asyncio.sleep(0.01)
+        self.assertTrue(observed.get("finished"))
+
+
+class RelativeDayOverrideTest(unittest.IsolatedAsyncioTestCase):
+    """Relative-day expressions are day-precision and never model-timed."""
+
+    SEMALAM = "Semalam gw lembur sampai jam 2 pagi memperbaiki backend."
+    TWO_DAYS = "2 hari lalu gw deploy backend."
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old = os.getcwd()
+        os.chdir(self._tmp.name)
+
+    def tearDown(self):
+        os.chdir(self._old)
+        self._tmp.cleanup()
+
+    def test_a_semalam_is_candidate(self):
+        self.assertTrue(is_episodic_candidate(self.SEMALAM))
+        for small_talk in ("iya wkwk", "oke", "haha", "lu gimana?"):
+            with self.subTest(text=small_talk):
+                self.assertFalse(is_episodic_candidate(small_talk))
+        self.assertFalse(is_episodic_candidate("Besok gw mau beli monitor."))
+
+    def test_b_semalam_resolves_to_previous_local_day(self):
+        self.assertEqual(
+            em.resolve_relative_day_override(self.SEMALAM, T0, JAKARTA),
+            "2026-09-30T17:00:00+00:00",
+        )
+        self.assertEqual(
+            resolve_occurred_at(self.SEMALAM, T0, JAKARTA),
+            "2026-09-30T17:00:00+00:00",
+        )
+
+    def test_c_n_days_ago_resolves_to_local_midnight(self):
+        self.assertEqual(
+            em.resolve_relative_day_override(self.TWO_DAYS, T0, JAKARTA),
+            "2026-09-29T17:00:00+00:00",
+        )
+
+    def test_d_model_clock_is_overridden(self):
+        async def fake_llm(messages, system):
+            yield (
+                '{"event_text": "User deployed the backend.",'
+                ' "occurred_at": "2026-09-30T09:38:18+00:00",'
+                ' "confidence": 0.9}'
+            )
+
+        async def run():
+            return await em.extract_and_store_episodic(
+                fake_llm, "c1", self.TWO_DAYS, "sess-a", T0, JAKARTA
+            )
+
+        stored = asyncio.get_event_loop().run_until_complete(run())
+        self.assertIsNotNone(stored)
+        assert stored is not None
+        # Model invented 09:38 local; deterministic day anchor wins.
+        self.assertEqual(stored["occurred_at"], "2026-09-29T17:00:00+00:00")
+
+    def test_e_explicit_clock_time_is_preserved(self):
+        text = "2 hari lalu jam 9 pagi gw deploy backend."
+        self.assertIsNone(em.resolve_relative_day_override(text, T0, JAKARTA))
+
+        async def fake_llm(messages, system):
+            yield (
+                '{"event_text": "User deployed the backend at 9am.",'
+                ' "occurred_at": "2026-09-30T02:00:00+00:00",'
+                ' "confidence": 0.9}'
+            )
+
+        async def run():
+            return await em.extract_and_store_episodic(
+                fake_llm, "c1", text, "sess-a", T0, JAKARTA
+            )
+
+        stored = asyncio.get_event_loop().run_until_complete(run())
+        self.assertIsNotNone(stored)
+        assert stored is not None
+        # 09:00 Jakarta == 02:00Z on Sep 30: user-stated time survives.
+        self.assertEqual(stored["occurred_at"], "2026-09-30T02:00:00+00:00")
+
+    def test_f_absolute_date_still_wins(self):
+        text = "Gw deploy backend tanggal 28 September 2026."
+        self.assertEqual(em.resolve_relative_day_override(text, T0, JAKARTA), None)
+        self.assertEqual(
+            resolve_occurred_at(text, T0, JAKARTA), "2026-09-27T17:00:00+00:00"
+        )
+
+    def test_g_kemarin_resolves_to_previous_local_day(self):
+        text = "Kemarin gw beresin refactor modul billing."
+        self.assertEqual(
+            em.resolve_relative_day_override(text, T0, JAKARTA),
+            "2026-09-30T17:00:00+00:00",
+        )
+
+    def test_incidental_range_clock_does_not_block_override(self):
+        # "sampai jam 2 pagi" is a range end, not the event clock.
+        text = "Gw lembur sampai jam 2 pagi kemarin."
+        self.assertEqual(
+            em.resolve_relative_day_override(text, T0, JAKARTA),
+            "2026-09-30T17:00:00+00:00",
+        )
+
+    async def test_malformed_model_timestamp_ignored_for_relative_day(self):
+        text = "2 hari lalu gw deploy backend ke VPS baru."
+        self.assertTrue(is_episodic_candidate(text))
+
+        async def fake_llm(messages, system):
+            yield (
+                '{"event_text": "User deployed the backend to a new VPS.",'
+                ' "occurred_at": "kemarin sore", "confidence": 0.9}'
+            )
+
+        with unittest.mock.patch.object(em, "_log_extraction_rejection") as log:
+            stored = await em.extract_and_store_episodic(
+                fake_llm, "c1", text, "sess-a", T0, JAKARTA
+            )
+        self.assertIsNotNone(stored)
+        assert stored is not None
+        self.assertEqual(stored["occurred_at"], "2026-09-29T17:00:00+00:00")
+        self.assertEqual(len(load_episodic_events("c1")), 1)
+        log.assert_not_called()
+
+    async def test_explicit_clock_still_validates_model_timestamp(self):
+        text = "2 hari lalu jam 9 pagi gw deploy backend ke VPS baru."
+        self.assertIsNone(em.resolve_relative_day_override(text, T0, JAKARTA))
+
+        async def fake_llm(messages, system):
+            yield (
+                '{"event_text": "User deployed the backend at 9am.",'
+                ' "occurred_at": "kemarin pagi", "confidence": 0.9}'
+            )
+
+        with unittest.mock.patch.object(em, "_log_extraction_rejection") as log:
+            stored = await em.extract_and_store_episodic(
+                fake_llm, "c1", text, "sess-a", T0, JAKARTA
+            )
+        self.assertIsNone(stored)
+        self.assertEqual(log.call_args.args[0], "invalid_event")
+
+    def test_no_relative_expression_returns_none(self):
+        for text in (
+            "Gw deploy backend.",
+            "Gw migrate database production.",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(em.resolve_relative_day_override(text, T0, JAKARTA))
 
 
 if __name__ == "__main__":

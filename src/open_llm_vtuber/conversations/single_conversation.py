@@ -30,6 +30,9 @@ from ..request_latency import (
 # Import necessary types from agent outputs
 from ..agent.output_types import SentenceOutput, AudioOutput
 
+# Strong references to in-flight episodic capture tasks (see usage below).
+_EPISODIC_CAPTURE_TASKS: "set[asyncio.Task]" = set()
+
 
 async def process_single_conversation(
     context: ServiceContext,
@@ -332,9 +335,12 @@ async def process_single_conversation(
             capture = getattr(context.agent_engine, "capture_episodic_event", None)
             if callable(capture):
                 try:
-                    asyncio.create_task(
-                        capture(input_text, context.history_uid)
-                    )
+                    task = asyncio.create_task(capture(input_text, context.history_uid))
+                    # Strong reference until done: an unreferenced task may be
+                    # garbage-collected mid-flight, losing the event and its
+                    # latency measurement. Never awaited here.
+                    _EPISODIC_CAPTURE_TASKS.add(task)
+                    task.add_done_callback(_EPISODIC_CAPTURE_TASKS.discard)
                 except Exception as error:
                     logger.debug(
                         "Episodic capture scheduling skipped: type={}",

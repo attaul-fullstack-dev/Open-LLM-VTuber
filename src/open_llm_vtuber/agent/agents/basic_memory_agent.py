@@ -737,25 +737,31 @@ class BasicMemoryAgent(AgentInterface):
             selected, tz=getattr(self, "_user_timezone", None)
         )
 
-    async def capture_episodic_event(
-        self, user_text: str, history_uid: str
-    ) -> None:
+    async def capture_episodic_event(self, user_text: str, history_uid: str) -> None:
         """Fire-and-forget episodic capture for one completed turn.
 
         Runs after the user-visible response; gate + single LLM call +
         validated store. Never raises; never blocks the conversation.
+
+        Latency is measured inside this task (``perf_counter`` from task
+        start to task end) rather than on the request tracker, because the
+        turn tracker is already reset and serialized by the time this task
+        runs. The task-owned number is logged on its own line and is written
+        to the tracker on a best-effort basis.
         """
         started = time.perf_counter()
+        outcome = "skipped"
         try:
             if not self._character_conf_uid or not history_uid:
                 return
             if not is_episodic_candidate(user_text):
                 return
+            outcome = "rejected"
             llm = getattr(self, "_llm", None)
             chat_fn = getattr(llm, "chat_completion", None)
             if not callable(chat_fn):
                 return
-            await extract_and_store_episodic(
+            stored = await extract_and_store_episodic(
                 chat_fn,
                 self._character_conf_uid,
                 user_text,
@@ -763,17 +769,29 @@ class BasicMemoryAgent(AgentInterface):
                 utcnow(),
                 getattr(self, "_user_timezone", None),
             )
+            outcome = "stored" if stored is not None else "rejected"
         except Exception as error:
+            outcome = "error"
             logger.warning(
                 "Episodic capture failed (turn unaffected): type={}",
                 type(error).__name__,
             )
         finally:
-            tracker = get_latency_tracker()
-            if tracker:
-                tracker.add_time(
-                    "episodic_ms", (time.perf_counter() - started) * 1000.0
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            try:
+                tracker = get_latency_tracker()
+                if tracker:
+                    tracker.add_time("episodic_ms", elapsed_ms)
+            except Exception as error:
+                logger.debug(
+                    "Episodic latency tracker write skipped: type={}",
+                    type(error).__name__,
                 )
+            logger.info(
+                "Episodic capture latency: outcome={} elapsed_ms={}",
+                outcome,
+                round(elapsed_ms, 2),
+            )
 
     def observe_character_events(
         self,
@@ -822,9 +840,7 @@ class BasicMemoryAgent(AgentInterface):
             )
             return True
         except Exception as error:
-            logger.warning(
-                "Reactive state skipped: type={}", type(error).__name__
-            )
+            logger.warning("Reactive state skipped: type={}", type(error).__name__)
             return False
 
     async def compact_conversation(self) -> tuple[bool, Optional[str]]:
@@ -879,9 +895,7 @@ class BasicMemoryAgent(AgentInterface):
                 summary_updated_at=updated_at,
             )
             if tracker:
-                tracker.add_metadata_save(
-                    (time.perf_counter() - save_started) * 1000
-                )
+                tracker.add_metadata_save((time.perf_counter() - save_started) * 1000)
             if not persisted:
                 self._load_summary_state(
                     self._summary_conf_uid,
@@ -1075,9 +1089,13 @@ class BasicMemoryAgent(AgentInterface):
             final_selection = initial_selection
 
         self._log_context_stats(final_selection)
-        summary_included = summary_present and bool(final_selection.messages) and (
-            final_selection.messages[0].get("content", "").startswith(
-                "Conversation context from earlier messages"
+        summary_included = (
+            summary_present
+            and bool(final_selection.messages)
+            and (
+                final_selection.messages[0]
+                .get("content", "")
+                .startswith("Conversation context from earlier messages")
             )
         )
         logger.info(
@@ -1433,9 +1451,7 @@ class BasicMemoryAgent(AgentInterface):
         while True:
             if self.prompt_mode_flag:
                 if self._mcp_prompt_string:
-                    base_system_prompt = (
-                        f"{self._system}\n\n{self._mcp_prompt_string}"
-                    )
+                    base_system_prompt = f"{self._system}\n\n{self._mcp_prompt_string}"
                 else:
                     logger.warning("Prompt mode active but mcp_prompt_string is empty!")
                     base_system_prompt = self._system
@@ -1724,9 +1740,7 @@ class BasicMemoryAgent(AgentInterface):
         followup_context: Optional[
             Union[Dict[str, Any], ProactiveFollowupContext]
         ] = None,
-        intent_context: Optional[
-            Union[Dict[str, Any], ProactiveIntentContext]
-        ] = None,
+        intent_context: Optional[Union[Dict[str, Any], ProactiveIntentContext]] = None,
     ) -> Callable[[], AsyncIterator[Union[SentenceOutput, Dict[str, Any]]]]:
         """Create an assistant-only turn using the normal character context.
 
@@ -1867,9 +1881,7 @@ class BasicMemoryAgent(AgentInterface):
         followup_context: Optional[
             Union[Dict[str, Any], ProactiveFollowupContext]
         ] = None,
-        intent_context: Optional[
-            Union[Dict[str, Any], ProactiveIntentContext]
-        ] = None,
+        intent_context: Optional[Union[Dict[str, Any], ProactiveIntentContext]] = None,
     ) -> AsyncIterator[Union[SentenceOutput, Dict[str, Any]]]:
         """Generate one proactive assistant message without a fake user turn."""
         proactive_chat = self._proactive_chat_function_factory(

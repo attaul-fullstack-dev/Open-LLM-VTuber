@@ -62,6 +62,7 @@ legacy/
 chat_history/
 character_state/
 world_state/
+episodic/
 knowledge_base/
 submodules/MeloTTS
 openapi_assistants.json
