@@ -1185,6 +1185,56 @@ class WebSocketHandler:
                         json.dumps({"type": "control", "text": "mic-audio-end"})
                     )
 
+    async def _ensure_history_for_trigger(
+        self,
+        websocket: WebSocket,
+        client_uid: str,
+        context: ServiceContext,
+        data: WSMessage,
+    ) -> bool:
+        """Create exactly one history for a history-less socket (orphan guard).
+
+        Mirrors the _handle_create_history setup (uid + memory init +
+        new-history-created notify) so the turn about to start persists
+        normally. Returns True when context.history_uid is valid
+        afterwards; False means the caller must drop the trigger with an
+        explicit error reply (fail closed, never a silent orphan turn).
+        """
+        history_uid = create_new_history(context.character_config.conf_uid)
+        if not history_uid:
+            logger.error("Orphan guard: history creation failed; dropping trigger")
+            try:
+                await websocket.send_text(
+                    json.dumps(
+                        {
+                            "type": "error",
+                            "message": "Could not start a conversation: history unavailable. Please resend.",
+                        }
+                    )
+                )
+            except Exception:
+                pass
+            return False
+        context.history_uid = history_uid
+        context.agent_engine.set_memory_from_history(
+            conf_uid=context.character_config.conf_uid,
+            history_uid=history_uid,
+            user_timezone=context.user_timezone,
+        )
+        try:
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "new-history-created",
+                        "history_uid": history_uid,
+                    }
+                )
+            )
+        except Exception:
+            pass
+        logger.info("Orphan guard: created history for pending trigger")
+        return True
+
     async def _handle_conversation_trigger(
         self, websocket: WebSocket, client_uid: str, data: WSMessage
     ) -> None:
@@ -1195,6 +1245,18 @@ class WebSocketHandler:
             context = self.client_contexts.get(client_uid)
             if context is not None:
                 self._update_user_timezone(context, data)
+            # Orphan-turn guard: a fresh socket has history_uid == "" until
+            # history selection completes. A turn started here would run
+            # but persist nothing (and a later history-data would wipe the
+            # frontend bubble). Atomically create exactly one history per
+            # socket instead; the sequential receive loop makes the
+            # check-and-create race-free. Fail closed on creation failure.
+            if context is not None and not context.history_uid:
+                ensured = await self._ensure_history_for_trigger(
+                    websocket, client_uid, context, data
+                )
+                if not ensured:
+                    return
         trigger_context = self.client_contexts.get(client_uid)
         if trigger_context is None:
             # Disconnect cleanup raced this trigger: answer with an error
