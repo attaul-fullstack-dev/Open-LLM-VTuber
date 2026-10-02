@@ -819,5 +819,194 @@ class RelativeDayOverrideTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(em.resolve_relative_day_override(text, T0, JAKARTA))
 
 
+class ContinuityRetrievalTest(unittest.IsolatedAsyncioTestCase):
+    """Persisted events must be usable later, selectively and bounded."""
+
+    BUG_EVENT = "Gw tadi habisin 3 jam benerin bug WebSocket."
+    FOLLOW_UP = "Lu masih inget waktu gw lama banget benerin bug?"
+    UNRELATED = "Cuaca hari ini gimana?"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old = os.getcwd()
+        os.chdir(self._tmp.name)
+
+    def tearDown(self):
+        os.chdir(self._old)
+        self._tmp.cleanup()
+
+    def _store(self, text, *, occurred=None, session="sess-a"):
+        """Persist one event through the real store (as capture does)."""
+        return append_episodic_event(
+            "c1",
+            {
+                "event_text": text,
+                "occurred_at": occurred,
+                "session_uid": session,
+                "source": "conversation",
+                "tz": JAKARTA,
+            },
+        )
+
+    async def test_a_direct_relevance_retrieved(self):
+        self._store(self.BUG_EVENT, occurred="2026-09-29T17:00:00+00:00")
+        events = load_episodic_events("c1")
+        selected = retrieve_episodic_events(events, self.FOLLOW_UP, now=T0)
+        self.assertEqual(len(selected), 1)
+        self.assertIn("WebSocket", selected[0]["event_text"])
+
+    async def test_b_unrelated_query_not_retrieved(self):
+        self._store(self.BUG_EVENT, occurred="2026-09-29T17:00:00+00:00")
+        events = load_episodic_events("c1")
+        self.assertEqual(retrieve_episodic_events(events, self.UNRELATED, now=T0), [])
+        self.assertEqual(
+            render_episodic_context(
+                retrieve_episodic_events(events, self.UNRELATED, now=T0),
+                now=T0,
+                tz=JAKARTA,
+            ),
+            "",
+        )
+
+    async def test_c_multiple_events_bounded_subset(self):
+        topics = [
+            ("Gw benerin bug WebSocket koneksi putus", "2026-09-29T17:00:00+00:00"),
+            ("Gw benerin bug WebSocket timeout agent", "2026-09-28T17:00:00+00:00"),
+            ("Gw migrasi database pelanggan ke Postgres", "2026-09-20T17:00:00+00:00"),
+            ("Gw setup monitoring Grafana alert", "2026-09-10T17:00:00+00:00"),
+            ("Gw refund invoice pelanggan via email", "2026-09-05T17:00:00+00:00"),
+            ("Gw dokumentasi API endpoint baru", "2026-08-30T17:00:00+00:00"),
+        ]
+        for text, occurred in topics:
+            self._store(text, occurred=occurred)
+        events = load_episodic_events("c1")
+        selected = retrieve_episodic_events(events, self.FOLLOW_UP, now=T0)
+        self.assertLessEqual(len(selected), em.EPISODIC_TOP_N)
+        self.assertTrue(selected)
+        for item in selected:
+            self.assertIn("WebSocket", item["event_text"])
+        block = render_episodic_context(selected, now=T0, tz=JAKARTA)
+        from src.open_llm_vtuber.agent.context_window import estimate_tokens
+
+        self.assertLessEqual(estimate_tokens(block), em.EPISODIC_MAX_TOKENS + 60)
+
+    async def test_d_old_relevant_beats_recent_irrelevant(self):
+        self._store(self.BUG_EVENT, occurred="2026-06-01T17:00:00+00:00")
+        self._store(
+            "Gw beli键盘 mechanical baru untuk setup",
+            occurred="2026-10-01T17:00:00+00:00",
+        )
+        events = load_episodic_events("c1")
+        selected = retrieve_episodic_events(events, self.FOLLOW_UP, now=T0)
+        self.assertEqual(len(selected), 1)
+        self.assertIn("WebSocket", selected[0]["event_text"])
+
+    async def test_e_recent_irrelevant_never_wins(self):
+        self._store(self.BUG_EVENT, occurred="2026-09-29T17:00:00+00:00")
+        self._store(
+            "Gw beli keyboard mechanical baru untuk setup",
+            occurred="2026-10-01T17:00:00+00:00",
+        )
+        events = load_episodic_events("c1")
+        selected = retrieve_episodic_events(events, "keyboard mechanical setup", now=T0)
+        self.assertEqual(len(selected), 1)
+        self.assertIn("keyboard", selected[0]["event_text"])
+
+    async def test_f_no_episodic_memory_injects_nothing(self):
+        self.assertEqual(load_episodic_events("nobody"), [])
+        self.assertEqual(retrieve_episodic_events([], self.FOLLOW_UP, now=T0), [])
+        self.assertEqual(render_episodic_context([], now=T0, tz=JAKARTA), "")
+
+    async def test_g_dedup_unchanged(self):
+        first = self._store(self.BUG_EVENT, occurred="2026-09-29T17:00:00+00:00")
+        self.assertIsNotNone(first)
+        self.assertIsNone(
+            self._store(self.BUG_EVENT, occurred="2026-09-28T17:00:00+00:00")
+        )
+        self.assertEqual(len(load_episodic_events("c1")), 1)
+
+    async def test_h_cross_session_retrieval(self):
+        self._store(
+            self.BUG_EVENT, occurred="2026-09-29T17:00:00+00:00", session="sess-a"
+        )
+        # Session B has its own transcript; retrieval is keyed by conf_uid only.
+        events = load_episodic_events("c1")
+        selected = retrieve_episodic_events(events, self.FOLLOW_UP, now=T0)
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0]["session_uid"], "sess-a")
+
+    async def test_i_restart_persistence_retrieval(self):
+        self._store(self.BUG_EVENT, occurred="2026-09-29T17:00:00+00:00")
+        # Simulate a restart: drop every in-memory cache, reload from disk.
+        em._episodic_locks.clear()
+        events = load_episodic_events("c1")
+        self.assertEqual(len(events), 1)
+        selected = retrieve_episodic_events(events, self.FOLLOW_UP, now=T0)
+        self.assertEqual(len(selected), 1)
+
+    async def test_j_age_rendered_from_request_time_not_creation(self):
+        self._store(self.BUG_EVENT, occurred="2026-09-29T17:00:00+00:00")
+        events = load_episodic_events("c1")
+        early = render_episodic_context(events, now=T0, tz=JAKARTA)
+        later = render_episodic_context(
+            events, now=datetime(2026, 10, 9, 5, 0, tzinfo=timezone.utc), tz=JAKARTA
+        )
+        self.assertIn("[2 days ago | Sep 30]", early)
+        self.assertIn("[9 days ago | Sep 30]", later)
+        for block in (early, later):
+            self.assertNotIn("today", block.lower())
+            self.assertNotIn("yesterday", block.lower())
+
+    def test_recency_uses_occurred_at_not_created_at(self):
+        old_event = event(
+            self.BUG_EVENT,
+            occurred="2026-01-01T00:00:00+00:00",
+            created="2026-10-02T05:00:00+00:00",
+        )
+        recent_event = event(
+            "Gw refund invoice pelanggan lewat email",
+            occurred="2026-10-01T17:00:00+00:00",
+            created="2026-10-02T05:00:00+00:00",
+        )
+        query = em._token_set(em._normalize_event_text("bug WebSocket"))
+        old_score = em._score_event(query, old_event, T0)
+        recent_score = em._score_event(query, recent_event, T0)
+        self.assertGreater(old_score, recent_score)
+        # Recency alone never promotes an unrelated event above nothing.
+        self.assertEqual(em._score_event(em._token_set("cuaca"), old_event, T0), 0.0)
+
+    def test_retrieval_is_deterministic_without_llm(self):
+        source = (
+            pathlib.Path(em.__file__).parent
+            / "agent"
+            / "agents"
+            / "basic_memory_agent.py"
+        ).read_text(encoding="utf-8")
+        body = source[
+            source.index("def _episodic_context_for_prompt") : source.index(
+                "async def capture_episodic_event"
+            )
+        ]
+        self.assertNotIn("await ", body)
+        self.assertNotIn("chat_completion", body)
+        self.assertIn("retrieve_episodic_events", body)
+
+    def test_clean_query_is_forwarded_for_retrieval(self):
+        source = (
+            pathlib.Path(em.__file__).parent
+            / "conversations"
+            / "single_conversation.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('turn_metadata["episodic_query"] = input_text.strip()', source)
+        self.assertIn("metadata=turn_metadata", source)
+        agent_source = (
+            pathlib.Path(em.__file__).parent
+            / "agent"
+            / "agents"
+            / "basic_memory_agent.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('get("episodic_query", "")', agent_source)
+
+
 if __name__ == "__main__":
     unittest.main()

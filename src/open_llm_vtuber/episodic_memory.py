@@ -675,14 +675,18 @@ def _score_event(query_tokens: set, event: Dict[str, Any], now: datetime) -> flo
     if overlap == 0:
         return 0.0
     score = float(overlap)
-    created = _parse_iso_or_none(event.get("created_at", ""))
-    if created is not None:
+    # Recency ranks by event time, not storage time: an old experience saved
+    # yesterday is still old. created_at is only a fallback for rows without
+    # an event timestamp. Recency boosts, never replaces, relevance.
+    reference = _parse_iso_or_none(event.get("occurred_at", "")) or _parse_iso_or_none(
+        event.get("created_at", "")
+    )
+    if reference is not None:
         try:
-            age_days = (now - created).total_seconds() / 86400.0
+            age_days = (now - reference).total_seconds() / 86400.0
         except TypeError:
             age_days = None
         if age_days is not None and age_days >= 0:
-            # Recency is a boost, never a replacement for relevance.
             score += max(0.0, 0.5 - age_days / 14.0)
     return score
 

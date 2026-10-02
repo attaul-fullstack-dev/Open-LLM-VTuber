@@ -193,6 +193,12 @@ class BasicMemoryAgent(AgentInterface):
         # per turn below so midnight crossings stay correct.
         self._prev_session_summaries: List[Dict[str, str]] = []
 
+        # Clean user text for episodic retrieval (set per turn from
+        # BatchInput metadata). Kept separate from _memory because the LLM
+        # input text may carry an appended search block that must not pollute
+        # the retrieval query. Empty means "fall back to the last user turn".
+        self._episodic_query: str = ""
+
         self._formatted_tools_openai = []
         self._formatted_tools_claude = []
         if self._tool_manager:
@@ -712,30 +718,48 @@ class BasicMemoryAgent(AgentInterface):
     def _episodic_context_for_prompt(self) -> str:
         """Render relevant episodic experiences for the current turn (pure I/O).
 
-        Retrieval query is the latest user message in this session's
-        transcript. Fail-soft: any problem yields "" and the turn is
-        unaffected. Never writes.
+        Retrieval query is this turn's clean user text (see ``_to_messages``),
+        falling back to the latest user message in the session transcript.
+        Fail-soft: any problem yields "" and the turn is unaffected. Never
+        writes.
         """
+        started = time.perf_counter()
         if not self._character_conf_uid:
             return ""
-        query = ""
-        for message in reversed(self._memory or []):
-            if message.get("role") == "user" and str(
-                message.get("content", "")
-            ).strip():
-                query = str(message.get("content", ""))
-                break
+        query = (getattr(self, "_episodic_query", "") or "").strip()
+        if not query:
+            for message in reversed(self._memory or []):
+                if message.get("role") == "user" and str(
+                    message.get("content", "")
+                ).strip():
+                    query = str(message.get("content", ""))
+                    break
         if not query.strip():
             return ""
         events = load_episodic_events(self._character_conf_uid)
         if not events:
+            logger.debug("Episodic retrieval: no stored events.")
             return ""
         selected = retrieve_episodic_events(events, query)
         if not selected:
+            logger.debug(
+                "Episodic retrieval: no relevant event for query_chars={} "
+                "events={}.",
+                len(query),
+                len(events),
+            )
             return ""
-        return render_episodic_context(
+        block = render_episodic_context(
             selected, tz=getattr(self, "_user_timezone", None)
         )
+        # Counts and cost only: no prompt content, no user text.
+        logger.info(
+            "Episodic retrieval: events={} selected={} elapsed_ms={}",
+            len(events),
+            len(selected),
+            round((time.perf_counter() - started) * 1000.0, 2),
+        )
+        return block
 
     async def capture_episodic_event(self, user_text: str, history_uid: str) -> None:
         """Fire-and-forget episodic capture for one completed turn.
@@ -1252,6 +1276,12 @@ class BasicMemoryAgent(AgentInterface):
 
     def _to_messages(self, input_data: BatchInput) -> List[Dict[str, Any]]:
         """Prepare messages for LLM API call."""
+        # Episodic retrieval query: the clean user turn from metadata, so an
+        # appended search block (LLM input only, never persisted) cannot
+        # pollute retrieval. Reset every turn to avoid stale reuse.
+        self._episodic_query = str(
+            (input_data.metadata or {}).get("episodic_query", "") or ""
+        ).strip()
         messages = self._memory.copy()
         user_content = []
         text_prompt = self._to_text_prompt(input_data)

@@ -111,6 +111,12 @@ async def process_single_conversation(
             # its labeled block joins the LLM input text. History keeps
             # the clean user text; nothing router-related is persisted.
             llm_text = input_text
+            # Episodic retrieval must see the clean user turn: the search
+            # block below is LLM-input only and would otherwise pollute the
+            # query. Same rule as history persistence.
+            turn_metadata = dict(metadata or {})
+            if input_text.strip():
+                turn_metadata["episodic_query"] = input_text.strip()
             if input_text.strip():
                 from ..mcpp.search_router import (
                     SEARCH_EXECUTED_NO_RESULTS,
@@ -159,7 +165,7 @@ async def process_single_conversation(
                 input_text=llm_text,
                 images=images,
                 from_name=context.character_config.human_name,
-                metadata=metadata,
+                metadata=turn_metadata,
             )
 
             if context.history_uid and not skip_history:
