@@ -58,6 +58,29 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
     proactive_intent_weights: Optional[Dict[str, float]] = Field(
         None, alias="proactive_intent_weights"
     )
+    # Proactive V2 deterministic gate. Kept flat (no extra nesting) so the
+    # existing config surface and upgrade path stay untouched.
+    proactive_daily_hard_limit: int = Field(60, ge=0, alias="proactive_daily_hard_limit")
+    minimum_proactive_gap_seconds: int = Field(
+        900, ge=0, alias="minimum_proactive_gap_seconds"
+    )
+    maximum_unanswered_consecutive: int = Field(
+        2, ge=0, alias="maximum_unanswered_consecutive"
+    )
+    backoff_multiplier: float = Field(2.0, gt=0, alias="backoff_multiplier")
+    max_backoff_seconds: int = Field(21600, ge=0, alias="max_backoff_seconds")
+    quiet_hours_start_hour: int = Field(23, ge=0, le=23, alias="quiet_hours_start_hour")
+    quiet_hours_end_hour: int = Field(7, ge=0, le=23, alias="quiet_hours_end_hour")
+    meaningful_trigger_budget_per_hour: int = Field(
+        2, ge=0, alias="meaningful_trigger_budget_per_hour"
+    )
+    idle_trigger_budget_per_hour: int = Field(
+        0, ge=0, alias="idle_trigger_budget_per_hour"
+    )
+    idle_trigger_budget_per_day: int = Field(0, ge=0, alias="idle_trigger_budget_per_day")
+    behavior_on_budget_exhausted: Literal["degrade_to_silent"] = Field(
+        "degrade_to_silent", alias="behavior_on_budget_exhausted"
+    )
 
     DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
         "llm_provider": Description(
