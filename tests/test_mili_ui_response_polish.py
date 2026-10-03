@@ -3,7 +3,7 @@ from pathlib import Path
 
 import yaml
 
-from open_llm_vtuber.utils.tts_preprocessor import remove_special_characters
+from src.open_llm_vtuber.utils.tts_preprocessor import remove_special_characters
 
 
 ROOT = Path(__file__).resolve().parents[1]

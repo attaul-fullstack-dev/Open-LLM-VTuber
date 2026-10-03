@@ -153,14 +153,24 @@ async def handle_individual_interrupt(
             logger.error(f"Error handling interrupt: {e}")
 
         if context.history_uid:
-            store_message(
-                conf_uid=context.character_config.conf_uid,
-                history_uid=context.history_uid,
-                role="ai",
-                content=heard_response,
-                name=context.character_config.character_name,
-                avatar=context.character_config.avatar,
-            )
+            # Only persist the AI turn when something was actually spoken. The
+            # client sends `interrupt-signal` when a new message arrives
+            # mid-turn, so an interrupt raised before the first sentence leaves
+            # `heard_response` empty; storing that produced an empty assistant
+            # turn in the transcript (fed back into the next LLM context and
+            # rendered as a blank bubble). Same guard as the normal completion
+            # path in single_conversation (`if ... and full_response`). The
+            # "[Interrupted by user]" marker is always kept so the transcript
+            # still records that the turn was cut short.
+            if heard_response and heard_response.strip():
+                store_message(
+                    conf_uid=context.character_config.conf_uid,
+                    history_uid=context.history_uid,
+                    role="ai",
+                    content=heard_response,
+                    name=context.character_config.character_name,
+                    avatar=context.character_config.avatar,
+                )
             store_message(
                 conf_uid=context.character_config.conf_uid,
                 history_uid=context.history_uid,
@@ -213,14 +223,17 @@ async def handle_group_interrupt(
                 try:
                     member_ctx = client_contexts[member_uid]
                     member_ctx.agent_engine.handle_interrupt(heard_response)
-                    store_message(
-                        conf_uid=member_ctx.character_config.conf_uid,
-                        history_uid=member_ctx.history_uid,
-                        role="ai",
-                        content=heard_response,
-                        name=context.character_config.character_name,
-                        avatar=context.character_config.avatar,
-                    )
+                    # Skip empty assistant turns (see the individual path for
+                    # the rationale); the interruption marker is always stored.
+                    if heard_response and heard_response.strip():
+                        store_message(
+                            conf_uid=member_ctx.character_config.conf_uid,
+                            history_uid=member_ctx.history_uid,
+                            role="ai",
+                            content=heard_response,
+                            name=context.character_config.character_name,
+                            avatar=context.character_config.avatar,
+                        )
                     store_message(
                         conf_uid=member_ctx.character_config.conf_uid,
                         history_uid=member_ctx.history_uid,

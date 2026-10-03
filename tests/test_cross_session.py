@@ -9,7 +9,8 @@ import json
 import os
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from src.open_llm_vtuber.agent.agents.basic_memory_agent import BasicMemoryAgent
 from src.open_llm_vtuber.agent.conversation_summary import (
@@ -30,6 +31,35 @@ from src.open_llm_vtuber.world_state import load_and_reconcile_world_state
 
 JAKARTA = "Asia/Jakarta"
 T0 = datetime(2026, 10, 1, 0, 0, tzinfo=timezone.utc)  # Oct 1 00:00 UTC.
+
+
+def days_ago_local(days: int, hour_local: int = 10, tz_name: str = JAKARTA) -> datetime:
+    """Local moment exactly ``days`` user-local calendar days before now.
+
+    Age labels are computed against the *user-local* calendar date
+    (``world_state.relative_day_parts`` compares ``user_local_datetime(...)``
+    with the timestamp converted to the same zone), so fixtures must be built
+    in that same zone. Deriving the stamp in UTC instead makes the day delta
+    drift by one whenever the local clock sits between midnight and the UTC
+    hour offset.
+    """
+    zone = ZoneInfo(tz_name)
+    local_now = datetime.now(zone)
+    return (local_now - timedelta(days=days)).replace(
+        hour=hour_local, minute=0, second=0, microsecond=0
+    )
+
+
+def days_ago_stamp(days: int, hour_local: int = 10, tz_name: str = JAKARTA) -> str:
+    """ISO (UTC) stamp ``days`` user-local days before now."""
+    return days_ago_local(days, hour_local, tz_name).astimezone(timezone.utc).isoformat()
+
+
+def days_ago_date_str(days: int, tz_name: str = JAKARTA) -> str:
+    """Expected ``Mon D`` half of the age tag for a ``days``-old stamp."""
+    local = days_ago_local(days, 10, tz_name)
+    return f"{local:%b} {local.day}"
+
 
 
 class _FakeLLM:
@@ -251,28 +281,28 @@ class SessionSummaryRetrieveTest(CrossSessionBase):
         write_history(
             self.conf_uid,
             "sess-a",
-            "2026-09-29T10:00:00+00:00",
+            days_ago_stamp(2),
             summary="Temporal Awareness selesai.",
-            updated_at="2026-09-29T11:00:00+00:00",
+            updated_at=days_ago_stamp(2, hour_local=11),
         )
-        write_history(self.conf_uid, "sess-b", "2026-10-01T00:00:00+00:00")
+        write_history(self.conf_uid, "sess-b", days_ago_stamp(0))
         agent = make_agent(self.conf_uid, "sess-b", tz=JAKARTA)
         prompt = agent._relationship_system_prompt("base")
-        # Sep 29 11:00 UTC = 18:00 Jakarta Sep 29 -> "2 days ago (Sep 29)".
-        self.assertIn("[2 days ago | Sep 29]", prompt)
+        # updated_at is 2 days before now, rendered in the user timezone.
+        self.assertIn(f"[2 days ago | {days_ago_date_str(2)}]", prompt)
 
     def test_10b_missing_updated_at_falls_back_to_session_stamp(self):
         write_history(
             self.conf_uid,
             "sess-a",
-            "2026-09-30T10:00:00+00:00",
+            days_ago_stamp(1),
             summary="Tanpa stamp update.",
         )
-        write_history(self.conf_uid, "sess-b", "2026-10-01T00:00:00+00:00")
+        write_history(self.conf_uid, "sess-b", days_ago_stamp(0))
         agent = make_agent(self.conf_uid, "sess-b", tz=JAKARTA)
         self.assertEqual(len(agent._prev_session_summaries), 1)
         prompt = agent._relationship_system_prompt("base")
-        self.assertIn("[Yesterday | Sep 30]", prompt)
+        self.assertIn(f"[Yesterday | {days_ago_date_str(1)}]", prompt)
 
     def test_11_previous_context_reaches_context_builder(self):
         write_history(
@@ -298,7 +328,7 @@ class UntouchedSystemsTest(CrossSessionBase):
         state.memories.append(
             {
                 "text": "user suka ramen",
-                "added_at": "2026-09-30T10:00:00+00:00",
+                "added_at": days_ago_stamp(1),
                 "explicit": True,
             }
         )
@@ -314,7 +344,7 @@ class UntouchedSystemsTest(CrossSessionBase):
 
     def test_14_relationship_behavior_unchanged(self):
         context = build_relationship_context(
-            "close", updated_at="2026-09-30T10:00:00+00:00", tz=JAKARTA
+            "close", updated_at=days_ago_stamp(1), tz=JAKARTA
         )
         self.assertIn("close", context)
         self.assertIn("yesterday", context)
