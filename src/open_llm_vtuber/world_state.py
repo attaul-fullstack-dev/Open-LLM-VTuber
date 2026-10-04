@@ -68,7 +68,7 @@ import json
 import os
 import threading
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -534,6 +534,11 @@ DECISION_NIGHT_REST_ENERGY = 50
 # here, never biological hunger (no hunger state exists).
 DECISION_MORNING_EAT_START_HOUR = 6
 DECISION_MORNING_EAT_END_HOUR = 9
+# Contextual signals (ADL v2): how recent a relevant episodic experience must
+# be before the decision layer holds instead of starting a new activity, and
+# how many retrieved events may contribute at all.
+EPISODIC_CONTEXT_MAX_AGE_H = 24
+EPISODIC_CONTEXT_MAX_EVENTS = 3
 
 DecisionReason = Literal[
     "low_energy",
@@ -546,6 +551,7 @@ DecisionReason = Literal[
     "relationship_bias",
     "preference",
     "mood_bias",
+    "episodic_continuity",
 ]
 
 # Explicit goal -> activity hints, keyed by seeded goal id only (read-only).
@@ -567,6 +573,60 @@ DECISION_MOODS_PLAYFUL = ("content",)
 
 
 @dataclass(frozen=True)
+class DecisionContextSignals:
+    """Compact contextual signals for the decision stage (no message content).
+
+    Produced by ``autonomous_decision.build_context_signals`` from data that is
+    already stored: active interaction preferences (counts + category only,
+    never their text) and episodic retrieval results (counts + the newest
+    ``occurred_at`` only, never the event text). Never persisted; it is
+    rebuilt per evaluation from the stores themselves.
+    """
+
+    # Episodic side. ``episodic_age_hours`` is derived from occurred_at, so an
+    # event is judged by when it happened, not by when it was stored. It is
+    # whole hours elapsed, rounded up, and clamped at 0 for clock skew.
+    episodic_relevant_count: int = 0
+    episodic_latest_occurred_at: Optional[str] = None  # ISO-8601 UTC
+    episodic_age_hours: Optional[int] = None
+    # Interaction side. Entries look like "tone:avoid"; no preference text.
+    preference_signals: tuple = ()
+    # Semantic gate for episodic continuity. True ONLY when the producer could
+    # verify from stored data that the experience involved Mili or a shared
+    # activity. The episodic schema stores no actor/participant field, so no
+    # producer may assert this from a user-only memory: an unverified event is
+    # a USER experience, never Mili world state, and must not hold her
+    # activity. Fail-safe default is False.
+    continuity_candidate: bool = False
+
+    def has_recent_episodic(self, max_age_h: int) -> bool:
+        """True when a relevant experience happened inside the window."""
+        try:
+            age = self.episodic_age_hours
+            return (
+                int(self.episodic_relevant_count or 0) > 0
+                and age is not None
+                and 0 <= int(age) <= int(max_age_h)
+            )
+        except Exception:
+            return False
+
+    def has_continuity(self, max_age_h: int) -> bool:
+        """True when a VERIFIED Mili/shared experience is inside the window.
+
+        This is the only predicate the decision rule may act on: recency plus
+        relevance is not enough, the event must also be semantically about
+        Mili's own or a shared life.
+        """
+        try:
+            return bool(self.continuity_candidate) and self.has_recent_episodic(
+                max_age_h
+            )
+        except Exception:
+            return False
+
+
+@dataclass(frozen=True)
 class DecisionInputs:
     """Optional read-only context for the influence stage (pure data).
 
@@ -579,6 +639,9 @@ class DecisionInputs:
     goal_activities: tuple = ()  # mapped activities from active goals
     preferred_activities: tuple = ()  # established preference activities
     mood_bias: bool = False  # explicit opt-in; an all-default object is inert
+    # Compact contextual signals (interaction preferences + episodic recall).
+    # Absent means "no context available", which is the pre-v2 behaviour.
+    context: Optional[DecisionContextSignals] = None
 
 
 @dataclass(frozen=True)
@@ -659,6 +722,34 @@ def _normalized_relationship(value: object) -> Optional[str]:
     return None
 
 
+_DECISION_HOLD = ""
+"""Sentinel target meaning "hold the current activity" (no transition)."""
+
+
+def _continuity_is_new(signals: DecisionContextSignals, anchor: Any) -> bool:
+    """Anti-stasis: a hold needs a NEW reason, not the same old memory.
+
+    ``anchor`` is the existing ``last_autonomous_decision_at``. A qualifying
+    experience only justifies holding when it happened *after* the last
+    autonomous decision, because ``occurred_at`` is the temporal source of
+    truth. The same memory therefore cannot hold Mili again and again for the
+    rest of its window: once acted on, it is spent, and normal decision
+    behaviour resumes on the next evaluation.
+
+    No new persisted field, no timer, no loop: still one lazy reconciliation.
+    """
+    try:
+        latest = _parse_iso(signals.episodic_latest_occurred_at, None)
+        if latest is None:
+            return False
+        previous = _parse_iso(anchor, None) if anchor else None
+        if previous is None:
+            return True
+        return latest > previous
+    except Exception:
+        return False
+
+
 def _pick_influence_activity(
     state: WorldState,
     moment: datetime,
@@ -666,10 +757,11 @@ def _pick_influence_activity(
     recent_to: Sequence[str],
     inputs: Optional[DecisionInputs],
 ) -> Optional[Tuple[str, DecisionReason]]:
-    """Influence stage: goal > relationship > preference > mood (pure).
+    """Influence stage: goal > context > relationship > preference > mood.
 
     Returns ``None`` when no factor names an eligible activity, so the caller
     falls through to the existing morning/alternation rules unchanged.
+    Returns ``(_DECISION_HOLD, reason)`` to keep the current activity.
     """
     if inputs is None:
         return None
@@ -686,7 +778,20 @@ def _pick_influence_activity(
     if goal_hit is not None:
         return goal_hit, "goal_related"
 
-    # 2. Relationship: chooses the class, never overrides the goal above.
+    # 2. Contextual continuity (ADL v2): a VERIFIED Mili/shared experience that
+    #    happened recently, and only if it is newer than the last autonomous
+    #    decision. Recency plus relevance is not enough: an unverified event is
+    #    a user memory, not Mili world state. Without qualifying signals this
+    #    is None and the pre-v2 precedence is exactly unchanged.
+    context = getattr(inputs, "context", None)
+    if (
+        isinstance(context, DecisionContextSignals)
+        and context.has_continuity(EPISODIC_CONTEXT_MAX_AGE_H)
+        and _continuity_is_new(context, state.last_autonomous_decision_at)
+    ):
+        return _DECISION_HOLD, "episodic_continuity"
+
+    # 3. Relationship: chooses the class, never overrides the goal above.
     status = _normalized_relationship(inputs.relationship_status)
     if status is not None:
         class_order = (
@@ -698,14 +803,14 @@ def _pick_influence_activity(
         if class_hit is not None:
             return class_hit, "relationship_bias"
 
-    # 3. Preference: established evidence of past behaviour.
+    # 4. Preference: established evidence of past behaviour.
     preferred = _eligible_from(
         inputs.preferred_activities, recent_to, ("reading", "playing")
     )
     if preferred is not None:
         return preferred, "preference"
 
-    # 4. Mood: weakest, tie-break only inside the same class.
+    # 5. Mood: weakest, tie-break only inside the same class.
     if not inputs.mood_bias:
         return None
     mood = normalize_mood(state.mood)
@@ -735,9 +840,10 @@ def _pick_stale_idle_activity(
 ) -> Optional[Tuple[str, DecisionReason]]:
     """Deterministic pick for long-idle; None = hold. No personality logic.
 
-    Precedence: energy -> night -> influence (goal, relationship,
-    preference, mood) -> morning eating -> existing alternation. Every
-    candidate is filtered through the recent-activity anti-repeat rule.
+    Precedence: energy -> night -> influence (goal, contextual continuity,
+    relationship, preference, mood) -> morning eating -> existing
+    alternation. Every candidate is filtered through the recent-activity
+    anti-repeat rule.
     """
     energy = clamp_energy(state.energy)
     if energy < DECISION_ACTIVE_MIN_ENERGY:
@@ -803,9 +909,34 @@ def decide_activity(
         if pick is None:
             return _decision_hold(state, aware, "no_change")
         target, reason = pick
+        if target == _DECISION_HOLD:
+            # Contextual hold: keep the current activity, record the reason.
+            return _decision_hold(state, aware, reason)
         return DecisionResult(target, reason, _to_iso(aware), state.last_update_at)
 
     return _decision_hold(state, aware, "no_change")
+
+
+def _log_typed_decision(decision: DecisionResult, moment: datetime) -> None:
+    """Emit the typed Autonomous Decision Layer record for this evaluation.
+
+    Observation only: the policy above already ran and already applied. This
+    imports the decision layer lazily to keep module import order stable, and
+    swallows every failure so logging can never affect a conversation.
+    """
+    try:
+        from .autonomous_decision import classify_world_decision
+
+        typed = classify_world_decision(decision, moment)
+        logger.debug(
+            "Autonomous decision typed: outcome={} reason={} acts={} cooldown_until={}",
+            typed.outcome,
+            typed.reason,
+            typed.acts,
+            typed.cooldown_until,
+        )
+    except Exception as error:
+        logger.debug("Typed decision unavailable: type={}", type(error).__name__)
 
 
 def _apply_decision(
@@ -818,6 +949,15 @@ def _apply_decision(
     Unknown targets are ignored (transition wins).
     """
     if decision.action is None:
+        # Anti-stasis: a contextual hold is still an autonomous decision, so it
+        # must consume the cooldown anchor. Otherwise the same memory would be
+        # re-evaluated as "stale" on every reconciliation and hold Mili for the
+        # whole window. Only this reason is stamped; every other hold keeps its
+        # existing behaviour exactly.
+        if decision.reason == "episodic_continuity":
+            return replace(
+                state, last_autonomous_decision_at=_to_iso(_ensure_aware(moment))
+            )
         return state
     target = normalize_activity(decision.action)
     if target not in VALID_ACTIVITIES or target == state.activity:
@@ -1033,6 +1173,7 @@ def reconcile(
                     decision.action,
                     decision.reason,
                 )
+            _log_typed_decision(decision, moment)
             updated = applied
         except Exception as error:
             logger.warning(

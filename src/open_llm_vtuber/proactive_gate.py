@@ -384,16 +384,29 @@ def classify_trigger(
     meaningful_life_event: bool = False,
     relationship_event: bool = False,
     explicit_reminder: bool = False,
+    goal_evidence: bool = False,
 ) -> TriggerReason:
     """Map existing deterministic signals onto a priority. Pure, no I/O.
 
     LOW means "generic idle thought". With ``idle_trigger_budget_* = 0`` the
     gate suppresses LOW entirely, so the model is never called merely to look
     for a reason to speak.
+
+    ``goal_evidence`` is the Autonomous Decision Layer's single contribution:
+    it is raised only from a stored, explicitly *active* goal matched with
+    fresh deterministic evidence (see
+    ``autonomous_decision.classify_goal_evidence``). It ranks HIGH because a
+    verified, self-declared objective is a real reason to speak, ahead of the
+    reactive MEDIUM sources, and it still has to clear every budget, gap,
+    quiet-hour and backoff rule below -- a priority is never permission.
     """
     if explicit_reminder:
         return TriggerReason(
             PRIORITY_HIGH, "explicit_reminder", "user-defined reminder"
+        )
+    if goal_evidence:
+        return TriggerReason(
+            PRIORITY_HIGH, "goal_evidence", "active goal with fresh evidence"
         )
     if user_question_pending or unfinished_topic:
         return TriggerReason(PRIORITY_HIGH, "unfinished_topic", "unresolved user topic")

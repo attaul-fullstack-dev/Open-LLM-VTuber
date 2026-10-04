@@ -20,6 +20,7 @@ from ...chat_history_manager import (
     get_history,
     get_history_list,
     get_metadata,
+    update_metadate,
     update_summary_metadata,
 )
 from ...proactive_chat import (
@@ -31,15 +32,27 @@ from ...proactive_chat import (
 )
 from ...character_state import (
     CharacterState,
+    activate_goal,
     add_character_memory as persist_character_memory,
     build_character_memory_context,
+    complete_goal,
+    ensure_seed_goals,
+    goal_status_counts,
     load_character_state,
     migrate_relationship_if_needed,
+    record_goal_evidence,
+    record_interaction_preference,
     remove_character_memory as remove_persisted_character_memory,
     reset_character_memory as reset_persisted_character_memory,
     reset_character_state as reset_persisted_character_state,
+    save_character_state,
     set_character_relationship,
 )
+from ...interaction_preferences import (
+    active_preferences,
+    build_interaction_preference_context,
+)
+from ...autonomous_decision import goal_evidence_summary
 from ...character_memory_commands import parse_memory_command
 from ...self_model import build_self_context, derive_activity_preferences
 from ..transformers import (
@@ -78,6 +91,7 @@ from ..relationship_context import (
 )
 from ...world_state import (
     DECISION_GOAL_ACTIVITY_HINTS,
+    DecisionContextSignals,
     DecisionInputs,
     apply_reactive,
     build_world_state_context,
@@ -115,6 +129,15 @@ from ...request_latency import (
 # selection, before the provider call, and is never persisted: it never enters
 # _memory, history, summary, memory parsing, relationship logic, or the UI.
 PROACTIVE_TURN_CUE = "Continue the conversation naturally on your own."
+
+
+# Cost safety guard (independent of the proactive budget): hard cap on tool
+# round-trips per turn. Both tool interaction loops are `while True` by
+# design, so without this a model that keeps calling tools would generate an
+# unbounded number of provider requests inside ONE user turn. On reaching the
+# cap the loop stops cleanly and the existing graceful/fail-soft response
+# path finishes the turn.
+TOOL_LOOP_MAX_ITERATIONS = 4
 
 
 class BasicMemoryAgent(AgentInterface):
@@ -194,12 +217,17 @@ class BasicMemoryAgent(AgentInterface):
         # history load from persisted rolling summaries; age labels render
         # per turn below so midnight crossings stay correct.
         self._prev_session_summaries: List[Dict[str, str]] = []
+        # Active session file id; used to keep its metadata truthful.
+        self._history_uid: str = ""
 
         # Clean user text for episodic retrieval (set per turn from
         # BatchInput metadata). Kept separate from _memory because the LLM
         # input text may carry an appended search block that must not pollute
         # the retrieval query. Empty means "fall back to the last user turn".
         self._episodic_query: str = ""
+        # Per-turn episodic retrieval selection (query, events), shared by the
+        # prompt block and the Autonomous Decision Layer.
+        self._episodic_selection_cache: Any = None
 
         self._formatted_tools_openai = []
         self._formatted_tools_claude = []
@@ -352,6 +380,12 @@ class BasicMemoryAgent(AgentInterface):
         state = migrate_relationship_if_needed(conf_uid, state)
         self._character_state = state
         self._character_conf_uid = conf_uid
+        # Seed the finite self-model goals once, right where the state is
+        # loaded. Idempotent: a character that already has goals keeps exactly
+        # those (no re-seed, no status rewrite, no reactivation), and the seed
+        # is persisted immediately so a restart never re-derives it. Fail-soft:
+        # a goal problem must never break history load.
+        self._ensure_goals_seeded()
         # Restart/offline fallback: a turn may carry no timezone (proactive,
         # reconnect). The persisted last-known zone keeps local
         # interpretation stable; a fresh session value always wins.
@@ -534,6 +568,23 @@ class BasicMemoryAgent(AgentInterface):
                 tz=self._user_timezone,
             ),
         )
+        # Persistent interaction preferences: the user's standing
+        # constraints on HOW Mili talks to them. Placed after the identity
+        # blocks (persona, relationship) and before facts/episodic context,
+        # so they shape interaction without ever replacing the persona.
+        preference_context = ""
+        try:
+            preference_context = build_interaction_preference_context(
+                self._character_state.interaction_preferences,
+                tz=self._user_timezone,
+            )
+        except Exception as error:
+            logger.warning(
+                "Interaction preference context skipped: type={}",
+                type(error).__name__,
+            )
+        if preference_context:
+            parts.append(preference_context)
         memory_context = build_character_memory_context(
             self._character_state, tz=self._user_timezone
         )
@@ -545,15 +596,41 @@ class BasicMemoryAgent(AgentInterface):
         try:
             episodic_block = self._episodic_context_for_prompt()
         except Exception as error:
-            logger.warning(
-                "Episodic retrieval skipped: type={}", type(error).__name__
-            )
+            logger.warning("Episodic retrieval skipped: type={}", type(error).__name__)
             episodic_block = ""
         if episodic_block:
             parts.append(episodic_block)
         if world_line:
             parts.append(world_line)
         return "\n\n".join(parts)
+
+    def _sync_relationship_metadata(self, status: str, reason: str) -> None:
+        """Mirror the character-level relationship into the active session file.
+
+        New history files are created with a hardcoded ``stranger`` default
+        and were never refreshed, so the per-session metadata permanently
+        disagreed with the real character-level state (and fed the legacy
+        migration a wrong value). The character-level state stays the single
+        source of truth; this only keeps the session record truthful.
+        Best-effort and fail-soft: never affects the conversation.
+        """
+        if not self._character_conf_uid or not self._history_uid:
+            return
+        try:
+            update_metadate(
+                self._character_conf_uid,
+                self._history_uid,
+                {
+                    "relationship_status": status,
+                    "relationship_reason": reason,
+                    "relationship_updated_at": self._relationship_state.updated_at,
+                },
+            )
+        except Exception as error:
+            logger.debug(
+                "Session relationship metadata not synced: type={}",
+                type(error).__name__,
+            )
 
     def set_relationship_status(
         self,
@@ -566,9 +643,7 @@ class BasicMemoryAgent(AgentInterface):
         if normalized != status:
             raise ValueError(f"Unsupported relationship status: {status}")
         if not self._character_conf_uid:
-            logger.warning(
-                "Relationship update skipped: no active character context"
-            )
+            logger.warning("Relationship update skipped: no active character context")
             return False
         if normalized == self._relationship_state.status:
             return True
@@ -599,6 +674,7 @@ class BasicMemoryAgent(AgentInterface):
             updated_at=updated_at,
             reason=trigger,
         )
+        self._sync_relationship_metadata(normalized, trigger)
         logger.info(
             "Relationship stats: relationship_status={}, "
             "relationship_updated=True, relationship_update_trigger={}",
@@ -611,7 +687,140 @@ class BasicMemoryAgent(AgentInterface):
         """Reset Mili's relationship for every conversation (character-level)."""
         return self.set_relationship_status("stranger", trigger="manual_reset")
 
-    def add_character_memory(self, text: str, *, explicit: bool = True, kind: str = "") -> bool:
+    # ------------------------------------------------------------------
+    # Self-model goals — explicit lifecycle, never inferred.
+    # ------------------------------------------------------------------
+
+    def _ensure_goals_seeded(self) -> bool:
+        """Seed the finite goals once and persist. Idempotent, fail-soft.
+
+        Returns True when a seed was actually written. A character that already
+        carries goals is left untouched: no re-seeding, no status rewrite, no
+        reactivation, no evidence-anchor reset.
+        """
+        try:
+            state = getattr(self, "_character_state", None)
+            if state is None:
+                return False
+            existing = list(getattr(state, "goals", None) or [])
+            seeded = ensure_seed_goals(existing)
+            if len(seeded) == len(existing) and all(
+                str(item.get("id", "")) == str(other.get("id", ""))
+                and str(item.get("status", "")) == str(other.get("status", ""))
+                for item, other in zip(seeded, existing)
+            ):
+                # Already present; still normalise into the live object so the
+                # in-memory view matches what is on disk.
+                state.goals = seeded
+                return False
+            state.goals = seeded
+            saved = save_character_state(self._character_conf_uid, state)
+            logger.info(
+                "Goal seeds: goals={} seeded=True persisted={}",
+                goal_status_counts(seeded),
+                bool(saved),
+            )
+            return bool(saved)
+        except Exception as error:
+            logger.debug("Goal seeding skipped: type={}", type(error).__name__)
+            return False
+
+    def goal_snapshot(self) -> Dict[str, Any]:
+        """Compact goal state for the decision layer (pure, fail-soft)."""
+        try:
+            state = getattr(self, "_character_state", None)
+            summary = goal_evidence_summary(getattr(state, "goals", None))
+            summary["counts"] = goal_status_counts(getattr(state, "goals", None))
+            return summary
+        except Exception as error:
+            logger.debug("Goal snapshot unavailable: type={}", type(error).__name__)
+            return {"seed": 0, "active": 0, "done": 0, "active_ids": (), "counts": {}}
+
+    def set_goal_status(self, goal_id: str, status: str) -> bool:
+        """Explicit goal transition: ``seed``->``active``->``done``.
+
+        The only supported moves are the two forward transitions; anything else
+        (unknown id, wrong current status, ``done``->anything) is rejected, so
+        there is no auto-complete and no reactivation. Nothing here is driven
+        by a model: the caller states the transition, and the decision layer
+        only ever reads the result.
+        """
+        try:
+            state = getattr(self, "_character_state", None)
+            if state is None:
+                return False
+            goals = list(getattr(state, "goals", None) or [])
+            target = str(status or "").strip().lower()
+            if target == "active":
+                updated, changed = activate_goal(goals, goal_id)
+            elif target == "done":
+                updated, changed = complete_goal(goals, goal_id)
+            else:
+                logger.debug(
+                    "Goal transition rejected: goal_id={} status={}",
+                    goal_id,
+                    target,
+                )
+                return False
+            if not changed:
+                return False
+            state.goals = updated
+            saved = save_character_state(self._character_conf_uid, state)
+            logger.info(
+                "Goal transition: goal_id={} status={} persisted={} counts={}",
+                goal_id,
+                target,
+                bool(saved),
+                goal_status_counts(updated),
+            )
+            return bool(saved)
+        except Exception as error:
+            logger.debug("Goal transition failed: type={}", type(error).__name__)
+            return False
+
+    def record_goal_evidence(self, goal_id: str, evidence_id: str) -> bool:
+        """Pin the evidence a goal already acted on (dedup anchor)."""
+        try:
+            state = getattr(self, "_character_state", None)
+            if state is None:
+                return False
+            updated, changed = record_goal_evidence(
+                list(getattr(state, "goals", None) or []), goal_id, evidence_id
+            )
+            if not changed:
+                return False
+            state.goals = updated
+            return bool(save_character_state(self._character_conf_uid, state))
+        except Exception as error:
+            logger.debug(
+                "Goal evidence anchor failed: type={}", type(error).__name__
+            )
+            return False
+
+    def classify_goal_evidence(self, moment: Optional[datetime] = None):
+        """Typed goal-evidence decision for the current state (pure read)."""
+        try:
+            from ...autonomous_decision import classify_goal_evidence as classify
+            from ...episodic_memory import load_episodic_events
+
+            state = getattr(self, "_character_state", None)
+            if state is None:
+                return None
+            return classify(
+                goals=getattr(state, "goals", None) or [],
+                episodic_events=load_episodic_events(self._character_conf_uid) or [],
+                moment=moment or utcnow(),
+            )
+        except Exception as error:
+            logger.debug(
+                "Goal evidence classification skipped: type={}",
+                type(error).__name__,
+            )
+            return None
+
+    def add_character_memory(
+        self, text: str, *, explicit: bool = True, kind: str = ""
+    ) -> bool:
         """Persist one long-term fact shared across all chats."""
         if not self._character_conf_uid:
             logger.warning("Character memory update skipped: no active character")
@@ -655,6 +864,12 @@ class BasicMemoryAgent(AgentInterface):
             len(state.memories),
         )
         return True
+
+    def list_interaction_preferences(self) -> List[Dict[str, Any]]:
+        """Active interaction preferences (newest first, one per category)."""
+        return active_preferences(
+            getattr(self._character_state, "interaction_preferences", None)
+        )
 
     def list_character_memories(self) -> List[Dict[str, Any]]:
         """Return stored long-term facts (for backend controls / future UI)."""
@@ -719,6 +934,52 @@ class BasicMemoryAgent(AgentInterface):
         )
         return success
 
+    def _decision_context(self) -> Optional[DecisionContextSignals]:
+        """Compact contextual signals (ADL v2) from already-stored data.
+
+        Interaction preferences are read through their own active-row helper
+        and episodic memory through the existing deterministic retriever, both
+        bounded. No LLM call, no new store, no new lifecycle: this runs inside
+        the same per-turn decision-context build. Fail-soft — any problem
+        returns None, which keeps the pre-v2 decision behaviour exactly.
+
+        Semantic continuity (ADL v2): returned only when a VERIFIED Mili or
+        shared-activity candidate exists. The episodic schema has no
+        actor/participant field and extraction only ever sees the user turn,
+        so nothing here may claim a recent user memory is Mili world state:
+        ``continuity_event_ids`` stays empty and the signal is suppressed. A
+        stored interaction preference likewise never makes the context look
+        relevant, because it carries no semantic consumer in this layer yet.
+        """
+        try:
+            from ...autonomous_decision import build_context_signals
+
+            # Reuse this turn's single retrieval selection. The gate still
+            # runs its own bounded recency pass internally; only the redundant
+            # full relevance retrieval is skipped.
+            events = load_episodic_events(self._character_conf_uid) or []
+            prefetched = self._episodic_selection()
+            signals = build_context_signals(
+                interaction_preferences=(
+                    getattr(self._character_state, "interaction_preferences", None)
+                    or []
+                ),
+                episodic_events=events,
+                query=self._episodic_query_text(),
+                moment=utcnow(),
+                continuity_event_ids=(),
+                prefetched_relevant=prefetched,
+            )
+            if not signals.continuity_candidate:
+                return None
+            return signals
+        except Exception as error:
+            logger.debug(
+                "Decision context signals unavailable: type={}",
+                type(error).__name__,
+            )
+            return None
+
     def _decision_inputs(self) -> Optional[DecisionInputs]:
         """Read-only influence context for the autonomous decision stage.
 
@@ -748,15 +1009,20 @@ class BasicMemoryAgent(AgentInterface):
                 for candidate in preferences
                 if getattr(candidate, "established", False)
             )
+            context = self._decision_context()
+            # Pre-v2 guard, deliberately NOT widened by context: goals and
+            # established preferences alone decide this branch, so having a
+            # stored interaction preference can never change the decision.
             if not goal_activities and not preferred_activities:
                 relationship = str(state.relationship_status or "").strip().lower()
                 if relationship in ("", "stranger"):
-                    return DecisionInputs(mood_bias=True)
+                    return DecisionInputs(mood_bias=True, context=context)
             return DecisionInputs(
                 relationship_status=str(state.relationship_status or "stranger"),
                 goal_activities=goal_activities,
                 preferred_activities=preferred_activities,
                 mood_bias=True,
+                context=context,
             )
         except Exception as error:
             logger.debug(
@@ -765,51 +1031,81 @@ class BasicMemoryAgent(AgentInterface):
             )
             return None
 
-    def _episodic_context_for_prompt(self) -> str:
-        """Render relevant episodic experiences for the current turn (pure I/O).
+    def _episodic_query_text(self) -> str:
+        """This turn's clean retrieval query (G1).
 
-        Retrieval query is this turn's clean user text (see ``_to_messages``),
-        falling back to the latest user message in the session transcript.
-        Fail-soft: any problem yields "" and the turn is unaffected. Never
-        writes.
+        Prefers ``metadata["episodic_query"]`` set by ``single_conversation``
+        from the raw user turn, so the LLM-input-only search block can never
+        pollute retrieval. Falls back to the LAST user message of the
+        transcript when metadata is unavailable — never the whole ``_memory``.
         """
-        started = time.perf_counter()
-        if not self._character_conf_uid:
-            return ""
         query = (getattr(self, "_episodic_query", "") or "").strip()
-        if not query:
-            for message in reversed(self._memory or []):
-                if message.get("role") == "user" and str(
-                    message.get("content", "")
-                ).strip():
-                    query = str(message.get("content", ""))
-                    break
-        if not query.strip():
-            return ""
-        events = load_episodic_events(self._character_conf_uid)
+        if query:
+            return query
+        for message in reversed(self._memory or []):
+            if (
+                message.get("role") == "user"
+                and str(message.get("content", "")).strip()
+            ):
+                return str(message.get("content", ""))
+        return ""
+
+    def _episodic_selection(self) -> List[Dict[str, Any]]:
+        """ONE deterministic retrieval per turn, shared by every consumer.
+
+        The prompt block and the Autonomous Decision Layer both need episodic
+        recall; running retrieval twice per turn was duplicated I/O and
+        duplicated scoring over the same store. The selection is cached per
+        query for the turn, so both consumers see identical events.
+
+        Deterministic, local and LLM-free. Emits G3 telemetry: counts and
+        timing only — never event text, user text, or any payload.
+        """
+        query = self._episodic_query_text()
+        if not self._character_conf_uid or not query:
+            return []
+        cached = getattr(self, "_episodic_selection_cache", None)
+        if isinstance(cached, tuple) and cached[0] == query:
+            return list(cached[1])
+        started = time.perf_counter()
+        events = load_episodic_events(self._character_conf_uid) or []
         if not events:
             logger.debug("Episodic retrieval: no stored events.")
-            return ""
-        selected = retrieve_episodic_events(events, query)
-        if not selected:
+            self._episodic_selection_cache = (query, [])
+            return []
+        selected = retrieve_episodic_events(events, query) or []
+        elapsed_ms = round((time.perf_counter() - started) * 1000.0, 2)
+        if selected:
+            # G3 telemetry: considered / selected / elapsed only.
+            logger.info(
+                "Episodic retrieval: events={} selected={} elapsed_ms={}",
+                len(events),
+                len(selected),
+                elapsed_ms,
+            )
+        else:
             logger.debug(
-                "Episodic retrieval: no relevant event for query_chars={} "
-                "events={}.",
+                "Episodic retrieval: no relevant event for query_chars={} events={}.",
                 len(query),
                 len(events),
             )
+        self._episodic_selection_cache = (query, list(selected))
+        return list(selected)
+
+    def _episodic_context_for_prompt(self) -> str:
+        """Render relevant episodic experiences for the current turn.
+
+        Fail-soft: any problem yields "" and the turn is unaffected.
+        Never writes, never calls a model.
+        """
+        if not self._character_conf_uid:
             return ""
-        block = render_episodic_context(
+        selected = self._episodic_selection()
+        if not selected:
+            return ""
+        return render_episodic_context(
             selected, tz=getattr(self, "_user_timezone", None)
         )
-        # Counts and cost only: no prompt content, no user text.
-        logger.info(
-            "Episodic retrieval: events={} selected={} elapsed_ms={}",
-            len(events),
-            len(selected),
-            round((time.perf_counter() - started) * 1000.0, 2),
-        )
-        return block
 
     async def capture_episodic_event(self, user_text: str, history_uid: str) -> None:
         """Fire-and-forget episodic capture for one completed turn.
@@ -872,12 +1168,40 @@ class BasicMemoryAgent(AgentInterface):
         user_text: str,
         assistant_text: str,
     ) -> bool:
-        """Observe one completed visible turn: relationship + explicit memory."""
+        """Observe one completed visible turn: relationship, memory, preference."""
         relationship_updated = self.observe_relationship_event(
             user_text, assistant_text
         )
         memory_updated = self._observe_character_memory_request(user_text)
-        return relationship_updated or memory_updated
+        preference_updated = self._observe_interaction_preference(user_text)
+        return relationship_updated or memory_updated or preference_updated
+
+    def _observe_interaction_preference(self, user_text: str) -> bool:
+        """Capture a durable interaction preference stated in ordinary chat.
+
+        Runs on the existing post-turn observer, so it adds no LLM call and
+        no new lifecycle. Deterministic local detection only; fail-soft.
+        """
+        if not self._character_conf_uid:
+            return False
+        stored = record_interaction_preference(self._character_conf_uid, user_text)
+        if stored is None:
+            return False
+        # Refresh the in-memory copy so the preference also applies for the
+        # rest of THIS session, not only from the next one.
+        try:
+            refreshed = load_character_state(self._character_conf_uid)
+            if refreshed is not None:
+                self._character_state = refreshed
+        except Exception as error:
+            logger.debug(
+                "Character state refresh after preference skipped: type={}",
+                type(error).__name__,
+            )
+        tracker = get_latency_tracker()
+        if tracker:
+            tracker.add_context(0.0, None)
+        return True
 
     def observe_reactive_state(self, emotion_keys: List[str]) -> bool:
         """Apply one deterministic reactive transition (no LLM calls).
@@ -1252,6 +1576,7 @@ class BasicMemoryAgent(AgentInterface):
     ) -> None:
         """Load memory from chat history."""
         self._user_timezone = user_timezone
+        self._history_uid = history_uid
         messages = get_history(conf_uid, history_uid)
         self._prev_session_at = self._latest_other_session_at(conf_uid, history_uid)
         self._prev_session_summaries = self._load_previous_session_summaries(
@@ -1332,6 +1657,9 @@ class BasicMemoryAgent(AgentInterface):
         self._episodic_query = str(
             (input_data.metadata or {}).get("episodic_query", "") or ""
         ).strip()
+        # New turn: drop the previous selection so a stale recall can never
+        # leak into this turn's prompt or decision context.
+        self._episodic_selection_cache = None
         messages = self._memory.copy()
         user_content = []
         text_prompt = self._to_text_prompt(input_data)
@@ -1389,8 +1717,17 @@ class BasicMemoryAgent(AgentInterface):
         current_turn_text = ""
         pending_tool_calls = []
         current_assistant_message_content = []
+        # Cost guard: counts provider round-trips caused by tool use.
+        tool_iterations = 0
 
         while True:
+            if tool_iterations >= TOOL_LOOP_MAX_ITERATIONS:
+                logger.warning(
+                    "Tool loop cap reached: stopping further provider "
+                    "round-trips at max_tool_iterations={}",
+                    TOOL_LOOP_MAX_ITERATIONS,
+                )
+                break
             current_system_prompt = self._relationship_system_prompt(self._system)
             try:
                 request_messages = await self._prepare_context_with_summary(
@@ -1405,6 +1742,7 @@ class BasicMemoryAgent(AgentInterface):
             stream = self._llm.chat_completion(
                 request_messages, current_system_prompt, tools=tools
             )
+            tool_iterations += 1
             pending_tool_calls.clear()
             current_assistant_message_content.clear()
 
@@ -1527,6 +1865,8 @@ class BasicMemoryAgent(AgentInterface):
         current_turn_text = ""
         pending_tool_calls: Union[List[ToolCallObject], List[Dict[str, Any]]] = []
         current_system_prompt = self._system
+        # Cost guard: counts provider round-trips caused by tool use.
+        tool_iterations = 0
 
         while True:
             if self.prompt_mode_flag:
@@ -1539,9 +1879,7 @@ class BasicMemoryAgent(AgentInterface):
             else:
                 base_system_prompt = self._system
                 tools_for_api = tools
-            current_system_prompt = self._relationship_system_prompt(
-                base_system_prompt
-            )
+            current_system_prompt = self._relationship_system_prompt(base_system_prompt)
 
             try:
                 request_messages = await self._prepare_context_with_summary(
@@ -1553,9 +1891,17 @@ class BasicMemoryAgent(AgentInterface):
             except ContextBudgetExceeded as error:
                 yield self._context_error_message(error)
                 return
+            if tool_iterations >= TOOL_LOOP_MAX_ITERATIONS:
+                logger.warning(
+                    "Tool loop cap reached: stopping further provider "
+                    "round-trips at max_tool_iterations={}",
+                    TOOL_LOOP_MAX_ITERATIONS,
+                )
+                break
             stream = self._llm.chat_completion(
                 request_messages, current_system_prompt, tools=tools_for_api
             )
+            tool_iterations += 1
             pending_tool_calls.clear()
             current_turn_text = ""
             assistant_message_for_api = None

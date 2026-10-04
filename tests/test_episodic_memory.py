@@ -982,14 +982,27 @@ class ContinuityRetrievalTest(unittest.IsolatedAsyncioTestCase):
             / "agents"
             / "basic_memory_agent.py"
         ).read_text(encoding="utf-8")
+        # The retrieval itself lives in the shared per-turn selection helper;
+        # the prompt block only renders it. Both are covered so the guarantee
+        # ("deterministic, local, no model call") cannot drift.
+        selection = source[
+            source.index("def _episodic_selection") : source.index(
+                "def _episodic_context_for_prompt"
+            )
+        ]
         body = source[
             source.index("def _episodic_context_for_prompt") : source.index(
                 "async def capture_episodic_event"
             )
         ]
+        self.assertNotIn("await ", selection)
+        self.assertNotIn("chat_completion", selection)
         self.assertNotIn("await ", body)
         self.assertNotIn("chat_completion", body)
-        self.assertIn("retrieve_episodic_events", body)
+        self.assertIn("retrieve_episodic_events", selection)
+        # the prompt path consumes that one shared selection
+        self.assertIn("_episodic_selection", body)
+        self.assertIn("render_episodic_context", body)
 
     def test_clean_query_is_forwarded_for_retrieval(self):
         source = (
@@ -1006,6 +1019,159 @@ class ContinuityRetrievalTest(unittest.IsolatedAsyncioTestCase):
             / "basic_memory_agent.py"
         ).read_text(encoding="utf-8")
         self.assertIn('get("episodic_query", "")', agent_source)
+
+
+class EpisodicRetrievalIntegrationTest(unittest.TestCase):
+    """G1/G3 wiring on the real agent: query source + retrieval telemetry."""
+
+    CONF = "epi_wire"
+    SECRET_EVENT = "Gw benerin bug WebSocket ConnectRetryQzx9"
+    SECRET_QUERY = "Lu masih inget ConnectRetryQzx9 yesterday?"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old = os.getcwd()
+        os.chdir(self._tmp.name)
+        em.append_episodic_event(
+            self.CONF,
+            {
+                "event_text": self.SECRET_EVENT,
+                "occurred_at": "2026-09-29T17:00:00+00:00",
+                "session_uid": "sess-a",
+                "source": "conversation",
+                "tz": JAKARTA,
+            },
+        )
+
+    def tearDown(self):
+        os.chdir(self._old)
+        self._tmp.cleanup()
+
+    def _agent(self):
+        from src.open_llm_vtuber.agent.agents.basic_memory_agent import (
+            BasicMemoryAgent,
+        )
+        from src.open_llm_vtuber.config_manager import TTSPreprocessorConfig
+
+        class _LLM:
+            async def chat_completion(self, messages, system=None, **kwargs):
+                yield "ok"
+
+        class _Live2D:
+            live2d_model_name = "model"
+
+            def set_emotion(self, emotion, duration=None):
+                pass
+
+            def set_motion(self, group, index, priority=1):
+                pass
+
+        agent = BasicMemoryAgent(
+            llm=_LLM(),
+            system="persona",
+            live2d_model=_Live2D(),
+            tts_preprocessor_config=TTSPreprocessorConfig(
+                remove_special_char=True,
+                translator_config={
+                    "translate_audio": False,
+                    "translate_provider": "deeplx",
+                },
+            ),
+        )
+        agent._character_conf_uid = self.CONF
+        agent._user_timezone = JAKARTA
+        agent._memory = []
+        return agent
+
+    def _logs(self, agent):
+        from src.open_llm_vtuber.agent.agents import basic_memory_agent as mod
+
+        with unittest.mock.patch.object(mod, "logger") as fake:
+            block = agent._episodic_context_for_prompt()
+        # loguru keeps the brace template; positional args carry the values.
+        info = [tuple(call.args) for call in fake.info.call_args_list]
+        debug = [tuple(call.args) for call in fake.debug.call_args_list]
+        return block, info, debug
+
+    def test_metadata_query_is_primary_over_memory(self):
+        agent = self._agent()
+        # _memory holds an unrelated user turn; metadata query is the real one.
+        agent._memory = [{"role": "user", "content": "cuaca cerah hari ini"}]
+        agent._episodic_query = self.SECRET_QUERY
+        block, info, _ = self._logs(agent)
+        self.assertIn("ConnectRetryQzx9", block)
+
+    def test_falls_back_to_memory_when_metadata_missing(self):
+        agent = self._agent()
+        agent._memory = [{"role": "user", "content": self.SECRET_QUERY}]
+        agent._episodic_query = ""
+        block, info, _ = self._logs(agent)
+        self.assertIn("ConnectRetryQzx9", block)
+
+    def test_no_query_at_all_injects_nothing(self):
+        agent = self._agent()
+        agent._memory = []
+        agent._episodic_query = ""
+        block, _, _ = self._logs(agent)
+        self.assertEqual(block, "")
+
+    def test_telemetry_info_only_when_results(self):
+        agent = self._agent()
+        agent._episodic_query = self.SECRET_QUERY
+        block, info, _ = self._logs(agent)
+        self.assertTrue(block)
+        self.assertEqual(len(info), 1)
+        template, total, selected, elapsed = info[0]
+        self.assertIn("events={}", template)
+        self.assertIn("selected={}", template)
+        self.assertIn("elapsed_ms={}", template)
+        self.assertEqual(total, 1)
+        self.assertEqual(selected, 1)
+        self.assertGreaterEqual(elapsed, 0.0)
+
+    def test_telemetry_absent_when_no_match(self):
+        agent = self._agent()
+        agent._episodic_query = "cuaca cerah besok pagi"
+        block, info, debug = self._logs(agent)
+        self.assertEqual(block, "")
+        self.assertEqual(info, [])
+        self.assertTrue(any("no relevant event" in str(entry[0]) for entry in debug))
+
+    def test_telemetry_never_leaks_content(self):
+        agent = self._agent()
+        agent._episodic_query = self.SECRET_QUERY
+        _, info, debug = self._logs(agent)
+        rendered = " ".join(repr(entry) for entry in (info + debug))
+        self.assertNotIn("ConnectRetryQzx9", rendered)
+        self.assertNotIn(self.SECRET_QUERY, rendered)
+
+    def test_created_at_used_only_when_occurred_missing(self):
+        fallback = event(
+            "Gw benerin bug WebSocket ConnectRetryQzx9",
+            occurred=None,
+            created="2026-10-01T00:00:00+00:00",
+        )
+        explicit = event(
+            "Gw benerin bug WebSocket ConnectRetryQzx9",
+            occurred="2026-10-01T00:00:00+00:00",
+            created="2026-01-01T00:00:00+00:00",
+        )
+        query = em._token_set(em._normalize_event_text("bug WebSocket"))
+        # Same reference stamp in both cases -> identical recency handling.
+        self.assertEqual(
+            em._score_event(query, fallback, T0),
+            em._score_event(query, explicit, T0),
+        )
+        # Garbage occurred_at degrades to created_at instead of losing recency.
+        broken = event(
+            "Gw benerin bug WebSocket ConnectRetryQzx9",
+            occurred="not-a-timestamp",
+            created="2026-10-01T00:00:00+00:00",
+        )
+        self.assertEqual(
+            em._score_event(query, broken, T0),
+            em._score_event(query, fallback, T0),
+        )
 
 
 if __name__ == "__main__":

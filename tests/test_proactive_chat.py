@@ -25,6 +25,10 @@ from src.open_llm_vtuber.conversations.conversation_utils import create_batch_in
 from src.open_llm_vtuber.conversations.single_conversation import (
     process_single_conversation,
 )
+from src.open_llm_vtuber.proactive_gate import (
+    ProactiveBudgetState,
+    ProactiveGateConfig,
+)
 from src.open_llm_vtuber.proactive_chat import (
     DEFAULT_INTENT_WEIGHTS,
     INTENT_SELECTION_ORDER,
@@ -442,6 +446,26 @@ class ProactiveGuardTests(unittest.IsolatedAsyncioTestCase):
         handler._proactive_timer_tasks = {}
         handler.current_conversation_tasks = {}
         handler.chat_group_manager = SimpleNamespace(get_client_group=lambda _uid: None)
+        # Proactive V2: the deterministic gate runs BEFORE any provider call,
+        # so these timer-mechanics tests must present a MEANINGFUL trigger.
+        # A generic idle timer is intentionally no longer allowed to spend an
+        # LLM call (idle_trigger_budget = 0); see tests/test_proactive_v2.py.
+        # Quiet hours disabled here on purpose: these tests exercise the timer
+        # mechanics, not the wall-clock policy. start == end means "never
+        # quiet", so the test cannot become time-of-day flaky. Quiet-hours
+        # behaviour itself is covered in tests/test_proactive_v2.py.
+        handler._proactive_gate_config = ProactiveGateConfig(
+            quiet_hours_start_hour=0, quiet_hours_end_hour=0
+        )
+        handler._proactive_budget_state = {}
+        handler._proactive_intent_signals = staticmethod(
+            lambda _context, _state: ProactiveIntentSignals(
+                has_useful_memory=True, memory_relevance_score=0.9
+            )
+        )
+        handler._meaningful_life_event = staticmethod(lambda _context, _since: False)
+        handler._budget_state = lambda _uid, _conf: ProactiveBudgetState()
+        handler._persist_budget = lambda _uid, _conf: True
         return handler
 
     async def test_disconnected_client_is_not_eligible_for_generation(self):

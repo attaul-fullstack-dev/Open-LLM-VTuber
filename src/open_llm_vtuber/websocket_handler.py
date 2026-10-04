@@ -28,10 +28,22 @@ from .conversations.conversation_handler import (
     handle_group_interrupt,
     handle_individual_interrupt,
 )
-from .world_state import load_and_reconcile_world_state
+from .world_state import load_and_reconcile_world_state, utcnow
 from .character_state import set_character_timezone
 from .conversations.single_conversation import process_single_conversation
 from .conversations.conversation_utils import EMOJI_LIST
+from .autonomous_decision import OUTCOME_GOAL_BEHAVIOR
+from .proactive_gate import (
+    ProactiveBudgetState,
+    ProactiveGateConfig,
+    classify_trigger,
+    evaluate_gate,
+    load_proactive_state,
+    record_proactive_answered,
+    record_proactive_dispatch,
+    record_suppressed,
+    save_proactive_state,
+)
 from .proactive_chat import (
     ProactiveChatConfig,
     ProactiveIntent,
@@ -46,6 +58,45 @@ from .proactive_chat import (
     compute_intent_signals,
     resolve_proactive_intent_decision,
 )
+
+
+def _log_typed_proactive_decision(machine, state, decision) -> None:
+    """Log the typed Autonomous Decision Layer record for one proactive turn.
+
+    Observation only. The existing ``ProactiveStateMachine`` remains the sole
+    authority on eligibility, cooldown and intent; this never gates, never
+    reschedules and never touches the socket. Fail-soft by construction.
+    """
+    try:
+        from .autonomous_decision import classify_proactive_decision
+        from .world_state import utcnow
+
+        try:
+            eligible = bool(machine.is_eligible(state))
+        except Exception:
+            # A decision was produced, so treat it as eligible for labelling.
+            eligible = True
+        typed = classify_proactive_decision(
+            eligible=eligible,
+            reason=str(getattr(decision, "reason", "") or ""),
+            moment=utcnow(),
+            strategy=getattr(decision, "strategy", None),
+            intent=getattr(decision, "intent", None),
+        )
+        logger.debug(
+            "Autonomous decision typed: outcome={} reason={} acts={} "
+            "cooldown_until={} strategy={} intent={}",
+            typed.outcome,
+            typed.reason,
+            typed.acts,
+            typed.cooldown_until,
+            typed.metadata.get("strategy"),
+            typed.metadata.get("intent"),
+        )
+    except Exception as error:
+        logger.debug(
+            "Typed proactive decision unavailable: type={}", type(error).__name__
+        )
 
 
 class MessageType(Enum):
@@ -125,6 +176,11 @@ class WebSocketHandler:
         self.received_data_buffers: Dict[str, np.ndarray] = {}
         self._proactive_timer_tasks: Dict[str, asyncio.Task] = {}
         self._proactive_states: Dict[str, Dict[str, ProactiveRuntimeState]] = {}
+        # Proactive V2: persisted accounting (survives reconnect + restart) and
+        # the deterministic gate config. The gate is evaluated BEFORE any
+        # provider call, so a suppressed turn never reaches the LLM.
+        self._proactive_budget_state: Dict[str, ProactiveBudgetState] = {}
+        self._proactive_gate_config = ProactiveGateConfig()
         self._proactive_machines: Dict[str, ProactiveStateMachine] = {}
         self._proactive_maintenance: set[str] = set()
 
@@ -158,10 +214,25 @@ class WebSocketHandler:
             except Exception:
                 pass
 
-    @staticmethod
-    def _proactive_config(context: ServiceContext) -> ProactiveChatConfig:
+    def _proactive_config(self, context: ServiceContext) -> ProactiveChatConfig:
         settings = (
             context.character_config.agent_config.agent_settings.basic_memory_agent
+        )
+        # Proactive V2: build the deterministic gate config from the same
+        # settings object, so config and runtime can never drift apart.
+        self._proactive_gate_config = ProactiveGateConfig(
+            minimum_proactive_gap_seconds=settings.minimum_proactive_gap_seconds,
+            proactive_daily_hard_limit=settings.proactive_daily_hard_limit,
+            maximum_unanswered_consecutive=settings.maximum_unanswered_consecutive,
+            ignored_threshold_before_backoff=settings.ignored_before_backoff,
+            backoff_multiplier=settings.backoff_multiplier,
+            max_backoff_seconds=settings.max_backoff_seconds,
+            quiet_hours_start_hour=settings.quiet_hours_start_hour,
+            quiet_hours_end_hour=settings.quiet_hours_end_hour,
+            meaningful_trigger_budget_per_hour=settings.meaningful_trigger_budget_per_hour,
+            idle_trigger_budget_per_hour=settings.idle_trigger_budget_per_hour,
+            idle_trigger_budget_per_day=settings.idle_trigger_budget_per_day,
+            behavior_on_budget_exhausted=settings.behavior_on_budget_exhausted,
         )
         return ProactiveChatConfig(
             enabled=settings.proactive_enabled,
@@ -238,6 +309,137 @@ class WebSocketHandler:
             name=f"proactive-chat-{client_uid}-{history_uid}",
         )
 
+    # ------------------------------------------------------------------
+    # Proactive V2 — deterministic gate, persisted budget, trigger priority
+    # ------------------------------------------------------------------
+
+    def _budget_state(
+        self, client_uid: str, conf_uid: Optional[str]
+    ) -> ProactiveBudgetState:
+        """Return (loading once) the persisted proactive accounting.
+
+        Survives reconnect and backend restart; a reconnect must never hand out
+        a fresh budget.
+        """
+        store = getattr(self, "_proactive_budget_state", None)
+        if store is None:
+            store = {}
+            self._proactive_budget_state = store
+        state = store.get(client_uid)
+        if state is None:
+            state = (
+                load_proactive_state(conf_uid) if conf_uid else ProactiveBudgetState()
+            )
+            self._proactive_budget_state[client_uid] = state
+        return state
+
+    def _persist_budget(self, client_uid: str, conf_uid: Optional[str]) -> None:
+        state = getattr(self, "_proactive_budget_state", {}).get(client_uid)
+        if state is None or not conf_uid:
+            return
+        save_proactive_state(conf_uid, state)
+
+    @staticmethod
+    def _meaningful_life_event(
+        context: ServiceContext, since_iso: Optional[str]
+    ) -> bool:
+        """True when the life clock completed an activity since ``since_iso``.
+
+        Read-only from the existing world state; no model call. This is the
+        bridge that lets Mili comment on her OWN life without any LLM spent on
+        deciding that something happened.
+        """
+        try:
+            from .world_state import load_world_state
+
+            agent = getattr(context, "agent_engine", None)
+            conf_uid = getattr(agent, "_character_conf_uid", None)
+            if not conf_uid:
+                return False
+            snapshot = load_world_state(conf_uid)
+            history = list(getattr(snapshot, "recent_activity_history", None) or [])
+            if not history:
+                return False
+            latest = history[-1]
+            stamp = str(latest.get("at", "") or "")
+            if not stamp:
+                return False
+            if since_iso and stamp <= str(since_iso):
+                return False
+            # A completed, non-trivial activity (not simply waking up).
+            return latest.get("from") not in (None, "", "idle", "sleeping")
+        except Exception as error:
+            logger.debug(
+                "Life-event trigger probe unavailable: type={}", type(error).__name__
+            )
+            return False
+
+    def _goal_evidence_trigger(self, context: ServiceContext) -> bool:
+        """True when an *active* stored goal has fresh deterministic evidence.
+
+        This is the Autonomous Decision Layer's one contribution to proactive
+        speech. It reads state that is already on disk (goals + episodic
+        events), runs the pure ``classify_goal_evidence`` classifier, and pins
+        the evidence it acted on so the same event can never fire the same goal
+        twice. It performs **no** LLM call, creates no timer and no queue: the
+        existing Proactive V2 gate below remains the only authority on whether
+        anything is actually dispatched.
+
+        Fail-soft: any problem means "no goal evidence", i.e. exactly the
+        pre-existing behaviour.
+        """
+        try:
+            agent = getattr(context, "agent_engine", None)
+            classifier = getattr(agent, "classify_goal_evidence", None)
+            if not callable(classifier):
+                return False
+            decision = classifier()
+            if decision is None or not getattr(decision, "acts", False):
+                return False
+            if str(getattr(decision, "outcome", "")) != OUTCOME_GOAL_BEHAVIOR:
+                return False
+            goal_id = (getattr(decision, "metadata", {}) or {}).get("goal_id")
+            evidence_id = (getattr(decision, "metadata", {}) or {}).get("evidence_id")
+            anchor = getattr(agent, "record_goal_evidence", None)
+            if callable(anchor) and goal_id and evidence_id:
+                anchor(goal_id, evidence_id)
+            logger.info(
+                "Autonomous decision: outcome={} reason={} goal_id={} "
+                "evidence_id={} priority=high",
+                getattr(decision, "outcome", ""),
+                getattr(decision, "reason", ""),
+                goal_id,
+                evidence_id,
+            )
+            return True
+        except Exception as error:
+            logger.debug(
+                "Goal evidence trigger unavailable: type={}", type(error).__name__
+            )
+            return False
+
+    def _proactive_trigger(
+        self,
+        context: ServiceContext,
+        signals: ProactiveIntentSignals,
+        budget: ProactiveBudgetState,
+    ):
+        """Deterministic trigger priority. Never calls a model."""
+        return classify_trigger(
+            user_question_pending=bool(
+                getattr(signals, "user_question_pending", False)
+            ),
+            unfinished_topic=bool(getattr(signals, "unfinished_topic", False)),
+            has_useful_memory=bool(getattr(signals, "has_useful_memory", False)),
+            memory_relevance_score=float(
+                getattr(signals, "memory_relevance_score", 0.0) or 0.0
+            ),
+            meaningful_life_event=self._meaningful_life_event(
+                context, budget.last_proactive_at
+            ),
+            goal_evidence=self._goal_evidence_trigger(context),
+        )
+
     async def _record_user_activity(self, client_uid: str) -> None:
         """Reset idle/backoff state and give user input priority over a timer."""
         context = self.client_contexts.get(client_uid)
@@ -252,6 +454,20 @@ class WebSocketHandler:
             generation_was_in_progress = state.proactive_generation_in_progress
             machine.record_user_activity(state)
             state.proactive_generation_in_progress = generation_was_in_progress
+        # Proactive V2: a user reply always clears the unanswered/dormant
+        # pressure, and the reset is persisted so a reconnect cannot restore
+        # a stale "unanswered" verdict.
+        try:
+            agent = getattr(context, "agent_engine", None) if context else None
+            conf_uid = getattr(agent, "_character_conf_uid", None)
+            if conf_uid:
+                record_proactive_answered(self._budget_state(client_uid, conf_uid))
+                self._persist_budget(client_uid, conf_uid)
+        except Exception as error:
+            logger.debug(
+                "Proactive budget reset on user activity skipped: type={}",
+                type(error).__name__,
+            )
 
         task = self._proactive_timer_tasks.pop(client_uid, None)
         if task and not task.done() and task is not asyncio.current_task():
@@ -345,13 +561,9 @@ class WebSocketHandler:
             recent_silence_acknowledgment=(
                 ProactiveIntent.REACT_TO_SILENCE in state.recent_proactive_intents
             ),
-            topic_continuity_band=band_for(
-                signals.topic_continuity_score, 0.35, 0.6
-            ),
+            topic_continuity_band=band_for(signals.topic_continuity_score, 0.35, 0.6),
             topic_staleness_band=band_for(signals.topic_staleness_score, 0.4, 0.7),
-            user_engagement_band=band_for(
-                signals.recent_user_engagement, 0.4, 0.7
-            ),
+            user_engagement_band=band_for(signals.recent_user_engagement, 0.4, 0.7),
             dominant_topic_keywords=signals.dominant_recent_topic,
             avoid_recent_topics=tuple(
                 tuple(signature)
@@ -391,6 +603,46 @@ class WebSocketHandler:
 
                 context = self.client_contexts[client_uid]
                 websocket = self.client_connections[client_uid]
+
+                # ---- Proactive V2 deterministic gate -------------------
+                # Runs BEFORE the in-flight lock and BEFORE any provider
+                # call: a suppressed turn must never reach the LLM. Signals
+                # and trigger priority are local computations; there is no
+                # model call anywhere in this block.
+                conf_uid = getattr(
+                    getattr(context, "agent_engine", None), "_character_conf_uid", None
+                )
+                budget = self._budget_state(client_uid, conf_uid)
+                gate_signals = self._proactive_intent_signals(context, state)
+                trigger = self._proactive_trigger(context, gate_signals, budget)
+                gate_config = getattr(
+                    self, "_proactive_gate_config", ProactiveGateConfig()
+                )
+                decision_gate = evaluate_gate(
+                    budget,
+                    gate_config,
+                    trigger,
+                    now=utcnow(),
+                    tz=getattr(self, "_user_timezone_for_client", None)
+                    or getattr(context, "user_timezone", None),
+                    connection_valid=True,
+                    generation_in_progress=False,
+                )
+                if not decision_gate.allowed:
+                    logger.debug(
+                        "Proactive suppressed: reason={} priority={} daily_remaining={}",
+                        decision_gate.reason,
+                        decision_gate.priority,
+                        decision_gate.daily_remaining,
+                    )
+                    self._persist_budget(client_uid, conf_uid)
+                    # Wait out the current window instead of spinning.
+                    await asyncio.sleep(
+                        min(60.0, max(5.0, machine.seconds_until_eligible(state)))
+                    )
+                    continue
+                # ------------------------------------------------------
+
                 revision = state.activity_revision
                 state.proactive_generation_in_progress = True
                 self.current_conversation_tasks[client_uid] = current_task
@@ -401,26 +653,43 @@ class WebSocketHandler:
                 if revision != state.activity_revision:
                     state.proactive_generation_in_progress = False
                     return
+                record_proactive_dispatch(
+                    budget,
+                    gate_config,
+                    trigger,
+                    now=utcnow(),
+                    tz=getattr(context, "user_timezone", None),
+                )
+                self._persist_budget(client_uid, conf_uid)
                 logger.info(
                     "Proactive chat generation started: request_origin=proactive, "
-                    "ignored_count={}",
+                    "ignored_count={} priority={} trigger={} "
+                    "daily_used={}/{}",
                     state.consecutive_ignored_proactive,
+                    trigger.priority,
+                    trigger.reason,
+                    budget.daily_request_count,
+                    gate_config.proactive_daily_hard_limit,
                 )
                 followup_context = machine.proactive_followup_context(state)
-                signals = ProactiveIntentSignals()
+                # Reuse the signals the gate already computed: identical input,
+                # one computation, no extra cost.
+                signals = gate_signals
                 forced_ignored_question = (
                     followup_context.previous_proactive_ignored
                     and followup_context.previous_proactive_expected_response
                 )
                 if (
-                    machine.config.intent_strategy
-                    == ProactiveIntentStrategy.HEURISTIC
+                    machine.config.intent_strategy == ProactiveIntentStrategy.HEURISTIC
                     and not forced_ignored_question
                 ):
                     signals = self._proactive_intent_signals(context, state)
                 decision = resolve_proactive_intent_decision(
                     followup_context, state, machine, signals
                 )
+                # Typed Autonomous Decision Layer record (observation only:
+                # the existing machine decision above stays authoritative).
+                _log_typed_proactive_decision(machine, state, decision)
                 if decision.strategy == ProactiveTurnStrategy.SEMANTIC_AUTO:
                     try:
                         intent_context = build_semantic_proactive_context(state)
@@ -459,10 +728,7 @@ class WebSocketHandler:
                     logger.info(
                         "[PROACTIVE INTENT] strategy=semantic_auto forced=false"
                     )
-                elif (
-                    decision.strategy
-                    == ProactiveTurnStrategy.FORCED_IGNORED_QUESTION
-                ):
+                elif decision.strategy == ProactiveTurnStrategy.FORCED_IGNORED_QUESTION:
                     logger.info(
                         "[PROACTIVE INTENT] "
                         "strategy=forced_ignored_question forced=true"
@@ -501,6 +767,22 @@ class WebSocketHandler:
                     # Empty/cancelled work or user activity gets a fresh idle
                     # period and never increments the ignored counter.
                     machine.record_user_activity(state)
+                    # Proactive V2: a suppressed/undelivered proactive turn
+                    # still costs nothing from the budget, but it must widen
+                    # the gap so a silent backend cannot keep firing.
+                    try:
+                        record_suppressed(
+                            budget,
+                            gate_config,
+                            now=utcnow(),
+                            tz=getattr(context, "user_timezone", None),
+                        )
+                        self._persist_budget(client_uid, conf_uid)
+                    except Exception as error:
+                        logger.debug(
+                            "Suppressed proactive accounting skipped: type={}",
+                            type(error).__name__,
+                        )
         except asyncio.CancelledError:
             state.proactive_generation_in_progress = False
             raise

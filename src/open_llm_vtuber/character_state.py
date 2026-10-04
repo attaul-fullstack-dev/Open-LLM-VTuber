@@ -27,6 +27,11 @@ from .agent.relationship_context import (
     normalize_relationship_status,
 )
 from .chat_history_manager import _sanitize_path_component
+from .interaction_preferences import (
+    apply_preference,
+    detect_interaction_preference,
+    normalize_stored_preference,
+)
 from .world_state import memory_age_label
 
 # Conservative target for the character-memory block injected into the prompt.
@@ -68,6 +73,11 @@ class CharacterState:
     relationship_migrated: bool = False
     memories: List[Dict[str, Any]] = field(default_factory=list)
     goals: List[Dict[str, Any]] = field(default_factory=list)
+    # Durable, user-stated constraints on HOW Mili interacts (tone,
+    # formality, humor, address, directness). Separate from persona YAML
+    # (identity) and from memories (facts): these change the way Mili talks
+    # to this user across sessions. See interaction_preferences.py.
+    interaction_preferences: List[Dict[str, Any]] = field(default_factory=list)
     # Last known user timezone (IANA name, e.g. "Asia/Jakarta"). Session
     # scope by design: refreshed whenever the frontend sends a valid value,
     # used as fallback when a turn carries no timezone (restart/proactive).
@@ -88,6 +98,12 @@ class Goal:
     always has a verifiable completion criterion (documented per seed in
     ``default_seed_goals``). Transitions are explicit only; there is no
     auto-complete, no reactivation, no planner.
+
+    ``last_evidence_id`` / ``last_evidence_at`` are the dedup anchor for the
+    Autonomous Decision Layer: they record which deterministic piece of
+    evidence already produced a decision for this goal, so the same evidence
+    can never trigger the same goal twice. Both are optional and purely
+    observational -- old state files without them load unchanged.
     """
 
     id: str
@@ -97,10 +113,12 @@ class Goal:
     activated_at: Optional[str] = None
     completed_at: Optional[str] = None
     source: GoalSource = "seed"
+    last_evidence_id: Optional[str] = None
+    last_evidence_at: Optional[str] = None
 
 
 def goal_to_dict(goal: Goal) -> Dict[str, Any]:
-    return {
+    data = {
         "id": goal.id,
         "text": goal.text,
         "status": goal.status,
@@ -109,6 +127,15 @@ def goal_to_dict(goal: Goal) -> Dict[str, Any]:
         "completed_at": goal.completed_at,
         "source": goal.source,
     }
+    # The evidence anchor is written only once it exists, so a goal that has
+    # never produced a decision serialises exactly as it did before the anchor
+    # existed and an old state file stays byte-identical after a load/save
+    # cycle. Round-trip still holds once an anchor is present.
+    if goal.last_evidence_id:
+        data["last_evidence_id"] = goal.last_evidence_id
+    if goal.last_evidence_at:
+        data["last_evidence_at"] = goal.last_evidence_at
+    return data
 
 
 def goal_from_dict(item: Any) -> Optional[Goal]:
@@ -133,6 +160,8 @@ def goal_from_dict(item: Any) -> Optional[Goal]:
         activated_at=item.get("activated_at"),
         completed_at=item.get("completed_at"),
         source=source,  # type: ignore[arg-type]
+        last_evidence_id=item.get("last_evidence_id"),
+        last_evidence_at=item.get("last_evidence_at"),
     )
 
 
@@ -210,9 +239,112 @@ def complete_goal(
     goals: List[Dict[str, Any]], goal_id: str, now: Optional[datetime] = None
 ) -> tuple:
     """active -> done with completion stamp (pure). No auto-complete."""
-    return _with_goal_status(
-        goals, goal_id, "active", "done", "completed_at", now
-    )
+    return _with_goal_status(goals, goal_id, "active", "done", "completed_at", now)
+
+
+def ensure_seed_goals(
+    goals: Any, now: Optional[datetime] = None
+) -> List[Dict[str, Any]]:
+    """Return the seeded goal list, seeding only when there is nothing yet.
+
+    Idempotent and backward compatible:
+
+    - an empty/absent/corrupt ``goals`` value is seeded once with the three
+      approved finite seeds, so a character always has a goal surface;
+    - any non-empty list is returned normalised *as-is*: no re-seeding, no
+      status rewrite, no reactivation, no evidence-anchor reset. A character
+      that already carries goals keeps exactly those.
+
+    Pure: never mutates ``goals`` and never performs I/O. The caller persists.
+    """
+    try:
+        existing = list(goals or [])
+    except Exception:
+        existing = []
+    normalised: List[Dict[str, Any]] = []
+    for item in existing:
+        parsed = goal_from_dict(item)
+        if parsed is not None:
+            normalised.append(goal_to_dict(parsed))
+    if normalised:
+        return normalised
+    return default_seed_goals(now)
+
+
+def goal_status_counts(goals: Any) -> Dict[str, int]:
+    """``{"seed": n, "active": n, "done": n}`` (pure, fail-soft to zeros).
+
+    This is how the decision layer distinguishes "no goal relevant", "a seed
+    not yet activated", "actively working on it" and "already finished"
+    without ever inferring a transition.
+    """
+    counts = {"seed": 0, "active": 0, "done": 0}
+    try:
+        items = list(goals or [])
+    except Exception:
+        return counts
+    for item in items:
+        parsed = goal_from_dict(item)
+        if parsed is None:
+            continue
+        counts[parsed.status] = counts.get(parsed.status, 0) + 1
+    return counts
+
+
+def active_goal_ids(goals: Any) -> tuple:
+    """Ids of goals in ``active`` status only (pure, fail-soft)."""
+    out: List[str] = []
+    try:
+        items = list(goals or [])
+    except Exception:
+        return tuple()
+    for item in items:
+        parsed = goal_from_dict(item)
+        if parsed is not None and parsed.status == "active":
+            out.append(parsed.id)
+    return tuple(out)
+
+
+def record_goal_evidence(
+    goals: List[Dict[str, Any]],
+    goal_id: str,
+    evidence_id: str,
+    now: Optional[datetime] = None,
+) -> tuple:
+    """Pin the evidence that already produced a decision for ``goal_id``.
+
+    Pure ``(new_list, changed)``. The anchor only moves when the evidence
+    identity actually differs, so replaying the same event cannot retrigger
+    the same goal. A blank ``evidence_id`` is a no-op rather than a silent
+    reset (which would re-open an already-consumed goal).
+    """
+    marker = str(evidence_id or "").strip()
+    if not marker:
+        return (list(goals or []), False)
+    moment = now if now is not None else datetime.now(timezone.utc)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    stamp = moment.astimezone(timezone.utc).isoformat(timespec="seconds")
+    changed = False
+    out: List[Dict[str, Any]] = []
+    for item in goals or []:
+        if (
+            isinstance(item, dict)
+            and str(item.get("id", "")) == str(goal_id)
+            and str(item.get("status", "seed")) == "active"
+            and not changed
+        ):
+            if str(item.get("last_evidence_id", "") or "") != marker:
+                updated = dict(item)
+                updated["last_evidence_id"] = marker
+                updated["last_evidence_at"] = stamp
+                out.append(updated)
+                changed = True
+            else:
+                out.append(item)
+        else:
+            out.append(item)
+    return out, changed
 
 
 def _now_iso() -> str:
@@ -246,6 +378,11 @@ def load_character_state(conf_uid: str) -> CharacterState:
             if isinstance(item, dict) and str(item.get("text", "")).strip()
         ]
         goals: List[Dict[str, Any]] = []
+        preferences: List[Dict[str, Any]] = []
+        for item in data.get("interaction_preferences", []) or []:
+            normalized = normalize_stored_preference(item)
+            if normalized is not None:
+                preferences.append(normalized)
         raw_goals = data.get("goals", [])
         if isinstance(raw_goals, list):
             for item in raw_goals:
@@ -261,6 +398,7 @@ def load_character_state(conf_uid: str) -> CharacterState:
             relationship_migrated=bool(data.get("relationship_migrated", False)),
             memories=memories,
             goals=goals,
+            interaction_preferences=preferences,
             user_timezone=str(data.get("user_timezone") or "") or None,
         )
     except Exception as error:
@@ -284,6 +422,7 @@ def save_character_state(conf_uid: str, state: CharacterState) -> bool:
                 "relationship_migrated": state.relationship_migrated,
                 "memories": state.memories,
                 "goals": state.goals,
+                "interaction_preferences": state.interaction_preferences,
                 "user_timezone": state.user_timezone,
             }
             _write_state_atomic(filepath, data)
@@ -295,7 +434,9 @@ def save_character_state(conf_uid: str, state: CharacterState) -> bool:
         return False
 
 
-def migrate_relationship_if_needed(conf_uid: str, state: CharacterState) -> CharacterState:
+def migrate_relationship_if_needed(
+    conf_uid: str, state: CharacterState
+) -> CharacterState:
     """Backward-compatible migration: per-conversation metadata -> character state.
 
     Only runs once per character. Existing explicit relationship metadata from
@@ -325,7 +466,8 @@ def migrate_relationship_if_needed(conf_uid: str, state: CharacterState) -> Char
                     data = json.load(file)
                 metadata = (
                     data[0]
-                    if data and isinstance(data[0], dict)
+                    if data
+                    and isinstance(data[0], dict)
                     and data[0].get("role") == "metadata"
                     else {}
                 )
@@ -354,6 +496,7 @@ def migrate_relationship_if_needed(conf_uid: str, state: CharacterState) -> Char
             relationship_reason=best[3],
             relationship_migrated=True,
             memories=state.memories,
+            interaction_preferences=state.interaction_preferences,
         )
         save_character_state(conf_uid, state)
         logger.info(
@@ -443,6 +586,50 @@ def add_character_memory(
     return state
 
 
+def record_interaction_preference(
+    conf_uid: str,
+    user_text: str,
+    *,
+    now: Optional[datetime] = None,
+) -> Optional[Dict[str, Any]]:
+    """Detect and persist one durable interaction preference (pure-ish I/O).
+
+    Returns the stored entry, or None when the turn carried no durable
+    preference. Conflicting preferences of the same category supersede the
+    older active entry rather than coexisting. Fail-soft: never raises.
+    """
+    detected = detect_interaction_preference(user_text, now=now)
+    if detected is None:
+        return None
+    try:
+        state = load_character_state(conf_uid)
+        preference_id = uuid.uuid4().hex
+        updated = apply_preference(
+            state.interaction_preferences,
+            detected,
+            preference_id=preference_id,
+            now=now,
+        )
+        state.interaction_preferences = updated
+        if not save_character_state(conf_uid, state):
+            return None
+        logger.info(
+            "Interaction preference stored: category={} polarity={} frame={}",
+            detected.category,
+            detected.polarity,
+            detected.frame,
+        )
+        for item in reversed(updated):
+            if item.get("id") == preference_id:
+                return dict(item)
+        return None
+    except Exception as error:
+        logger.warning(
+            "Interaction preference not stored: type={}", type(error).__name__
+        )
+        return None
+
+
 def remove_character_memory(conf_uid: str, text: str) -> Optional[CharacterState]:
     """Remove stored facts overlapping the given text; None on write failure."""
     target = _normalize_memory_text(text)
@@ -477,13 +664,19 @@ def reset_character_memory(conf_uid: str) -> Optional[CharacterState]:
 
 
 def reset_character_state(conf_uid: str) -> Optional[CharacterState]:
-    """Reset relationship to stranger and clear memory; None on write failure."""
+    """Reset relationship to stranger and clear character-level state.
+
+    Clears memories and interaction preferences as well: this action is a
+    full character-state reset, so no character-level state may survive it
+    hidden.
+    """
     state = load_character_state(conf_uid)
     state.relationship_status = "stranger"
     state.relationship_updated_at = _now_iso()
     state.relationship_reason = "manual_reset"
     state.relationship_migrated = True
     state.memories = []
+    state.interaction_preferences = []
     if not save_character_state(conf_uid, state):
         return None
     return state
