@@ -15,9 +15,9 @@ from typing import Literal, Optional
 from ..world_state import relative_day_parts
 
 
-RelationshipStatus = Literal["stranger", "familiar", "close", "dating"]
+RelationshipStatus = Literal["stranger", "familiar", "close", "dating", "married"]
 VALID_RELATIONSHIP_STATUSES = frozenset(
-    {"stranger", "familiar", "close", "dating"}
+    {"stranger", "familiar", "close", "dating", "married"}
 )
 
 
@@ -59,6 +59,43 @@ _ROMANTIC_REJECTION = re.compile(
     r"\b(?:bukan\s+(?:jadi\s+)?pacar|tetap\s+teman|teman\s+aja)\b|"
     r"\b(?:mungkin\b.{0,50}\b(?:nanti|suatu\s+hari)|sekarang\s+belum)\b|"
     r"\b(?:cuma|hanya)\s+teman|\bjangan\s+(?:ngarep|berharap)|\baku\s+tolak\b",
+    re.IGNORECASE,
+)
+
+# Marriage is a one-way, terminal step above "dating": it is only ever reached
+# from an explicitly established romance, and it is never inferred, undone or
+# downgraded automatically. This layer records durable facts, it does not
+# arbitrate the user's life, so there is deliberately no divorce rule.
+_MARRIAGE_USER_EVENT = re.compile(
+    r"\b(?:kita\s+(?:udah|sudah|udah\s+ya|sudah\s+ya)\s+"
+    r"(?:nikah|menikah)|"
+    r"(?:aku|kamu)\s+(?:udah\s+)?nikah(?:an)?|"
+    r"kita\s+(?:sekarang\s+)?(?:suami\s+istri|istri\s+suami)|"
+    r"aku\s+(?:suami|kekasih)\s+kamu|kamu\s+(?:istri|kekasih)\s+aku|"
+    r"kita\s+(?:sudah|udah)\s+terikat|"
+    r"pernikahan\s+kita|"
+    r"kita\s+sudah\s+menikah)\b",
+    re.IGNORECASE,
+)
+_MARRIAGE_ACCEPTANCE = re.compile(
+    r"\b(?:kita\s+(?:udah|sudah|udah\s+ya|sudah\s+ya)\s+"
+    r"(?:nikah|menikah)|"
+    r"kita\s+(?:sekarang\s+)?(?:suami\s+istri|istri\s+suami)|"
+    r"aku\s+(?:istri|kekasih)\s+kamu|kamu\s+(?:suami|kekasih)\s+aku|"
+    r"(?:ya|iya|benar)\s*[,.\s]+kita\s+(?:udah|sudah)|"
+    r"aku\s+(?:juga\s+)?setuju|aku\s+mau|sudah\s+kita\s+nikah)\b",
+    re.IGNORECASE,
+)
+# Marriage-specific refusal. Kept separate from ``_ROMANTIC_REJECTION`` so the
+# dating rule above keeps its exact previous behaviour.
+_MARRIAGE_REJECTION = re.compile(
+    r"\b(?:belum|nggak|ngga|gak|ga|tidak)\s+(?:nikah|menikah|terikat)\b|"
+    r"\b(?:nggak|ngga|gak|ga|tidak|mau\s+nggak)\s+(?:mau|bisa|setuju)\s+"
+    r"(?:nikah|menikah)\b|"
+    r"\bbukan\s+(?:suami|istri|kekasih)\b|"
+    r"\bmasih\s+(?:pacar|pacaran|belum\s+nikah)\b|"
+    r"\bkita\s+(?:baru|masih)\s+(?:pacaran|kenal)\b|"
+    r"\baku\s+tolak\b|\baku\s+nggak\s+mau\b",
     re.IGNORECASE,
 )
 
@@ -114,6 +151,18 @@ def detect_relationship_update(
         return None
 
     acceptance_prefix = assistant[:_DATING_ACCEPTANCE_PREFIX_CHARS]
+    # Marriage sits ABOVE dating and is terminal: once married, nothing in this
+    # layer can walk it back, and an ordinary conversation can never re-open the
+    # question. Checked first so a married character never re-detects dating.
+    if current_status == "married":
+        return None
+    if (
+        current_status == "dating"
+        and _MARRIAGE_USER_EVENT.search(user)
+        and _MARRIAGE_ACCEPTANCE.search(acceptance_prefix)
+        and not _MARRIAGE_REJECTION.search(assistant)
+    ):
+        return RelationshipUpdate("married", "explicit_marriage_event")
     if (
         current_status != "dating"
         and _DATING_PROPOSAL.search(user)
@@ -130,8 +179,7 @@ def detect_relationship_update(
         return RelationshipUpdate("close", "mutual_trust_event")
 
     if current_status == "stranger" and (
-        _FAMILIAR_USER_EVENT.search(user)
-        and _FAMILIAR_ACCEPTANCE.search(assistant)
+        _FAMILIAR_USER_EVENT.search(user) and _FAMILIAR_ACCEPTANCE.search(assistant)
     ):
         return RelationshipUpdate("familiar", "returning_user_event")
 
@@ -139,13 +187,25 @@ def detect_relationship_update(
 
 
 _STATE_GUIDANCE = {
-    "stranger": "Mili is slightly more reserved because familiarity has not been established.",
-    "familiar": "Mili is more relaxed and comfortable with this returning user.",
-    "close": "Mili is more openly attentive, comfortable joking, and less defensive.",
+    "stranger": "Familiarity has not been established yet.",
+    "familiar": "Mutual familiarity has been established in an earlier conversation.",
+    "close": "Mutual trust has been established in an earlier conversation.",
     "dating": (
         "A romantic relationship has already been mutually established in this "
-        "roleplay conversation. Keep Mili's tsundere personality, but do not behave "
-        "as if that agreement never happened."
+        "roleplay conversation. Do not behave as if that agreement never "
+        "happened. How Mili expresses herself still follows her persona prompt "
+        "and what the conversation has established, so read the persona rules "
+        "and the stored memories before answering."
+    ),
+    "married": (
+        "You and the user are already married in this roleplay conversation. "
+        "Treat it as long-settled and durable: never re-open the proposal, "
+        "never ask whether you are really together, and never fall back to "
+        "'just dating', 'only a girlfriend/boyfriend' or any earlier stage. "
+        "The marriage is a fact of this relationship, exactly like a stored "
+        "memory, and it survives new conversations. How Mili expresses herself "
+        "still follows her persona prompt and what the conversation has "
+        "established."
     ),
 }
 
@@ -169,8 +229,7 @@ def build_relationship_context(
         if parts is not None:
             label, date_str = parts
             state_line = (
-                f"Current state: {status} "
-                f"(status updated {label.lower()}, {date_str})."
+                f"Current state: {status} (status updated {label.lower()}, {date_str})."
             )
     return (
         "Internal relationship continuity (not user-visible metadata):\n"

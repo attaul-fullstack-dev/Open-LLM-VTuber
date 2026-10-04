@@ -714,9 +714,23 @@ def retrieve_episodic_events(
             except Exception:
                 continue
             if score > 0:
-                scored.append((score, str(event.get("created_at", "")), event))
-        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        return [event for _, _, event in scored[: max(top_n, 0)]]
+                # Tie-break on EVENT time, never storage time: two equally
+                # relevant events must rank by when they happened.
+                reference = _parse_iso_or_none(event.get("occurred_at", ""))
+                if reference is None:
+                    reference = _parse_iso_or_none(event.get("created_at", ""))
+                scored.append(
+                    (
+                        score,
+                        reference.isoformat(timespec="seconds") if reference else "",
+                        # Final tie-break on a unique key so the result never
+                        # depends on the order rows happened to be stored in.
+                        str(event.get("id", "") or ""),
+                        event,
+                    )
+                )
+        scored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+        return [row[3] for row in scored[: max(top_n, 0)]]
     except Exception as error:
         logger.warning(
             "Episodic retrieval failed (no events returned): type={}",

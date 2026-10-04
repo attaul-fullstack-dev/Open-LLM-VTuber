@@ -1173,8 +1173,62 @@ class BasicMemoryAgent(AgentInterface):
             user_text, assistant_text
         )
         memory_updated = self._observe_character_memory_request(user_text)
+        auto_updated = self._observe_automatic_memory(user_text)
         preference_updated = self._observe_interaction_preference(user_text)
-        return relationship_updated or memory_updated or preference_updated
+        return (
+            relationship_updated
+            or memory_updated
+            or auto_updated
+            or preference_updated
+        )
+
+    def _observe_automatic_memory(self, user_text: str) -> bool:
+        """Persist stable facts stated in ordinary chat, with no command word.
+
+        The user should never have to say "ingat this" for something that is
+        plainly a lasting fact about them ("aku suka kopi susu"). This runs on
+        the existing post-turn observer, uses the deterministic extractor in
+        ``character_memory_commands`` (no model call, no new store, no new
+        lifecycle) and writes through the same ``add_character_memory`` path as
+        the explicit command, so deduplication, bounds and the 600-token prompt
+        budget are shared.
+
+        Transient statements, questions and reactions are rejected by the
+        extractor -- those belong to episodic memory, which already captures
+        events on its own. Stored as ``explicit=False`` so an inferred trait is
+        never presented as something the user asked Mili to remember, and a
+        later explicit "ingat ..." still wins.
+
+        Fail-soft: a failure here can never break the conversation.
+        """
+        if not self._character_conf_uid:
+            return False
+        try:
+            from ...character_memory_commands import extract_stable_facts
+
+            stored_any = False
+            for fact in extract_stable_facts(user_text):
+                if self.add_character_memory(fact, explicit=False):
+                    stored_any = True
+            if not stored_any:
+                return False
+            # Refresh the in-memory copy so the fact also applies for the rest
+            # of THIS session, not only from the next one.
+            try:
+                refreshed = load_character_state(self._character_conf_uid)
+                if refreshed is not None:
+                    self._character_state = refreshed
+            except Exception as error:
+                logger.debug(
+                    "Character state refresh after auto-memory skipped: type={}",
+                    type(error).__name__,
+                )
+            return True
+        except Exception as error:
+            logger.debug(
+                "Automatic memory capture skipped: type={}", type(error).__name__
+            )
+            return False
 
     def _observe_interaction_preference(self, user_text: str) -> bool:
         """Capture a durable interaction preference stated in ordinary chat.

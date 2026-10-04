@@ -43,6 +43,9 @@ _RELATIONSHIP_RANK: Dict[str, int] = {
     "familiar": 1,
     "close": 2,
     "dating": 3,
+    # Terminal tier above dating. Old state files never contain it, so every
+    # previously stored status keeps its exact rank and migration behaviour.
+    "married": 4,
 }
 
 _state_locks: Dict[str, threading.RLock] = {}
@@ -555,6 +558,52 @@ def _normalize_memory_text(text: str) -> str:
     return " ".join((text or "").lower().split()).strip(" .,!?;:，。！？；：")
 
 
+# Words that carry no identity in a stored fact. Dropping them lets the same
+# sentence survive being written twice in different surface forms.
+_MEMORY_STOPWORDS = frozenset(
+    {
+        "aku", "gw", "gue", "gua", "ane", "saya", "user", "yang", "dengan",
+        "untuk", "dari", "pada", "itu", "ini", "ya", "sih", "deh", "dong",
+        "kok", "banget", "suka", "biasa", "selalu",
+    }
+)
+
+
+def _memory_significant_tokens(text: str) -> frozenset:
+    """Lowercase content words of a stored fact, ignoring voice/filler."""
+    raw = _normalize_memory_text(text)
+    tokens = [
+        token
+        for token in "".join(
+            ch if ch.isalnum() else " " for ch in raw
+        ).split()
+        if token and token not in _MEMORY_STOPWORDS
+    ]
+    return frozenset(tokens)
+
+
+def _memory_is_same_fact(existing: str, incoming: str) -> bool:
+    """True when two phrasings state the same durable fact.
+
+    Automatic capture drops the first-person subject ("suka kopi susu gula
+    aren") while an explicit command keeps it ("aku suka minum kopi susu gula
+    aren"), so a plain string comparison stores the same fact twice. A token
+    subset in EITHER direction, with at least two shared content words, means
+    one phrasing is contained in the other and they must not coexist.
+
+    Deliberately conservative: genuinely different facts ("suka kopi" vs "suka
+    teh") share few tokens and stay separate.
+    """
+    left = _memory_significant_tokens(existing)
+    right = _memory_significant_tokens(incoming)
+    if not left or not right:
+        return False
+    shared = left & right
+    if len(shared) < 2:
+        return False
+    return left <= right or right <= left
+
+
 def add_character_memory(
     conf_uid: str,
     text: str,
@@ -562,17 +611,23 @@ def add_character_memory(
     explicit: bool = True,
     kind: str = "",
 ) -> Optional[CharacterState]:
-    """Append one long-term fact (deduplicated); None on write failure."""
+    """Append one long-term fact (deduplicated); None on write failure.
+
+    Deduplication is semantic as well as literal: a fact already stored in a
+    different phrasing ("aku suka minum kopi susu" vs "suka kopi susu") is not
+    written a second time.
+    """
     cleaned = " ".join((text or "").split()).strip()
     if not cleaned:
         return None
     state = load_character_state(conf_uid)
     normalized = _normalize_memory_text(cleaned)
-    if any(
-        _normalize_memory_text(str(item.get("text", ""))) == normalized
-        for item in state.memories
-    ):
-        return state
+    for item in state.memories:
+        stored_text = str(item.get("text", ""))
+        if _normalize_memory_text(stored_text) == normalized:
+            return state
+        if _memory_is_same_fact(stored_text, cleaned):
+            return state
     state.memories.append(
         {
             "text": cleaned,
