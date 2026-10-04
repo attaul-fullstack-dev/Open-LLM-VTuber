@@ -41,9 +41,7 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
     rolling_summary_enabled: bool = Field(True, alias="rolling_summary_enabled")
     summary_target_tokens: int = Field(320, gt=0, alias="summary_target_tokens")
     summary_max_tokens: int = Field(384, gt=0, alias="summary_max_tokens")
-    summary_min_new_messages: int = Field(
-        4, gt=0, alias="summary_min_new_messages"
-    )
+    summary_min_new_messages: int = Field(4, gt=0, alias="summary_min_new_messages")
     proactive_enabled: bool = Field(True, alias="proactive_enabled")
     initial_idle_min_seconds: int = Field(45, ge=0, alias="initial_idle_min_seconds")
     initial_idle_max_seconds: int = Field(90, ge=0, alias="initial_idle_max_seconds")
@@ -60,24 +58,28 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
     )
     # Proactive V2 deterministic gate. Kept flat (no extra nesting) so the
     # existing config surface and upgrade path stay untouched.
-    proactive_daily_hard_limit: int = Field(60, ge=0, alias="proactive_daily_hard_limit")
+    proactive_daily_hard_limit: int = Field(
+        60, ge=0, alias="proactive_daily_hard_limit"
+    )
     minimum_proactive_gap_seconds: int = Field(
-        900, ge=0, alias="minimum_proactive_gap_seconds"
+        600, ge=0, alias="minimum_proactive_gap_seconds"
     )
     maximum_unanswered_consecutive: int = Field(
-        2, ge=0, alias="maximum_unanswered_consecutive"
+        3, ge=0, alias="maximum_unanswered_consecutive"
     )
     backoff_multiplier: float = Field(2.0, gt=0, alias="backoff_multiplier")
-    max_backoff_seconds: int = Field(21600, ge=0, alias="max_backoff_seconds")
+    max_backoff_seconds: int = Field(10800, ge=0, alias="max_backoff_seconds")
     quiet_hours_start_hour: int = Field(23, ge=0, le=23, alias="quiet_hours_start_hour")
     quiet_hours_end_hour: int = Field(7, ge=0, le=23, alias="quiet_hours_end_hour")
     meaningful_trigger_budget_per_hour: int = Field(
-        2, ge=0, alias="meaningful_trigger_budget_per_hour"
+        3, ge=0, alias="meaningful_trigger_budget_per_hour"
     )
     idle_trigger_budget_per_hour: int = Field(
-        0, ge=0, alias="idle_trigger_budget_per_hour"
+        1, ge=0, alias="idle_trigger_budget_per_hour"
     )
-    idle_trigger_budget_per_day: int = Field(0, ge=0, alias="idle_trigger_budget_per_day")
+    idle_trigger_budget_per_day: int = Field(
+        0, ge=0, alias="idle_trigger_budget_per_day"
+    )
     behavior_on_budget_exhausted: Literal["degrade_to_silent"] = Field(
         "degrade_to_silent", alias="behavior_on_budget_exhausted"
     )

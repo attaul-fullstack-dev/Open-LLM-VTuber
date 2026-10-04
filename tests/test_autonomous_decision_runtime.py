@@ -14,7 +14,7 @@ C. Preferences      - in the decision path, no invented preference
 D. Temporal         - absolute stamps, tz-aware day boundary, stale events
 E. Life State       - meaningful transition stays a MEDIUM source, no dupe
 F. Proactive gate   - goal evidence passes the real gate; daily 60 and the
-                      900s minimum gap still bind; budget exhaustion
+                      600s minimum gap still bind; budget exhaustion
                       suppresses; user-driven chat unaffected
 G. Restart/reconnect- no duplicate autonomous action
 H. Safety           - no loop, bounded scan, no repeat for the same evidence
@@ -159,7 +159,13 @@ class GoalsLifecycleTest(unittest.TestCase):
         self.assertEqual(again, first, "re-seeding must be a no-op")
 
     def test_empty_and_corrupt_goal_lists_seed(self):
-        for bad in (None, [], "not-a-list", {}, [None, {"no_id": 1}, {"id": "", "text": ""}]):
+        for bad in (
+            None,
+            [],
+            "not-a-list",
+            {},
+            [None, {"no_id": 1}, {"id": "", "text": ""}],
+        ):
             seeded = ensure_seed_goals(bad)
             self.assertEqual(len(seeded), 3, f"input={bad!r}")
 
@@ -222,7 +228,9 @@ class GoalsLifecycleTest(unittest.TestCase):
         self.assertEqual(round_tripped["status"], "active")
 
     def test_invalid_status_degrades_to_seed(self):
-        self.assertEqual(goal_from_dict({"id": "g", "text": "t", "status": "weird"}).status, "seed")
+        self.assertEqual(
+            goal_from_dict({"id": "g", "text": "t", "status": "weird"}).status, "seed"
+        )
 
     def test_evidence_anchor_round_trip(self):
         goals = goals_with_active("try-three-dishes")
@@ -249,10 +257,16 @@ class PreferencePathTest(unittest.TestCase):
     def test_goal_decision_does_not_depend_on_preferences(self):
         goals = goals_with_active("try-three-dishes")
         events = [event("e1", "gw coba masak chicken")]
-        with_prefs = classify_goal_evidence(goals=goals, episodic_events=events, moment=NOW)
-        without = classify_goal_evidence(goals=goals, episodic_events=events, moment=NOW)
+        with_prefs = classify_goal_evidence(
+            goals=goals, episodic_events=events, moment=NOW
+        )
+        without = classify_goal_evidence(
+            goals=goals, episodic_events=events, moment=NOW
+        )
         self.assertEqual(with_prefs.outcome, without.outcome)
-        self.assertEqual(with_prefs.metadata["evidence_id"], without.metadata["evidence_id"])
+        self.assertEqual(
+            with_prefs.metadata["evidence_id"], without.metadata["evidence_id"]
+        )
 
     def test_no_preference_data_means_safe_default(self):
         from src.open_llm_vtuber.autonomous_decision import build_context_signals
@@ -348,12 +362,17 @@ class TemporalTest(unittest.TestCase):
             hourly_count_hour=local_hour_key(NOW, ZONE),
         )
         # a meaningful (goal) trigger reaches the daily ceiling check
-        meaningful = evaluate_gate(state, cfg, classify_trigger(goal_evidence=True), now=NOW, tz=JKT)
+        meaningful = evaluate_gate(
+            state, cfg, classify_trigger(goal_evidence=True), now=NOW, tz=JKT
+        )
         self.assertTrue(meaningful.allowed)
         self.assertEqual(meaningful.daily_remaining, 1)
-        # a LOW generic idle thought never reaches the LLM at all: with
-        # idle_trigger_budget_* = 0 it is refused before any budget reasoning
-        idle = evaluate_gate(state, cfg, classify_trigger(), now=NOW, tz=JKT)
+        # a LOW generic idle thought never reaches the LLM when site policy
+        # disables the hourly idle budget; it is refused before other checks.
+        idle_cfg = ProactiveGateConfig(
+            idle_trigger_budget_per_hour=0, idle_trigger_budget_per_day=0
+        )
+        idle = evaluate_gate(state, idle_cfg, classify_trigger(), now=NOW, tz=JKT)
         self.assertFalse(idle.allowed)
         self.assertEqual(idle.reason, "idle_budget_exhausted")
 
@@ -363,7 +382,9 @@ class TemporalTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 class LifeStateSignalTest(unittest.TestCase):
     def test_meaningful_transition_remains_medium(self):
-        self.assertEqual(classify_trigger(meaningful_life_event=True).priority, PRIORITY_MEDIUM)
+        self.assertEqual(
+            classify_trigger(meaningful_life_event=True).priority, PRIORITY_MEDIUM
+        )
 
     def test_goal_evidence_and_life_event_coexist_without_dupe(self):
         first = classify_trigger(goal_evidence=True, meaningful_life_event=True)
@@ -387,7 +408,9 @@ class LifeStateSignalTest(unittest.TestCase):
 # F. Proactive V2 integration
 # ---------------------------------------------------------------------------
 class ProactiveIntegrationTest(unittest.TestCase):
-    def _state(self, daily: int = 0, last_proactive: str = None) -> ProactiveBudgetState:
+    def _state(
+        self, daily: int = 0, last_proactive: str = None
+    ) -> ProactiveBudgetState:
         return ProactiveBudgetState(
             daily_request_count=daily,
             daily_count_date=local_day_key(NOW, ZONE),
@@ -401,14 +424,20 @@ class ProactiveIntegrationTest(unittest.TestCase):
 
     def test_goal_evidence_passes_the_real_gate(self):
         trigger = classify_trigger(goal_evidence=True)
-        decision = evaluate_gate(self._state(), ProactiveGateConfig(), trigger, now=NOW, tz=JKT)
+        decision = evaluate_gate(
+            self._state(), ProactiveGateConfig(), trigger, now=NOW, tz=JKT
+        )
         self.assertTrue(decision.allowed)
         self.assertEqual(decision.priority, PRIORITY_HIGH)
 
-    def test_minimum_gap_900_still_binds_a_goal_decision(self):
+    def test_minimum_gap_600_still_binds_a_goal_decision(self):
         state = self._state(last_proactive=(NOW - timedelta(seconds=60)).isoformat())
         decision = evaluate_gate(
-            state, ProactiveGateConfig(), classify_trigger(goal_evidence=True), now=NOW, tz=JKT
+            state,
+            ProactiveGateConfig(),
+            classify_trigger(goal_evidence=True),
+            now=NOW,
+            tz=JKT,
         )
         self.assertFalse(decision.allowed)
         self.assertIn("gap", decision.reason)
@@ -417,7 +446,11 @@ class ProactiveIntegrationTest(unittest.TestCase):
         cfg = ProactiveGateConfig()
         for count, allowed in ((59, True), (60, False), (61, False)):
             decision = evaluate_gate(
-                self._state(daily=count), cfg, classify_trigger(goal_evidence=True), now=NOW, tz=JKT
+                self._state(daily=count),
+                cfg,
+                classify_trigger(goal_evidence=True),
+                now=NOW,
+                tz=JKT,
             )
             self.assertEqual(decision.allowed, allowed, f"count={count}")
             if not allowed:
@@ -456,11 +489,16 @@ class ProactiveIntegrationTest(unittest.TestCase):
         state = ProactiveBudgetState(
             daily_request_count=0,
             daily_count_date=local_day_key(NOW, ZONE),
-            hourly_meaningful_count=2,
+            hourly_meaningful_count=3,
+            hourly_idle_count=0,
             hourly_count_hour=local_hour_key(NOW, ZONE),
         )
         decision = evaluate_gate(
-            state, ProactiveGateConfig(), classify_trigger(goal_evidence=True), now=NOW, tz=JKT
+            state,
+            ProactiveGateConfig(),
+            classify_trigger(goal_evidence=True),
+            now=NOW,
+            tz=JKT,
         )
         self.assertFalse(decision.allowed)
         self.assertEqual(decision.reason, "hourly_budget")
@@ -500,8 +538,14 @@ class PersistenceAndSafetyTest(unittest.TestCase):
         save_character_state(conf, CharacterState(goals=goals))
         loaded = load_character_state(conf)
         events = [event("e1", "gw coba masak chicken")]
-        self.assertTrue(classify_goal_evidence(goals=loaded.goals, episodic_events=events, moment=NOW).acts)
-        loaded.goals, _ = record_goal_evidence(loaded.goals, "try-three-dishes", "e1", now=NOW)
+        self.assertTrue(
+            classify_goal_evidence(
+                goals=loaded.goals, episodic_events=events, moment=NOW
+            ).acts
+        )
+        loaded.goals, _ = record_goal_evidence(
+            loaded.goals, "try-three-dishes", "e1", now=NOW
+        )
         save_character_state(conf, loaded)
         # reconnect: state reloaded from disk must not re-fire the same evidence
         reloaded = load_character_state(conf)
@@ -518,7 +562,9 @@ class PersistenceAndSafetyTest(unittest.TestCase):
             handle.write("{ this is not json")
         state = load_character_state(conf)
         self.assertEqual(state.goals, [])
-        decision = classify_goal_evidence(goals=state.goals, episodic_events=[], moment=NOW)
+        decision = classify_goal_evidence(
+            goals=state.goals, episodic_events=[], moment=NOW
+        )
         self.assertEqual(decision.outcome, OUTCOME_NO_DECISION)
 
     def test_no_autonomous_loop_bounded_scan(self):
@@ -537,7 +583,9 @@ class PersistenceAndSafetyTest(unittest.TestCase):
         goals = goals_with_active("try-three-dishes")
         events = [event("e1", "gw coba masak chicken")]
         seen = {
-            classify_goal_evidence(goals=goals, episodic_events=events, moment=NOW).reason
+            classify_goal_evidence(
+                goals=goals, episodic_events=events, moment=NOW
+            ).reason
             for _ in range(5)
         }
         self.assertEqual(seen, {"goal_evidence"}, "classification must be stable")
@@ -593,7 +641,10 @@ class AgentFacadeTest(unittest.TestCase):
             live2d_model=SimpleNamespace(extract_emotion=lambda text: []),
             tts_preprocessor_config=TTSPreprocessorConfig(
                 remove_special_char=True,
-                translator_config={"translate_audio": False, "translate_provider": "deeplx"},
+                translator_config={
+                    "translate_audio": False,
+                    "translate_provider": "deeplx",
+                },
             ),
         )
 
@@ -609,7 +660,9 @@ class AgentFacadeTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def _write_events(self, events):
-        with open(os.path.join("episodic", "adlchar.json"), "w", encoding="utf-8") as handle:
+        with open(
+            os.path.join("episodic", "adlchar.json"), "w", encoding="utf-8"
+        ) as handle:
             json.dump(events, handle)
 
     def test_seeding_on_load_then_explicit_transitions(self):
@@ -645,14 +698,17 @@ class AgentFacadeTest(unittest.TestCase):
         agent._load_character_state("adlchar")
         self._write_events([event("e1", "gw coba masak chicken")])
         with patch(
-            "src.open_llm_vtuber.agent.agents.basic_memory_agent.utcnow", return_value=NOW
+            "src.open_llm_vtuber.agent.agents.basic_memory_agent.utcnow",
+            return_value=NOW,
         ):
             before = agent.classify_goal_evidence()
             self.assertEqual(before.outcome, OUTCOME_NO_DECISION)
             agent.set_goal_status("try-three-dishes", "active")
             fired = agent.classify_goal_evidence()
             self.assertEqual(fired.outcome, OUTCOME_GOAL_BEHAVIOR)
-            agent.record_goal_evidence("try-three-dishes", fired.metadata["evidence_id"])
+            agent.record_goal_evidence(
+                "try-three-dishes", fired.metadata["evidence_id"]
+            )
             again = agent.classify_goal_evidence()
             self.assertFalse(again.acts)
             self.assertEqual(again.reason, "goal_evidence_consumed")

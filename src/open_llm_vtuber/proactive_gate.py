@@ -126,16 +126,18 @@ def normalize_daily_hard_limit(value: Any) -> int:
 class ProactiveGateConfig:
     """Proactive V2 limits. Values are the agreed baseline, not suggestions."""
 
-    minimum_proactive_gap_seconds: int = 900  # 15 minutes
+    minimum_proactive_gap_seconds: int = 600  # 10 minutes
     proactive_daily_hard_limit: int = DEFAULT_DAILY_HARD_LIMIT  # hard ceiling
-    maximum_unanswered_consecutive: int = 2
+    maximum_unanswered_consecutive: int = 3
     ignored_threshold_before_backoff: int = 2
     backoff_multiplier: float = 2.0
-    max_backoff_seconds: int = 21600  # 6 hours
+    max_backoff_seconds: int = 10800  # 3 hours
     quiet_hours_start_hour: int = 23
     quiet_hours_end_hour: int = 7
-    meaningful_trigger_budget_per_hour: int = 2
-    idle_trigger_budget_per_hour: int = 0
+    meaningful_trigger_budget_per_hour: int = 3
+    idle_trigger_budget_per_hour: int = 1
+    # Reserved for a future independent daily idle ceiling. The aggregate daily
+    # hard limit already bounds idle dispatches; zero keeps this field inert.
     idle_trigger_budget_per_day: int = 0
     behavior_on_budget_exhausted: str = "degrade_to_silent"
 
@@ -198,6 +200,7 @@ class ProactiveBudgetState:
     daily_request_count: int = 0
     daily_count_date: Optional[str] = None  # YYYY-MM-DD in the USER timezone
     hourly_meaningful_count: int = 0
+    hourly_idle_count: int = 0
     hourly_count_hour: Optional[str] = None  # YYYY-MM-DDTHH in the USER timezone
     total_proactive_count: int = 0
     version: int = STATE_VERSION
@@ -212,6 +215,7 @@ class ProactiveBudgetState:
             "daily_request_count": int(self.daily_request_count),
             "daily_count_date": self.daily_count_date,
             "hourly_meaningful_count": int(self.hourly_meaningful_count),
+            "hourly_idle_count": int(self.hourly_idle_count),
             "hourly_count_hour": self.hourly_count_hour,
             "total_proactive_count": int(self.total_proactive_count),
         }
@@ -230,6 +234,7 @@ class ProactiveBudgetState:
             "consecutive_unanswered",
             "daily_request_count",
             "hourly_meaningful_count",
+            "hourly_idle_count",
             "total_proactive_count",
         ):
             try:
@@ -336,6 +341,7 @@ def roll_counters(state: ProactiveBudgetState, moment: datetime, tz: ZoneInfo) -
     if state.hourly_count_hour != hour:
         state.hourly_count_hour = hour
         state.hourly_meaningful_count = 0
+        state.hourly_idle_count = 0
 
 
 def current_gap_seconds(
@@ -388,9 +394,11 @@ def classify_trigger(
 ) -> TriggerReason:
     """Map existing deterministic signals onto a priority. Pure, no I/O.
 
-    LOW means "generic idle thought". With ``idle_trigger_budget_* = 0`` the
-    gate suppresses LOW entirely, so the model is never called merely to look
-    for a reason to speak.
+    LOW means "generic idle thought". A zero hourly idle budget suppresses LOW
+    entirely, so the model is never called merely to look for a reason to
+    speak. A nonzero hourly budget lets LOW continue through the same quiet,
+    daily, gap, dormant, backoff, and unanswered checks as meaningful
+    traffic; priority alone is never permission.
 
     ``goal_evidence`` is the Autonomous Decision Layer's single contribution:
     it is raised only from a stored, explicitly *active* goal matched with
@@ -491,15 +499,15 @@ def evaluate_gate(
         if generation_in_progress:
             return decide(False, GATE_CONNECTION)
 
-        # LOW idle thoughts are budgeted at zero by default: a generic idle
-        # timer must never be able to buy a model call.
+        # LOW idle thoughts need an explicit hourly budget. When both idle
+        # budgets are zero, a generic idle timer must never buy a model call.
+        # A nonzero hourly budget does not bypass anything below: LOW still
+        # has to clear quiet hours, the daily ceiling, its hourly budget, the
+        # minimum gap, dormancy, backoff, and unanswered protection.
+        idle_hourly_limit = max(0, int(config.idle_trigger_budget_per_hour))
         if not trigger.is_meaningful:
-            if (
-                int(config.idle_trigger_budget_per_hour) <= 0
-                and int(config.idle_trigger_budget_per_day) <= 0
-            ):
+            if idle_hourly_limit <= 0 and int(config.idle_trigger_budget_per_day) <= 0:
                 return decide(False, GATE_IDLE_BUDGET)
-            return decide(False, GATE_NO_REASON)
 
         if is_quiet_hours(moment, zone, config):
             return decide(False, GATE_QUIET_HOURS)
@@ -507,12 +515,17 @@ def evaluate_gate(
         if int(state.daily_request_count) >= int(config.proactive_daily_hard_limit):
             return decide(False, GATE_DAILY_LIMIT)
 
-        if int(config.meaningful_trigger_budget_per_hour) > 0 and int(
-            state.hourly_meaningful_count
-        ) >= int(config.meaningful_trigger_budget_per_hour):
-            # No HIGH bypass exists in the current architecture, so the safe
-            # choice is defer, not invent a new exemption.
-            return decide(False, GATE_HOURLY_BUDGET)
+        if trigger.is_meaningful:
+            if int(config.meaningful_trigger_budget_per_hour) > 0 and int(
+                state.hourly_meaningful_count
+            ) >= int(config.meaningful_trigger_budget_per_hour):
+                # No HIGH bypass exists in the current architecture, so the safe
+                # choice is defer, not invent a new exemption.
+                return decide(False, GATE_HOURLY_BUDGET)
+        elif (
+            idle_hourly_limit > 0 and int(state.hourly_idle_count) >= idle_hourly_limit
+        ):
+            return decide(False, GATE_IDLE_BUDGET)
 
         dormant_until = _parse(state.dormant_until)
         if dormant_until is not None and moment < dormant_until:
@@ -570,6 +583,8 @@ def record_proactive_dispatch(
     state.total_proactive_count = int(state.total_proactive_count) + 1
     if trigger.is_meaningful:
         state.hourly_meaningful_count = int(state.hourly_meaningful_count) + 1
+    else:
+        state.hourly_idle_count = int(state.hourly_idle_count) + 1
     # The gap only escalates once the previous proactive went unanswered.
     state.consecutive_unanswered = int(state.consecutive_unanswered) + 1
     gap = current_gap_seconds(state, config)
