@@ -486,6 +486,20 @@ class BasicMemoryAgent(AgentInterface):
             out.append(
                 {"at": at.strip(), "text": text.strip()[:PREV_SESSION_MAX_CHARS]}
             )
+        # A partially recovered older conversation (forensic pass) is appended
+        # last so it can never displace a real stored summary. It reuses this
+        # loader's exact item shape, so the existing renderer, age tags and
+        # bounds apply unchanged and nothing new enters the prompt.
+        try:
+            from ...recovered_context import load_recovered_previous_session
+
+            recovered = load_recovered_previous_session()
+            if recovered and recovered.get("text"):
+                out.append(recovered)
+        except Exception as error:
+            logger.debug(
+                "Recovered context skipped: type={}", type(error).__name__
+            )
         return out
 
     @property
