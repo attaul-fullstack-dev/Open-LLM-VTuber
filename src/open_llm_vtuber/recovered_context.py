@@ -40,9 +40,13 @@ RECOVERED_STATUS = "partial"
 RECOVERED_SOURCE = "forensic_recovery"
 RECOVERED_AT = "2026-10-04"
 
-# Same caps the normal previous-session path uses; the recovered block is an
-# extra, never a replacement.
-MAX_SUMMARY_CHARS = 600
+# Unlike live rolling summaries, this forensic remainder cannot be regenerated
+# from the deleted transcript. Preserve the whole compact summary instead of
+# reapplying the ordinary 600-character prefix cut. The later part of this
+# record can contain the only surviving account of mutually established facts
+# from that conversation; truncating it would silently change behavioral
+# continuity without adding any safety. Quotes remain separately bounded.
+MAX_SUMMARY_CHARS = 1200
 MAX_RECOVERED_QUOTES = 4
 MAX_QUOTE_CHARS = 220
 

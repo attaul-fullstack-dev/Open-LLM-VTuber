@@ -17,6 +17,7 @@ from src.open_llm_vtuber.chat_history_manager import (
     update_metadate,
 )
 from src.open_llm_vtuber.config_manager import TTSPreprocessorConfig
+from src.open_llm_vtuber.recovered_context import load_recovered_previous_session
 
 
 def message(role: str, content: str):
@@ -355,6 +356,55 @@ class RollingSummaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(input_tokens, 700 - 100 - 100)
         self.assertIn(message("user", "recent fact"), request)
         self.assertEqual(request[-1], message("user", "current"))
+
+
+class RecoveredSummaryContinuityTests(unittest.TestCase):
+    def setUp(self):
+        self._old_cwd = os.getcwd()
+        self._temporary_directory = tempfile.TemporaryDirectory()
+        os.chdir(self._temporary_directory.name)
+
+    def tearDown(self):
+        os.chdir(self._old_cwd)
+        self._temporary_directory.cleanup()
+
+    def write_recovered_summary(self, summary):
+        os.makedirs("recovered_context", exist_ok=True)
+        with open(
+            os.path.join("recovered_context", "conversation_summary.STEP1.txt"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            handle.write(summary)
+
+    def test_irreplaceable_forensic_summary_keeps_late_behavioral_fact(self):
+        head = ("Konteks awal percakapan yang panjang dan netral. " * 20).strip()
+        tail = (
+            "Fakta perilaku penting di bagian akhir: panggilan sayang yang "
+            "sudah disepakati tetap dipakai; jangan mengubahnya tanpa persetujuan."
+        )
+        summary = f"{head} {tail}"
+        self.assertGreater(len(summary), 600)
+        self.write_recovered_summary(summary)
+
+        item = load_recovered_previous_session()
+
+        self.assertIsNotNone(item)
+        self.assertIn(head[:80], item["text"])
+        self.assertIn("panggilan sayang yang sudah disepakati", item["text"])
+        self.assertIn("142 of 1282", item["text"])
+        self.assertIn("instead of inventing it", item["text"])
+
+    def test_recovered_summary_does_not_claim_a_complete_transcript(self):
+        self.write_recovered_summary("Ringkasan forensik yang utuh dan singkat.")
+        item = load_recovered_previous_session()
+
+        self.assertIsNotNone(item)
+        self.assertIn("partial transcript", item["text"])
+        self.assertIn("permanently lost", item["text"])
+
+    def test_missing_recovered_artifact_contributes_nothing(self):
+        self.assertIsNone(load_recovered_previous_session())
 
 
 if __name__ == "__main__":
