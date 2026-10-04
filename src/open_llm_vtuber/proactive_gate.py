@@ -135,7 +135,7 @@ class ProactiveGateConfig:
     quiet_hours_start_hour: int = 23
     quiet_hours_end_hour: int = 7
     meaningful_trigger_budget_per_hour: int = 3
-    idle_trigger_budget_per_hour: int = 6
+    idle_trigger_budget_per_hour: int = 15
     # Reserved for a future independent daily idle ceiling. The aggregate daily
     # hard limit already bounds idle dispatches; zero keeps this field inert.
     idle_trigger_budget_per_day: int = 0

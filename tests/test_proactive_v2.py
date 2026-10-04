@@ -352,8 +352,8 @@ class PriorityTest(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertEqual(decision.reason, GATE_IDLE_BUDGET)
 
-    def test_idle_budgets_are_six_per_hour(self):
-        self.assertEqual(CFG.idle_trigger_budget_per_hour, 6)
+    def test_idle_budgets_are_fifteen_per_hour(self):
+        self.assertEqual(CFG.idle_trigger_budget_per_hour, 15)
         self.assertEqual(CFG.idle_trigger_budget_per_day, 0)
 
     def test_meaningful_trigger_still_allowed_with_idle_budget_zero(self):
@@ -707,7 +707,7 @@ class DailyHardLimitConsistencyTest(unittest.TestCase):
     def test_tuned_gate_values_are_locked(self):
         expected = {
             "minimum_proactive_gap_seconds": 300,
-            "idle_trigger_budget_per_hour": 6,
+            "idle_trigger_budget_per_hour": 15,
             "idle_trigger_budget_per_day": 0,
             "quiet_hours_start_hour": 23,
             "quiet_hours_end_hour": 7,
@@ -734,7 +734,7 @@ class ConfigContractTest(unittest.TestCase):
         self.assertEqual(CFG.quiet_hours_start_hour, 23)
         self.assertEqual(CFG.quiet_hours_end_hour, 7)
         self.assertEqual(CFG.meaningful_trigger_budget_per_hour, 3)
-        self.assertEqual(CFG.idle_trigger_budget_per_hour, 6)
+        self.assertEqual(CFG.idle_trigger_budget_per_hour, 15)
         self.assertEqual(CFG.idle_trigger_budget_per_day, 0)
         self.assertEqual(CFG.behavior_on_budget_exhausted, "degrade_to_silent")
 
@@ -760,7 +760,7 @@ class ConfigContractTest(unittest.TestCase):
         self.assertEqual(settings["maximum_unanswered_consecutive"], 3)
         self.assertEqual(settings["max_backoff_seconds"], 10800)
         self.assertEqual(settings["meaningful_trigger_budget_per_hour"], 3)
-        self.assertEqual(settings["idle_trigger_budget_per_hour"], 6)
+        self.assertEqual(settings["idle_trigger_budget_per_hour"], 15)
         self.assertEqual(settings["idle_trigger_budget_per_day"], 0)
         self.assertEqual(settings["quiet_hours_start_hour"], 23)
         self.assertEqual(settings["quiet_hours_end_hour"], 7)
@@ -774,7 +774,7 @@ class ConfigContractTest(unittest.TestCase):
         self.assertEqual(fields["maximum_unanswered_consecutive"].default, 3)
         self.assertEqual(fields["max_backoff_seconds"].default, 10800)
         self.assertEqual(fields["meaningful_trigger_budget_per_hour"].default, 3)
-        self.assertEqual(fields["idle_trigger_budget_per_hour"].default, 6)
+        self.assertEqual(fields["idle_trigger_budget_per_hour"].default, 15)
         self.assertEqual(fields["idle_trigger_budget_per_day"].default, 0)
 
 
@@ -785,10 +785,10 @@ class ProactiveTuningContractTest(unittest.TestCase):
     fixed clock, so they prove behavior rather than merely repeating numbers.
     """
 
-    def test_idle_trigger_gets_six_hourly_calls_but_not_seven(self):
+    def test_idle_trigger_gets_fifteen_hourly_calls_but_not_sixteen(self):
         state = ProactiveBudgetState()
-        for index in range(6):
-            moment = NOON_JKT + timedelta(minutes=5 * index)
+        for index in range(15):
+            moment = NOON_JKT + timedelta(minutes=2 * index)
             decision = evaluate_gate(state, CFG, LOW, now=moment, tz=JKT)
             self.assertTrue(decision.allowed, (index, decision.reason))
             self.assertEqual(decision.reason, GATE_OK)
@@ -801,11 +801,11 @@ class ProactiveTuningContractTest(unittest.TestCase):
             state.backoff_until = None
             state.dormant_until = None
             state.consecutive_unanswered = 0
-        seventh = evaluate_gate(
+        sixteenth = evaluate_gate(
             state, CFG, LOW, now=NOON_JKT + timedelta(minutes=30), tz=JKT
         )
-        self.assertFalse(seventh.allowed)
-        self.assertEqual(seventh.reason, GATE_IDLE_BUDGET)
+        self.assertFalse(sixteenth.allowed)
+        self.assertEqual(sixteenth.reason, GATE_IDLE_BUDGET)
 
     def test_idle_trigger_cannot_bypass_the_minimum_gap(self):
         state = ProactiveBudgetState(last_proactive_at=pg._iso(NOON_JKT))
@@ -822,11 +822,11 @@ class ProactiveTuningContractTest(unittest.TestCase):
 
     def test_idle_hourly_counter_resets_next_hour(self):
         state = ProactiveBudgetState()
-        for index in range(6):
+        for index in range(15):
             record_proactive_dispatch(
-                state, CFG, LOW, now=NOON_JKT + timedelta(minutes=5 * index), tz=JKT
+                state, CFG, LOW, now=NOON_JKT + timedelta(minutes=2 * index), tz=JKT
             )
-        self.assertEqual(state.hourly_idle_count, 6)
+        self.assertEqual(state.hourly_idle_count, 15)
         # Isolate the counter reset from gap/backoff/dormant pressure, which
         # have their own dedicated tests.
         state.last_proactive_at = None

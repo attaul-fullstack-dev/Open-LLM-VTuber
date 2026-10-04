@@ -75,7 +75,7 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
         3, ge=0, alias="meaningful_trigger_budget_per_hour"
     )
     idle_trigger_budget_per_hour: int = Field(
-        6, ge=0, alias="idle_trigger_budget_per_hour"
+        15, ge=0, alias="idle_trigger_budget_per_hour"
     )
     idle_trigger_budget_per_day: int = Field(
         0, ge=0, alias="idle_trigger_budget_per_day"
