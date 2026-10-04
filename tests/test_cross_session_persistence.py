@@ -266,11 +266,27 @@ class RelationshipPersistenceTest(ContinuityBase):
     def test_unknown_value_still_degrades_to_stranger(self):
         self.assertEqual(normalize_relationship_status("garbage"), "stranger")
 
-    def test_marriage_requires_an_established_romance(self):
-        """A stranger cannot jump straight to married."""
-        self.assertIsNone(
-            detect_relationship_update("stranger", "kita sudah menikah", "Iya, kita sudah menikah.")
-        )
+    def test_any_tier_can_step_up_on_an_explicit_assertion(self):
+        """The relationship is mutable: every tier may follow every other."""
+        for current in ("stranger", "familiar", "close", "dating"):
+            update = detect_relationship_update(
+                current, "kita sudah menikah", "Iya, kita sudah menikah."
+            )
+            self.assertIsNotNone(update, f"from {current}")
+            self.assertEqual(update.new_status, "married", f"from {current}")
+
+    def test_a_step_up_still_needs_an_explicit_assertion(self):
+        """Mutability must not make the state twitchy: silence keeps it."""
+        for line in (
+            "halo, apa kabar?",
+            "kemarin kita ngobrol tentang pernikahan",
+            "aku ingat waktu kita pacaran dulu",
+            "kita pacaran duluan ya?",
+        ):
+            self.assertIsNone(
+                detect_relationship_update("stranger", line, "Iya, aku setuju."),
+                f"{line!r} must not move the relationship",
+            )
 
     def test_marriage_is_detected_from_dating(self):
         update = detect_relationship_update(
@@ -285,13 +301,41 @@ class RelationshipPersistenceTest(ContinuityBase):
                 detect_relationship_update("dating", "kita sudah menikah", reply)
             )
 
-    def test_married_is_terminal(self):
-        self.assertIsNone(
-            detect_relationship_update("married", "kita pacaran yuk", "Iya, aku mau.")
+    def test_married_can_step_back_down_on_request(self):
+        """Married is durable in storage, but never a locked terminal state."""
+        cases = (
+            ("aku rasa kita kembali pacaran saja", "dating"),
+            ("kita pacaran lagi aja", "dating"),
+            ("kita berteman aja", "familiar"),
+            ("mulai sekarang kita hanya teman", "familiar"),
         )
-        self.assertIsNone(
-            detect_relationship_update("married", "kita sudah cerai", "Iya, aku setuju.")
-        )
+        for line, expected in cases:
+            update = detect_relationship_update(
+                "married", line, "Iya, aku setuju denganmu."
+            )
+            self.assertIsNotNone(update, line)
+            self.assertEqual(update.new_status, expected, line)
+
+    def test_step_down_still_needs_acknowledgement(self):
+        for reply in ("Yah... akuolak.", "Hmm.", "Belum, aku belum siap."):
+            self.assertIsNone(
+                detect_relationship_update(
+                    "married", "aku rasa kita kembali pacaran saja", reply
+                ),
+                reply,
+            )
+
+    def test_narrative_mention_never_moves_a_married_relationship(self):
+        for line in (
+            "kemarin kita ngobrol tentang pernikahan",
+            "aku ingat waktu kita pacaran dulu",
+            "kenapa kita dulu punya rencana nikah?",
+            "kita pacaran duluan ya?",
+        ):
+            self.assertIsNone(
+                detect_relationship_update("married", line, "Iya, aku setuju."),
+                line,
+            )
 
     def test_dating_detection_unchanged(self):
         update = detect_relationship_update("stranger", "kita pacaran", "Iya, aku mau.")
@@ -317,11 +361,19 @@ class RelationshipPersistenceTest(ContinuityBase):
         self.assertIn("never", lowered)
         self.assertIn("dating", lowered, "guidance must explicitly forbid the old tier")
 
-    def test_scenario_b_repeated_dating_request_cannot_downgrade(self):
+    def test_scenario_b_relationship_is_mutable_but_not_twitchy(self):
+        """Persistence across sessions AND intentional change both hold."""
         self.seed_relationship("married")
+        # a casual, non-assertive mention must not downgrade anything
         a = self.session(self.new_session())
-        self.say(a, "kita pacaran yuk", "Iya, aku mau.")
+        self.say(a, "kita pacaran duluan ya?", "Iya, dulu banget.")
         self.assertEqual(a._relationship_state.status, "married")
+        # but an explicit, acknowledged change does move it
+        self.say(a, "aku rasa kita kembali pacaran saja", "Iya, aku setuju.")
+        self.assertEqual(a._relationship_state.status, "dating")
+        # and the new tier is what persists into the next session
+        b = self.session(self.new_session())
+        self.assertEqual(b._relationship_state.status, "dating")
 
     def test_relationship_persists_on_disk(self):
         self.seed_relationship("dating")

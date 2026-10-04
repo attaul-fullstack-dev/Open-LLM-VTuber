@@ -63,6 +63,11 @@ chat_history/
 character_state/
 world_state/
 episodic/
+# Proactive V2 accounting (per-character daily budget/backoff). Runtime
+# state, same class as world_state/ and episodic/: never versioned.
+proactive_state/
+# Timestamped safety snapshots of the conversation stores (history_backup.py)
+backups/
 knowledge_base/
 submodules/MeloTTS
 openapi_assistants.json

@@ -135,6 +135,15 @@ def run(console_log_level: str):
 
     atexit.register(WebSocketServer.clean_cache)
 
+    # Safety net: snapshot the conversation stores before anything can touch
+    # them. Fail-soft, and never inside the live stores.
+    try:
+        from src.open_llm_vtuber.history_backup import take_snapshot
+
+        take_snapshot(reason="server_start")
+    except Exception as e:
+        logger.warning(f"Conversation snapshot unavailable: {e}")
+
     # Load configurations from yaml file
     config: Config = validate_config(read_yaml("conf.yaml"))
     server_config = config.system_config

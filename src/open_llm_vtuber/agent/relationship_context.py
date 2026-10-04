@@ -66,17 +66,6 @@ _ROMANTIC_REJECTION = re.compile(
 # from an explicitly established romance, and it is never inferred, undone or
 # downgraded automatically. This layer records durable facts, it does not
 # arbitrate the user's life, so there is deliberately no divorce rule.
-_MARRIAGE_USER_EVENT = re.compile(
-    r"\b(?:kita\s+(?:udah|sudah|udah\s+ya|sudah\s+ya)\s+"
-    r"(?:nikah|menikah)|"
-    r"(?:aku|kamu)\s+(?:udah\s+)?nikah(?:an)?|"
-    r"kita\s+(?:sekarang\s+)?(?:suami\s+istri|istri\s+suami)|"
-    r"aku\s+(?:suami|kekasih)\s+kamu|kamu\s+(?:istri|kekasih)\s+aku|"
-    r"kita\s+(?:sudah|udah)\s+terikat|"
-    r"pernikahan\s+kita|"
-    r"kita\s+sudah\s+menikah)\b",
-    re.IGNORECASE,
-)
 _MARRIAGE_ACCEPTANCE = re.compile(
     r"\b(?:kita\s+(?:udah|sudah|udah\s+ya|sudah\s+ya)\s+"
     r"(?:nikah|menikah)|"
@@ -137,12 +126,134 @@ def normalize_relationship_status(value: object) -> RelationshipStatus:
     return "stranger"
 
 
+# ---------------------------------------------------------------------------
+# Explicit relationship assertions -- the ONLY way the state ever moves.
+# ---------------------------------------------------------------------------
+#
+# A relationship change is a deliberate act by the user, so the detector needs a
+# statement about the relationship *as it stands now*, plus Mili agreeing.
+# Everything else is inert:
+#
+#   * narrative / past reference ("kita pernah bicara soal pernikahan",
+#     "aku ingat waktu kita pacaran dulu", "kenapa kita duluplicity") -> no move
+#   * questions ("kita pacaran duluan?")                                 -> no move
+#   * a one-sided statement without acknowledgement                      -> no move
+#
+# This is what makes the state mutable without making it twitchy: it can go up
+# AND down between any two tiers, but only on an explicit, mutually confirmed
+# present-tense change.
+
+# Present-tense assertion: "we are X now", "we became X", "let's be X",
+# "from now on we are X", "let's go back to being X".
+_ASSERT_NOW = (
+    r"(?:kita|aku\s+dan\s+kamu|aku\s+kamu)\s+"
+    r"(?:sekarang\s+|udah\s+|sudah\s+|udah\s+ya\s+|sudah\s+ya\s+|"
+    r"justru\s+|kembali\s+|lagi\s+|mulai\s+|dari\s+sekarang\s+)*"
+)
+_ASSERT_WISH = r"(?:aku\s+(?:mau|ingin|berharap|pengen)|mulai\s+sekarang|kita\s+ubah)"
+# Used only on the assertion path. A bare recall question ("kita pacaran
+# duluan?") is not a change, but a proposal phrased as a question ("mau gak
+# jadi pacarku?") absolutely is, so the legacy proposal detectors below are
+# deliberately NOT gated on this.
+_QUESTION_FORM = re.compile(
+    r"\?\s*$|^\s*(?:kapan|kenapa|mengapa|apa|siapa|dimana|berapa|gimana)\b",
+    re.IGNORECASE,
+)
+# Anything that points at the past, a hypothetical or a topic of conversation
+# rather than a statement of the present state.
+# Wording that points at the past, a memory or a topic of conversation instead
+# of asserting what the relationship is NOW. Narrow on purpose: it must not
+# swallow a genuine proposal such as "mau gak jadi pacarku?" nor a real
+# re-connection such as "aku balik lagi, masih ingat aku?".
+_NARRATIVE_FRAME = re.compile(
+    r"\b(?:dulu(?:an)?|kelu|kemarin(?:nya)?|sebelumnya|pertama|"
+    r"waktu\s+(?:kita|aku)|pas\s+(?:kita|aku)\s+(?:lagi\s+)?"
+    r"(?:bicara|ngobrol|bahas|diskusi)|"
+    r"kenapa\s+(?:kita|aku)|"
+    r"pernah\s+(?:bahas|ngobrol|bicara|diskusi)|"
+    r"topik\s+tentang|pembahasan\s+tentang)\b",
+    re.IGNORECASE,
+)
+
+# target tier -> present-tense assertion patterns
+_RELATIONSHIP_ASSERTIONS = (
+    (
+        "married",
+        (
+            _ASSERT_NOW
+            + r"(?:nikah|menikah|bersuami|beristri|"
+            r"suami\s+istri|istri\s+suami|terikat|kekasih)\b",
+            _ASSERT_WISH
+            + r"[^.?!]{0,24}\b(?:nikah|menikah|terikat)\b",
+        ),
+    ),
+    (
+        "dating",
+        (
+            # "pacaran lagi/kembali", "jadi pacaran lagi", "pacaran aja"
+            _ASSERT_NOW
+            + r"(?:pacaran|pacar|pacar\s+aja|pacar\s+lagi|jadians?)\b",
+            _ASSERT_NOW + r"balik\s+(?:ke\s+)?(?:pacaran|pacar)\b",
+            _ASSERT_NOW + r"ke\s+(?:pacaran|pacar)\b",
+            _ASSERT_WISH
+            + r"[^.?!]{0,24}\b(?:pacaran|pacar|kembali)\b",
+        ),
+    ),
+    (
+        "familiar",
+        (
+            _ASSERT_NOW + r"(?:berteman|teman)\s*(?:aja|saja)?\b",
+            _ASSERT_NOW + r"hanya\s+(?:berteman|teman)\b",
+            _ASSERT_WISH
+            + r"[^.?!]{0,24}\b(?:berteman|teman\s+aja|hanya\s+teman)\b",
+        ),
+    ),
+)
+
+
+def _relationship_assertion_target(user_text: str) -> Optional[str]:
+    """The tier an explicit present-tense assertion asks for, else None."""
+    if _QUESTION_FORM.search(user_text):
+        return None
+    if _NARRATIVE_FRAME.search(user_text):
+        return None
+    for tier, patterns in _RELATIONSHIP_ASSERTIONS:
+        for pattern in patterns:
+            try:
+                if re.search(pattern, user_text, re.IGNORECASE):
+                    return tier
+            except re.error:  # pragma: no cover - pattern is static
+                continue
+    return None
+
+
+def _relationship_acknowledges(target: str, assistant_text: str) -> bool:
+    """True when Mili agrees to the requested change (mutual, one-sided no)."""
+    prefix = assistant_text[:_DATING_ACCEPTANCE_PREFIX_CHARS]
+    if _ROMANTIC_REJECTION.search(assistant_text):
+        return False
+    if target == "married":
+        return bool(_MARRIAGE_ACCEPTANCE.search(prefix)) and not _MARRIAGE_REJECTION.search(
+            assistant_text
+        )
+    # A downshift is agreed with the same plain acceptance language.
+    return bool(_DATING_ACCEPTANCE.search(prefix))
+
+
 def detect_relationship_update(
     current_status: RelationshipStatus,
     user_text: str,
     assistant_text: str,
 ) -> Optional[RelationshipUpdate]:
-    """Detect only explicit, mutually acknowledged relationship events."""
+    """Detect an explicit, mutually acknowledged relationship change.
+
+    The relationship is PERSISTENT but MUTABLE: any tier may follow any other
+    (stranger <-> familiar <-> close <-> dating <-> married), in either
+    direction. What it is not is volatile -- the state never moves because a new
+    session, a reconnect, a restart or an empty context happened, and it never
+    moves on a passing mention of the past. Only an explicit present-tense
+    request from the user, confirmed by Mili, changes anything.
+    """
     user = " ".join((user_text or "").split())
     assistant = " ".join((assistant_text or "").split())
     # Live2D expression markers are transport hints, not relationship language.
@@ -151,34 +262,40 @@ def detect_relationship_update(
         return None
 
     acceptance_prefix = assistant[:_DATING_ACCEPTANCE_PREFIX_CHARS]
-    # Marriage sits ABOVE dating and is terminal: once married, nothing in this
-    # layer can walk it back, and an ordinary conversation can never re-open the
-    # question. Checked first so a married character never re-detects dating.
-    if current_status == "married":
-        return None
-    if (
-        current_status == "dating"
-        and _MARRIAGE_USER_EVENT.search(user)
-        and _MARRIAGE_ACCEPTANCE.search(acceptance_prefix)
-        and not _MARRIAGE_REJECTION.search(assistant)
-    ):
-        return RelationshipUpdate("married", "explicit_marriage_event")
-    if (
-        current_status != "dating"
-        and _DATING_PROPOSAL.search(user)
-        and _DATING_ACCEPTANCE.search(acceptance_prefix)
-        and not _ROMANTIC_REJECTION.search(assistant)
-    ):
-        return RelationshipUpdate("dating", "explicit_relationship_event")
 
-    if current_status in {"stranger", "familiar"} and (
+    # A mention of the past, or a question about it, is never a change. This
+    # guards BOTH the explicit-assertion path below and the legacy detectors at
+    # the bottom, which otherwise match a bare "pacaran" in a sentence like
+    # "aku ingat waktu kita pacaran dulu".
+    non_assertive = bool(_NARRATIVE_FRAME.search(user))
+
+    # 1. An explicit present-tense assertion, in EITHER direction.
+    target = None if non_assertive else _relationship_assertion_target(user)
+    if target is not None and target != current_status:
+        if _relationship_acknowledges(target, assistant):
+            return RelationshipUpdate(
+                target, f"explicit_relationship_change_to_{target}"
+            )
+
+    # 2. Legacy tiers keep their original, narrower detectors so no existing
+    #    behaviour changes: a fresh "kita pacaran" from a stranger is a step up,
+    #    not a downshift.
+    if not non_assertive and current_status not in {"dating", "married"}:
+        if (
+            _DATING_PROPOSAL.search(user)
+            and _DATING_ACCEPTANCE.search(acceptance_prefix)
+            and not _ROMANTIC_REJECTION.search(assistant)
+        ):
+            return RelationshipUpdate("dating", "explicit_relationship_event")
+
+    if not non_assertive and current_status in {"stranger", "familiar"} and (
         _CLOSE_USER_EVENT.search(user)
         and _CLOSE_ACCEPTANCE.search(assistant)
         and not _ROMANTIC_REJECTION.search(assistant)
     ):
         return RelationshipUpdate("close", "mutual_trust_event")
 
-    if current_status == "stranger" and (
+    if not non_assertive and current_status == "stranger" and (
         _FAMILIAR_USER_EVENT.search(user) and _FAMILIAR_ACCEPTANCE.search(assistant)
     ):
         return RelationshipUpdate("familiar", "returning_user_event")
