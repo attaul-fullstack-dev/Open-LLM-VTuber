@@ -14,7 +14,7 @@ C. Preferences      - in the decision path, no invented preference
 D. Temporal         - absolute stamps, tz-aware day boundary, stale events
 E. Life State       - meaningful transition stays a MEDIUM source, no dupe
 F. Proactive gate   - goal evidence passes the real gate; daily 60 and the
-                      600s minimum gap still bind; budget exhaustion
+                      300s minimum gap still bind; budget exhaustion
                       suppresses; user-driven chat unaffected
 G. Restart/reconnect- no duplicate autonomous action
 H. Safety           - no loop, bounded scan, no repeat for the same evidence
@@ -430,7 +430,7 @@ class ProactiveIntegrationTest(unittest.TestCase):
         self.assertTrue(decision.allowed)
         self.assertEqual(decision.priority, PRIORITY_HIGH)
 
-    def test_minimum_gap_600_still_binds_a_goal_decision(self):
+    def test_minimum_gap_300_still_binds_a_goal_decision(self):
         state = self._state(last_proactive=(NOW - timedelta(seconds=60)).isoformat())
         decision = evaluate_gate(
             state,

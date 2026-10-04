@@ -126,7 +126,7 @@ def normalize_daily_hard_limit(value: Any) -> int:
 class ProactiveGateConfig:
     """Proactive V2 limits. Values are the agreed baseline, not suggestions."""
 
-    minimum_proactive_gap_seconds: int = 600  # 10 minutes
+    minimum_proactive_gap_seconds: int = 300  # 5 minutes
     proactive_daily_hard_limit: int = DEFAULT_DAILY_HARD_LIMIT  # hard ceiling
     maximum_unanswered_consecutive: int = 3
     ignored_threshold_before_backoff: int = 2
@@ -135,7 +135,7 @@ class ProactiveGateConfig:
     quiet_hours_start_hour: int = 23
     quiet_hours_end_hour: int = 7
     meaningful_trigger_budget_per_hour: int = 3
-    idle_trigger_budget_per_hour: int = 1
+    idle_trigger_budget_per_hour: int = 6
     # Reserved for a future independent daily idle ceiling. The aggregate daily
     # hard limit already bounds idle dispatches; zero keeps this field inert.
     idle_trigger_budget_per_day: int = 0

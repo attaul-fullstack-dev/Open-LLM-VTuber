@@ -62,7 +62,7 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
         60, ge=0, alias="proactive_daily_hard_limit"
     )
     minimum_proactive_gap_seconds: int = Field(
-        600, ge=0, alias="minimum_proactive_gap_seconds"
+        300, ge=0, alias="minimum_proactive_gap_seconds"
     )
     maximum_unanswered_consecutive: int = Field(
         3, ge=0, alias="maximum_unanswered_consecutive"
@@ -75,7 +75,7 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
         3, ge=0, alias="meaningful_trigger_budget_per_hour"
     )
     idle_trigger_budget_per_hour: int = Field(
-        1, ge=0, alias="idle_trigger_budget_per_hour"
+        6, ge=0, alias="idle_trigger_budget_per_hour"
     )
     idle_trigger_budget_per_day: int = Field(
         0, ge=0, alias="idle_trigger_budget_per_day"
