@@ -334,6 +334,38 @@ async def process_single_conversation(
                         (time.perf_counter() - event_started) * 1000,
                     )
 
+            # Auxiliary auto-title: one LLM call per conversation lifetime,
+            # after the visible response is stored. Never breaks the chat;
+            # a failure just keeps "Percakapan Baru".
+            if (
+                context.history_uid
+                and full_response
+                and not skip_history
+                and not proactive
+            ):
+                title_fn = getattr(
+                    context.agent_engine, "ensure_conversation_title", None
+                )
+                if callable(title_fn):
+                    try:
+                        auto_title = await title_fn()
+                    except Exception:
+                        auto_title = ""
+                    if auto_title:
+                        try:
+                            await websocket_send(
+                                json.dumps(
+                                    {
+                                        "type": "history-auto-titled",
+                                        "success": True,
+                                        "history_uid": context.history_uid,
+                                        "title": auto_title,
+                                    }
+                                )
+                            )
+                        except Exception:
+                            pass
+
         latency.mark("websocket_final_output")
         # Episodic capture runs after the user-visible response, never
         # blocking it: gate + one LLM call + validated store, fail-soft.

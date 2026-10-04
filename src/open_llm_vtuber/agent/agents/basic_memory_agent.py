@@ -889,6 +889,47 @@ class BasicMemoryAgent(AgentInterface):
         """Return stored long-term facts (for backend controls / future UI)."""
         return list(self._character_state.memories)
 
+    async def ensure_conversation_title(self) -> str:
+        """Generate and persist ONE title for the active conversation, or "".
+
+        Auxiliary and fail-soft: runs after the user-visible response is
+        already stored, uses the conversation's own LLM, and never raises.
+        An existing title (manual or automatic) is never overwritten, and a
+        failure simply keeps "Percakapan Baru".
+        """
+        try:
+            conf_uid = self._character_conf_uid
+            history_uid = self._history_uid
+            if not conf_uid or not history_uid:
+                return ""
+            metadata = get_metadata(conf_uid, history_uid)
+            messages = get_history(conf_uid, history_uid)
+            from ...conversation_title import (
+                generate_title,
+                has_stored_title,
+                should_generate_title,
+            )
+
+            if has_stored_title(metadata):
+                return str(metadata.get("title", "")).strip()
+            if not should_generate_title(metadata, messages):
+                return ""
+            chat_fn = getattr(getattr(self, "_llm", None), "chat_completion", None)
+            title = await generate_title(chat_fn, messages)
+            if not title:
+                return ""
+            # Re-check: a manual rename racing this turn wins, never overwritten.
+            current = get_metadata(conf_uid, history_uid)
+            if has_stored_title(current):
+                return str(current.get("title", "")).strip()
+            if not update_metadate(conf_uid, history_uid, {"title": title}):
+                return ""
+            logger.info("Conversation title generated (chars={})", len(title))
+            return title
+        except Exception as error:
+            logger.debug("Conversation title skipped: type={}", type(error).__name__)
+            return ""
+
     def reset_character_memory(self) -> bool:
         """Clear Mili's long-term memory; relationship is untouched."""
         if not self._character_conf_uid:
