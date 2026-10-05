@@ -369,7 +369,6 @@ class OrphanSerializationTest(unittest.IsolatedAsyncioTestCase):
         os.chdir(self._tmp.name)
         for folder in ("chat_history", "character_state", "episodic"):
             os.makedirs(folder, exist_ok=True)
-
     def tearDown(self):
         os.chdir(self._old)
         self._tmp.cleanup()
@@ -388,7 +387,17 @@ class OrphanSerializationTest(unittest.IsolatedAsyncioTestCase):
         }
 
     async def _trigger(self, env, text, group, process):
-        with patch.object(ch_mod, "process_single_conversation", side_effect=process):
+        # The turn runs inside its own task, so the patch must outlive this
+        # call: it is stopped once that task finishes.
+        patcher = patch.object(
+            ch_mod, "process_single_conversation", side_effect=process
+        )
+        patcher.start()
+        # Cleanups run LIFO, so nested triggers restore the real function in
+        # the right order. A done-callback is not enough: the loop may close
+        # first and the mock would leak into the next test module.
+        self.addCleanup(patcher.stop)
+        try:
             await ch_mod.handle_conversation_trigger(
                 msg_type="text-input",
                 data={"type": "text-input", "text": text},
@@ -403,6 +412,79 @@ class OrphanSerializationTest(unittest.IsolatedAsyncioTestCase):
                 broadcast_to_group=env["broadcast_to_group"],
                 detached_turns=env["detached_turns"],
             )
+        finally:
+            task = env["current_conversation_tasks"].get(env["client_uid"])
+            if task is None:
+                patcher.stop()
+
+    async def test_trigger_queued_behind_orphan_survives_its_own_disconnect(self):
+        """Regression: a message sent while an orphan turn is still finishing
+        must not be dropped when that socket dies too.
+
+        The orphan wait used to run BEFORE the turn task existed, so the
+        pending trigger lived only in the dying connection's receive loop and
+        the user's message vanished (observed live as a missing "reconnect-1").
+        """
+        ran = []
+
+        async def orphan():
+            await asyncio.sleep(0.05)
+
+        async def turn(**kwargs):
+            ran.append(kwargs["user_input"])
+
+        orphan_task = asyncio.create_task(orphan())
+        orphan_task._olv_single_turn = True
+        orphan_task._olv_history_uid = "hist-A"
+        orphan_task._olv_detached = True
+        env = self._env()
+        env["detached_turns"]["hist-A"] = orphan_task
+        group = SimpleNamespace(get_client_group=lambda uid: None)
+
+        # Trigger returns immediately (the task owns the orphan wait).
+        await self._trigger(env, "reconnect-1", group, turn)
+        queued = env["current_conversation_tasks"]["conn-new"]
+        self.assertFalse(queued.done(), "turn must be queued behind the orphan")
+
+        # The socket dies while the trigger is still queued behind the orphan.
+        queued._olv_detached = True
+        for _ in range(50):
+            await asyncio.sleep(0.005)
+        self.assertEqual(ran, ["reconnect-1"])
+        await asyncio.wait_for(queued, timeout=5)
+
+    async def test_turn_sends_are_fail_soft_on_a_dead_socket(self):
+        """A turn that outlives its socket must never die on a failed send.
+
+        Observed live: a turn queued behind an orphan resumed on a socket whose
+        ASGI response was already closed, and the very first lifecycle send
+        raised "Unexpected ASGI message 'websocket.send'", killing the turn
+        before the assistant response was persisted.
+        """
+        seen = []
+
+        class DeadSocket:
+            async def send_text(self, payload):
+                seen.append(payload)
+                raise RuntimeError(
+                    "Unexpected ASGI message 'websocket.send', after sending"
+                    " 'websocket.close' or response already completed."
+                )
+
+        env = self._env()
+        env["websocket"] = DeadSocket()
+
+        async def turn(**kwargs):
+            await kwargs["websocket_send"]('{"type": "latency-event"}')
+            await kwargs["websocket_send"]('{"type": "conversation-end"}')
+            return "persisted"
+
+        await self._trigger(env, "halo", SimpleNamespace(
+            get_client_group=lambda uid: None), turn)
+        task = env["current_conversation_tasks"]["conn-new"]
+        # No exception escapes: the turn completes despite the dead socket.
+        self.assertEqual(await asyncio.wait_for(task, timeout=5), "persisted")
+        self.assertEqual(len(seen), 2)
 
     async def test_new_trigger_waits_for_detached_orphan(self):
         """Same history, dead owner: the new turn starts only after the

@@ -11,7 +11,7 @@ from ..chat_history_manager import store_message
 from ..service_context import ServiceContext
 from .group_conversation import process_group_conversation
 from .single_conversation import process_single_conversation
-from .conversation_utils import EMOJI_LIST
+from .conversation_utils import EMOJI_LIST, safe_send
 from .types import GroupConversationState
 from prompts import prompt_loader
 
@@ -147,34 +147,54 @@ async def handle_conversation_trigger(
                 orphan_candidates.append(other_task)
         for orphan_task in orphan_candidates:
             logger.info(
-                "Waiting for detached in-flight turn on the same history "
-                "before starting the new trigger"
+                "Queued behind detached in-flight turn on the same history "
+                "(orphan={})",
+                id(orphan_task),
             )
-            try:
-                await asyncio.shield(orphan_task)
-            except asyncio.CancelledError:
-                # Our own cancellation must propagate; the orphan itself may
-                # legitimately have been cancelled, so shield and re-check.
-                if orphan_task.cancelled():
-                    continue
-                raise
-            except Exception as error:
-                # A dead orphan never blocks the new turn.
-                logger.debug(
-                    "Detached turn finished with: type={}",
-                    type(error).__name__,
+
+        async def _run_turn():
+            # The orphan wait happens INSIDE the turn task on purpose. If it
+            # ran before the task existed, a disconnect during the wait would
+            # abandon the trigger and silently drop the user's message. Here
+            # the task is already owned by current_conversation_tasks, so
+            # handle_disconnect can detach it like any other in-flight turn.
+            for orphan_task in orphan_candidates:
+                logger.info(
+                    "Waiting for detached in-flight turn on the same history "
+                    "before starting the new trigger"
                 )
-        new_task = asyncio.create_task(
-            process_single_conversation(
+                try:
+                    await asyncio.shield(orphan_task)
+                except asyncio.CancelledError:
+                    # Our own cancellation must propagate; the orphan itself
+                    # may legitimately have been cancelled, so re-check.
+                    if orphan_task.cancelled():
+                        continue
+                    raise
+                except Exception as error:
+                    # A dead orphan never blocks the new turn.
+                    logger.debug(
+                        "Detached turn finished with: type={}",
+                        type(error).__name__,
+                    )
+            # Every send in this turn is best-effort. A turn can outlive its
+            # socket (mid-turn disconnect, or queued behind an orphan), and a
+            # dead socket must never abort the turn before the assistant
+            # response is persisted.
+            async def _best_effort_send(payload: str) -> None:
+                await safe_send(websocket.send_text, payload)
+
+            return await process_single_conversation(
                 context=context,
-                websocket_send=websocket.send_text,
+                websocket_send=_best_effort_send,
                 client_uid=client_uid,
                 user_input=user_input,
                 images=images,
                 session_emoji=session_emoji,
                 metadata=metadata,
             )
-        )
+
+        new_task = asyncio.create_task(_run_turn())
         # Lifecycle tags (same task object, no new structures): what session
         # this turn belongs to, and whether its owner disconnected mid-turn.
         new_task._olv_single_turn = True
