@@ -599,6 +599,24 @@ class BasicMemoryAgent(AgentInterface):
             )
         if preference_context:
             parts.append(preference_context)
+        # Pending reminder requests: explicit WHAT+WHEN the user asked to be
+        # reminded about. Same placement rules as preferences (after identity,
+        # before facts) so they inform the turn without replacing persona.
+        try:
+            from ...future_intentions import build_future_intention_context
+
+            intention_context = build_future_intention_context(
+                getattr(self._character_state, "future_intentions", None),
+                tz=self._user_timezone,
+            )
+        except Exception as error:
+            logger.warning(
+                "Future intention context skipped: type={}",
+                type(error).__name__,
+            )
+            intention_context = ""
+        if intention_context:
+            parts.append(intention_context)
         memory_context = build_character_memory_context(
             self._character_state, tz=self._user_timezone
         )
@@ -885,6 +903,61 @@ class BasicMemoryAgent(AgentInterface):
         return active_preferences(
             getattr(self._character_state, "interaction_preferences", None)
         )
+
+    def list_future_intentions(self) -> List[Dict[str, Any]]:
+        """Pending reminder requests, oldest first (fail-soft)."""
+        try:
+            from ...future_intentions import pending_intentions
+
+            return pending_intentions(
+                getattr(self._character_state, "future_intentions", None)
+            )
+        except Exception:
+            return []
+
+    def has_due_future_intention(
+        self, moment: Optional[datetime] = None
+    ) -> bool:
+        """True when a pending reminder is due right now (pure read)."""
+        try:
+            from ...future_intentions import due_intentions
+
+            return bool(
+                due_intentions(
+                    getattr(self._character_state, "future_intentions", None),
+                    now=moment,
+                )
+            )
+        except Exception:
+            return False
+
+    def consume_due_future_intentions(
+        self, moment: Optional[datetime] = None
+    ) -> int:
+        """Mark all currently-due reminders done and persist. Returns count."""
+        try:
+            from ...character_state import consume_due_future_intentions as _consume
+            from ...character_state import load_character_state
+
+            if not self._character_conf_uid:
+                return 0
+            # Refresh first so a due row written by another session is seen.
+            try:
+                refreshed = load_character_state(self._character_conf_uid)
+                if refreshed is not None:
+                    self._character_state = refreshed
+            except Exception:
+                pass
+            count = _consume(self._character_conf_uid, now=moment)
+            try:
+                refreshed = load_character_state(self._character_conf_uid)
+                if refreshed is not None:
+                    self._character_state = refreshed
+            except Exception:
+                pass
+            return int(count)
+        except Exception:
+            return 0
 
     def list_character_memories(self) -> List[Dict[str, Any]]:
         """Return stored long-term facts (for backend controls / future UI)."""
@@ -1231,11 +1304,13 @@ class BasicMemoryAgent(AgentInterface):
         memory_updated = self._observe_character_memory_request(user_text)
         auto_updated = self._observe_automatic_memory(user_text)
         preference_updated = self._observe_interaction_preference(user_text)
+        intention_updated = self._observe_future_intention(user_text)
         return (
             relationship_updated
             or memory_updated
             or auto_updated
             or preference_updated
+            or intention_updated
         )
 
     def _observe_automatic_memory(self, user_text: str) -> bool:
@@ -1312,6 +1387,41 @@ class BasicMemoryAgent(AgentInterface):
         if tracker:
             tracker.add_context(0.0, None)
         return True
+
+    def _observe_future_intention(self, user_text: str) -> bool:
+        """Capture an explicit reminder request stated in ordinary chat.
+
+        Runs on the existing post-turn observer, so it adds no LLM call and
+        no new lifecycle. Deterministic local detection only; fail-soft.
+        """
+        if not self._character_conf_uid:
+            return False
+        try:
+            from ...character_state import load_character_state, record_future_intention
+
+            stored = record_future_intention(
+                self._character_conf_uid,
+                user_text,
+                tz=getattr(self, "_user_timezone", None),
+            )
+            if stored is None:
+                return False
+            try:
+                refreshed = load_character_state(self._character_conf_uid)
+                if refreshed is not None:
+                    self._character_state = refreshed
+            except Exception as error:
+                logger.debug(
+                    "Character state refresh after intention skipped: type={}",
+                    type(error).__name__,
+                )
+            return True
+        except Exception as error:
+            logger.debug(
+                "Future intention capture skipped: type={}",
+                type(error).__name__,
+            )
+            return False
 
     def observe_reactive_state(self, emotion_keys: List[str]) -> bool:
         """Apply one deterministic reactive transition (no LLM calls).

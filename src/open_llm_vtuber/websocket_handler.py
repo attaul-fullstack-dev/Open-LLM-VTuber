@@ -454,6 +454,31 @@ class WebSocketHandler:
             )
             return False
 
+    def _future_intention_trigger(self, context: ServiceContext, now=None) -> bool:
+        """True when a pending reminder request is due right now.
+
+        Reads the existing ``future_intentions`` rows (same character-state
+        file as memories/goals) through the agent facade's pure ``due``
+        check. No LLM, no timer, no queue. Consumption happens at dispatch
+        time (not here) so a gate-suppressed turn does not silently drop a
+        reminder. Fail-soft: any problem means "no due reminder".
+        """
+        try:
+            agent = getattr(context, "agent_engine", None)
+            probe = getattr(agent, "has_due_future_intention", None)
+            if not callable(probe):
+                return False
+            try:
+                return bool(probe(now) if now is not None else probe())
+            except TypeError:
+                return bool(probe())
+        except Exception as error:
+            logger.debug(
+                "Future intention trigger unavailable: type={}",
+                type(error).__name__,
+            )
+            return False
+
     def _proactive_trigger(
         self,
         context: ServiceContext,
@@ -475,6 +500,7 @@ class WebSocketHandler:
                 context, budget.last_proactive_at
             ),
             goal_evidence=self._goal_evidence_trigger(context, now=now),
+            explicit_reminder=self._future_intention_trigger(context, now=now),
         )
 
     async def _record_user_activity(self, client_uid: str) -> None:
@@ -698,6 +724,29 @@ class WebSocketHandler:
                     tz=getattr(context, "user_timezone", None),
                 )
                 self._persist_budget(client_uid, conf_uid)
+                # A dispatched reminder is consumed exactly once, so the same
+                # due row can never nag twice. Suppressed turns never reach
+                # here, so a gate-suppressed reminder stays pending.
+                if str(getattr(trigger, "reason", "")) == "explicit_reminder":
+                    try:
+                        agent = getattr(context, "agent_engine", None)
+                        consume = getattr(
+                            agent, "consume_due_future_intentions", None
+                        )
+                        if callable(consume):
+                            try:
+                                consumed = consume(utcnow())
+                            except TypeError:
+                                consumed = consume()
+                            logger.info(
+                                "Future intention consumed on dispatch: count={}",
+                                int(consumed or 0),
+                            )
+                    except Exception as error:
+                        logger.debug(
+                            "Future intention consume skipped: type={}",
+                            type(error).__name__,
+                        )
                 logger.info(
                     "Proactive chat generation started: request_origin=proactive, "
                     "ignored_count={} priority={} trigger={} "

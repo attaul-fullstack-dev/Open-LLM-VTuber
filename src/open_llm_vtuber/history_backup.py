@@ -86,9 +86,12 @@ def take_snapshot(reason: str = "startup") -> str:
         if not present:
             return ""
 
-        stamp = time.strftime("%Y%m%d-%H%M%S")
+        # Microseconds matter: two restarts inside the same second would
+        # otherwise reuse one directory, and ``copytree(dirs_exist_ok=True)``
+        # would then overwrite the very copy we took to stay safe.
+        stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1_000_000:06d}"
         destination = os.path.join(BACKUP_ROOT, f"snapshot-{stamp}")
-        os.makedirs(destination, exist_ok=True)
+        os.makedirs(destination, exist_ok=False)
         copied = 0
         for store in present:
             shutil.copytree(store, os.path.join(destination, store), dirs_exist_ok=True)

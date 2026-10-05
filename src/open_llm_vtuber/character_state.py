@@ -85,6 +85,10 @@ class CharacterState:
     # scope by design: refreshed whenever the frontend sends a valid value,
     # used as fallback when a turn carries no timezone (restart/proactive).
     user_timezone: Optional[str] = None
+    # Explicit reminder requests with absolute UTC due times. Same file, same
+    # atomic store as memories/goals/preferences — not a new memory system.
+    # Old state files without this key load as empty (restart/old-state safe).
+    future_intentions: List[Dict[str, Any]] = field(default_factory=list)
 
 
 GoalStatus = Literal["seed", "active", "done"]
@@ -392,6 +396,18 @@ def load_character_state(conf_uid: str) -> CharacterState:
                 parsed = goal_from_dict(item)
                 if parsed is not None:
                     goals.append(goal_to_dict(parsed))
+        intentions: List[Dict[str, Any]] = []
+        try:
+            from .future_intentions import normalize_stored_intention
+
+            raw_intentions = data.get("future_intentions", [])
+            if isinstance(raw_intentions, list):
+                for item in raw_intentions:
+                    parsed_intention = normalize_stored_intention(item)
+                    if parsed_intention is not None:
+                        intentions.append(parsed_intention)
+        except Exception:
+            intentions = []
         return CharacterState(
             relationship_status=normalize_relationship_status(
                 data.get("relationship_status", "stranger")
@@ -403,6 +419,7 @@ def load_character_state(conf_uid: str) -> CharacterState:
             goals=goals,
             interaction_preferences=preferences,
             user_timezone=str(data.get("user_timezone") or "") or None,
+            future_intentions=intentions,
         )
     except Exception as error:
         logger.error(
@@ -427,6 +444,7 @@ def save_character_state(conf_uid: str, state: CharacterState) -> bool:
                 "goals": state.goals,
                 "interaction_preferences": state.interaction_preferences,
                 "user_timezone": state.user_timezone,
+                "future_intentions": state.future_intentions,
             }
             _write_state_atomic(filepath, data)
         return True
@@ -721,9 +739,9 @@ def reset_character_memory(conf_uid: str) -> Optional[CharacterState]:
 def reset_character_state(conf_uid: str) -> Optional[CharacterState]:
     """Reset relationship to stranger and clear character-level state.
 
-    Clears memories and interaction preferences as well: this action is a
-    full character-state reset, so no character-level state may survive it
-    hidden.
+    Clears memories, interaction preferences and future intentions as well:
+    this action is a full character-state reset, so no character-level state
+    may survive it hidden.
     """
     state = load_character_state(conf_uid)
     state.relationship_status = "stranger"
@@ -732,6 +750,7 @@ def reset_character_state(conf_uid: str) -> Optional[CharacterState]:
     state.relationship_migrated = True
     state.memories = []
     state.interaction_preferences = []
+    state.future_intentions = []
     if not save_character_state(conf_uid, state):
         return None
     return state
@@ -779,3 +798,99 @@ def build_character_memory_context(
         return ""
     header = "Known long-term context (character memory, shared across all chats):"
     return f"{header}\n" + "\n".join(lines)
+
+
+def record_future_intention(
+    conf_uid: str,
+    user_text: str,
+    *,
+    now: Optional[datetime] = None,
+    tz: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Detect and persist one explicit reminder request (fail-soft).
+
+    Returns the stored entry, or None when the turn carried no reminder
+    request. Same-turn duplicates are not stored twice. Never raises.
+    """
+    try:
+        from .future_intentions import add_future_intention, detect_future_intention
+    except Exception:
+        return None
+    try:
+        detected = detect_future_intention(user_text, now=now, tz=tz)
+    except Exception:
+        return None
+    if detected is None:
+        return None
+    try:
+        import uuid as _uuid
+
+        state = load_character_state(conf_uid)
+        intention_id = _uuid.uuid4().hex
+        updated = add_future_intention(
+            state.future_intentions, detected, intention_id=intention_id
+        )
+        state.future_intentions = updated
+        if not save_character_state(conf_uid, state):
+            return None
+        logger.info(
+            "Future intention stored: due_at={} text_chars={}",
+            detected.due_at,
+            len(detected.text),
+        )
+        for item in reversed(updated):
+            if item.get("id") == intention_id:
+                return dict(item)
+        return None
+    except Exception as error:
+        logger.warning(
+            "Future intention not persisted: type={}", type(error).__name__
+        )
+        return None
+
+
+def complete_future_intention(
+    conf_uid: str, intention_id: str
+) -> bool:
+    """Mark one reminder request done; False when missing or unwritable."""
+    try:
+        from .future_intentions import complete_future_intention as _complete
+
+        state = load_character_state(conf_uid)
+        updated, changed = _complete(state.future_intentions, intention_id)
+        if not changed:
+            return False
+        state.future_intentions = updated
+        return bool(save_character_state(conf_uid, state))
+    except Exception:
+        return False
+
+
+def consume_due_future_intentions(
+    conf_uid: str,
+    *,
+    now: Optional[datetime] = None,
+) -> int:
+    """Mark all currently-due reminders done; returns count consumed."""
+    try:
+        from .future_intentions import complete_future_intention as _complete
+        from .future_intentions import due_intentions
+
+        state = load_character_state(conf_uid)
+        due = due_intentions(state.future_intentions, now=now)
+        if not due:
+            return 0
+        rows = list(state.future_intentions)
+        count = 0
+        for item in due:
+            updated, changed = _complete(rows, str(item.get("id", "")))
+            if changed:
+                rows = updated
+                count += 1
+        if count:
+            state.future_intentions = rows
+            if not save_character_state(conf_uid, state):
+                return 0
+        return count
+    except Exception:
+        return 0
