@@ -18,6 +18,7 @@ from .utils.stream_audio import prepare_audio_payload
 from .chat_history_manager import (
     create_new_history,
     get_history,
+    get_metadata,
     delete_history,
     get_history_list,
     update_metadate,
@@ -172,6 +173,13 @@ class WebSocketHandler:
         self.client_contexts: Dict[str, ServiceContext] = {}
         self.chat_group_manager = ChatGroupManager()
         self.current_conversation_tasks: Dict[str, Optional[asyncio.Task]] = {}
+        # Turns detached by a mid-turn disconnect, keyed by history_uid.
+        # Ownership outlives the dead socket so the turn can finish, stay
+        # serialised against the next trigger, and resync to the new socket.
+        self._detached_turns: Dict[str, asyncio.Task] = {}
+        # Which live client is currently viewing which history. Lets a
+        # finished detached turn deliver its result to the reconnected UI.
+        self._history_subscribers: Dict[str, str] = {}
         self.default_context_cache = default_context_cache
         self.received_data_buffers: Dict[str, np.ndarray] = {}
         self._proactive_timer_tasks: Dict[str, asyncio.Task] = {}
@@ -186,6 +194,26 @@ class WebSocketHandler:
 
         # Message handlers mapping
         self._message_handlers = self._init_message_handlers()
+
+    def _detached_registry(self) -> Dict[str, asyncio.Task]:
+        """Detached-turn registry, created on demand.
+
+        Lazily initialised so a handler built without __init__ (tests,
+        partial construction) still behaves correctly instead of raising.
+        """
+        registry = self.__dict__.get("_detached_turns")
+        if registry is None:
+            registry = {}
+            self.__dict__["_detached_turns"] = registry
+        return registry
+
+    def _subscriber_registry(self) -> Dict[str, str]:
+        """client_uid -> history_uid view map, created on demand."""
+        registry = self.__dict__.get("_history_subscribers")
+        if registry is None:
+            registry = {}
+            self.__dict__["_history_subscribers"] = registry
+        return registry
 
     @staticmethod
     def _update_user_timezone(context: ServiceContext, data: dict) -> None:
@@ -1067,9 +1095,44 @@ class WebSocketHandler:
         self._proactive_maintenance.discard(client_uid)
         if client_uid in self.current_conversation_tasks:
             task = self.current_conversation_tasks[client_uid]
-            if task and not task.done():
+            if task is not None and not task.done() and getattr(
+                task, "_olv_single_turn", False
+            ):
+                # RECONNECT ≠ NEW CONVERSATION: an in-flight single turn is
+                # detached, never cancelled, so its response still persists
+                # into its session and a post-reconnect resync picks it up.
+                # Socket sends on the dead connection fail safely
+                # (safe_send / fail-soft TTS queue); nothing here can raise.
+                task._olv_detached = True
+                try:
+                    history_uid = getattr(task, "_olv_history_uid", "")
+                except Exception:
+                    history_uid = ""
+                logger.info(
+                    "TURN_DETACHED history_uid={} "
+                    "(in-flight turn continues after disconnect)",
+                    history_uid,
+                )
+                # Keep a strong reference AND stay discoverable by history:
+                # a new trigger on this session must wait for the orphan
+                # instead of persisting a second turn concurrently. Keyed by
+                # history_uid because the dead client_uid is already gone.
+                if history_uid:
+                    self._detached_registry()[history_uid] = task
+                    task.add_done_callback(
+                        lambda finished, uid=history_uid: self._on_detached_turn_done(
+                            finished, uid
+                        )
+                    )
+            elif task and not task.done():
                 task.cancel()
             self.current_conversation_tasks.pop(client_uid, None)
+
+        # Drop this (now stale) connection's history binding; a reconnect
+        # re-registers itself, and an explicit new session rebinds below.
+        bound = self._subscriber_registry().get(client_uid)
+        if bound:
+            self._subscriber_registry().pop(client_uid, None)
 
         # Call context close to clean up resources (e.g., MCPClient)
         if context:
@@ -1191,6 +1254,7 @@ class WebSocketHandler:
         context = self.client_contexts[client_uid]
         # Update history_uid in service context
         context.history_uid = history_uid
+        logger.info("SESSION_RESTORE history_uid={}", history_uid)
         self._update_user_timezone(context, data)
         context.agent_engine.set_memory_from_history(
             conf_uid=context.character_config.conf_uid,
@@ -1209,9 +1273,84 @@ class WebSocketHandler:
         await websocket.send_text(
             json.dumps({"type": "history-data", "messages": messages})
         )
+        self._subscriber_registry()[client_uid] = history_uid
         # Selecting history is activity.  Reconnect therefore starts a fresh
         # idle period and never replays timers/messages from the old socket.
         await self._activate_proactive_for_history(client_uid, history_uid)
+
+    def _on_detached_turn_done(self, task: asyncio.Task, history_uid: str) -> None:
+        """Detached turn finished: release it and resync the live viewer.
+
+        Runs as a done-callback, so it must never raise.
+        """
+        self._detached_registry().pop(history_uid, None)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.warning(
+                "Detached turn ended with error: history_uid={} type={}",
+                history_uid,
+                type(error).__name__,
+            )
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self._deliver_history_to_subscriber(history_uid))
+
+    async def _deliver_history_to_subscriber(self, history_uid: str) -> None:
+        """Push an authoritative transcript to whoever is viewing it now.
+
+        Used when a turn detached by a disconnect finishes: the response it
+        persisted must reach the reconnected socket, otherwise the UI keeps
+        showing the half-finished conversation until a manual reload.
+        """
+        # _history_subscribers maps client_uid -> history_uid; find the live
+        # socket currently viewing this history.
+        client_uid = next(
+            (
+                uid
+                for uid, bound in self._subscriber_registry().items()
+                if bound == history_uid
+            ),
+            None,
+        )
+        websocket = self.client_connections.get(client_uid) if client_uid else None
+        if websocket is None:
+            return
+        context = self.client_contexts.get(client_uid)
+        if context is None:
+            return
+        try:
+            messages = [
+                msg
+                for msg in get_history(
+                    context.character_config.conf_uid, history_uid
+                )
+                if msg["role"] != "system"
+            ]
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "history-data",
+                        "history_uid": history_uid,
+                        "messages": messages,
+                    }
+                )
+            )
+            logger.info(
+                "TURN_RESYNCED history_uid={} client_uid={}",
+                history_uid,
+                client_uid,
+            )
+        except Exception as error:
+            logger.warning(
+                "Detached turn resync skipped: history_uid={} type={}",
+                history_uid,
+                type(error).__name__,
+            )
 
     async def _handle_create_history(
         self, websocket: WebSocket, client_uid: str, data: WSMessage
@@ -1221,6 +1360,10 @@ class WebSocketHandler:
         context = self.client_contexts[client_uid]
         history_uid = create_new_history(context.character_config.conf_uid)
         if history_uid:
+            logger.info(
+                "SESSION_CREATE history_uid={} (explicit new conversation)",
+                history_uid,
+            )
             context.history_uid = history_uid
             self._update_user_timezone(context, data)
             context.agent_engine.set_memory_from_history(
@@ -1514,7 +1657,10 @@ class WebSocketHandler:
             )
         except Exception:
             pass
-        logger.info("Orphan guard: created history for pending trigger")
+        logger.info(
+            "SESSION_CREATE history_uid={} (orphan guard: history-less socket)",
+            history_uid,
+        )
         return True
 
     async def _handle_conversation_trigger(
@@ -1533,12 +1679,45 @@ class WebSocketHandler:
             # frontend bubble). Atomically create exactly one history per
             # socket instead; the sequential receive loop makes the
             # check-and-create race-free. Fail closed on creation failure.
+            #
+            # RECONNECT ≠ NEW CONVERSATION: the frontend sends the active
+            # history_uid it already holds with every text-input. When the
+            # socket's session is still unrestored but the payload names an
+            # existing history, adopt it instead of minting a new session.
+            # This closes the reconnect race (send lands before
+            # fetch-and-set-history completes) without touching BUG A:
+            # a trigger with no usable uid still gets exactly one history.
             if context is not None and not context.history_uid:
-                ensured = await self._ensure_history_for_trigger(
-                    websocket, client_uid, context, data
-                )
-                if not ensured:
-                    return
+                claimed_uid = str((data or {}).get("history_uid", "") or "").strip()
+                adopted = False
+                if claimed_uid:
+                    try:
+                        if get_metadata(
+                            context.character_config.conf_uid, claimed_uid
+                        ):
+                            context.history_uid = claimed_uid
+                            context.agent_engine.set_memory_from_history(
+                                conf_uid=context.character_config.conf_uid,
+                                history_uid=claimed_uid,
+                                user_timezone=context.user_timezone,
+                            )
+                            adopted = True
+                            logger.info(
+                                "SESSION_RESTORE history_uid={} "
+                                "(adopted from trigger payload)",
+                                claimed_uid,
+                            )
+                    except Exception as error:
+                        logger.debug(
+                            "Session adopt skipped: type={}",
+                            type(error).__name__,
+                        )
+                if not adopted:
+                    ensured = await self._ensure_history_for_trigger(
+                        websocket, client_uid, context, data
+                    )
+                    if not ensured:
+                        return
         trigger_context = self.client_contexts.get(client_uid)
         if trigger_context is None:
             # Disconnect cleanup raced this trigger: answer with an error
@@ -1569,11 +1748,14 @@ class WebSocketHandler:
             chat_group_manager=self.chat_group_manager,
             received_data_buffers=self.received_data_buffers,
             current_conversation_tasks=self.current_conversation_tasks,
+            detached_turns=self._detached_registry(),
             broadcast_to_group=self.broadcast_to_group,
         )
         if msg_type in {"text-input", "mic-audio-end"}:
             context = self.client_contexts.get(client_uid)
             if context:
+                if context.history_uid:
+                    self._subscriber_registry()[client_uid] = context.history_uid
                 await self._activate_proactive_for_history(
                     client_uid,
                     context.history_uid,

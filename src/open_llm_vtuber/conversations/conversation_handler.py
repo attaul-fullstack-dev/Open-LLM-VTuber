@@ -28,6 +28,7 @@ async def handle_conversation_trigger(
     received_data_buffers: Dict[str, np.ndarray],
     current_conversation_tasks: Dict[str, Optional[asyncio.Task]],
     broadcast_to_group: Callable,
+    detached_turns: Optional[Dict[str, asyncio.Task]] = None,
 ) -> None:
     """Handle triggers that start a conversation"""
     metadata = None
@@ -122,7 +123,48 @@ async def handle_conversation_trigger(
         if previous is not None and not previous.done():
             logger.info("Cancelling in-flight turn for new trigger")
             previous.cancel()
-        current_conversation_tasks[client_uid] = asyncio.create_task(
+        turn_history_uid = getattr(context, "history_uid", "") or ""
+        # A turn detached by a mid-turn disconnect (see handle_disconnect)
+        # keeps running so its response still persists. If THIS trigger
+        # targets the same history, wait for the orphan first: two turns
+        # must never persist into one transcript concurrently.
+        # Same-client replacement above already cancelled, so anything
+        # awaited here belongs to a dead connection.
+        orphan_candidates = []
+        if turn_history_uid and detached_turns is not None:
+            orphan = detached_turns.get(turn_history_uid)
+            if orphan is not None and not orphan.done():
+                orphan_candidates.append(orphan)
+        for other_key, other_task in list(current_conversation_tasks.items()):
+            if (
+                other_key != client_uid
+                and other_task is not None
+                and not other_task.done()
+                and getattr(other_task, "_olv_detached", False)
+                and getattr(other_task, "_olv_history_uid", "") == turn_history_uid
+                and turn_history_uid
+            ):
+                orphan_candidates.append(other_task)
+        for orphan_task in orphan_candidates:
+            logger.info(
+                "Waiting for detached in-flight turn on the same history "
+                "before starting the new trigger"
+            )
+            try:
+                await asyncio.shield(orphan_task)
+            except asyncio.CancelledError:
+                # Our own cancellation must propagate; the orphan itself may
+                # legitimately have been cancelled, so shield and re-check.
+                if orphan_task.cancelled():
+                    continue
+                raise
+            except Exception as error:
+                # A dead orphan never blocks the new turn.
+                logger.debug(
+                    "Detached turn finished with: type={}",
+                    type(error).__name__,
+                )
+        new_task = asyncio.create_task(
             process_single_conversation(
                 context=context,
                 websocket_send=websocket.send_text,
@@ -133,6 +175,12 @@ async def handle_conversation_trigger(
                 metadata=metadata,
             )
         )
+        # Lifecycle tags (same task object, no new structures): what session
+        # this turn belongs to, and whether its owner disconnected mid-turn.
+        new_task._olv_single_turn = True
+        new_task._olv_history_uid = turn_history_uid
+        new_task._olv_detached = False
+        current_conversation_tasks[client_uid] = new_task
 
 
 async def handle_individual_interrupt(

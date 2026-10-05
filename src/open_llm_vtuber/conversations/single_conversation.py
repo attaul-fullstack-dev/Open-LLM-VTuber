@@ -182,7 +182,11 @@ async def process_single_conversation(
             if skip_history:
                 logger.debug("Skipping storing user input to history")
 
-            logger.info("User input received (characters={})", len(input_text))
+            logger.info(
+                "TURN_STARTED history_uid={} (characters={})",
+                context.history_uid,
+                len(input_text),
+            )
             if images:
                 logger.info(f"With {len(images)} images")
 
@@ -315,7 +319,11 @@ async def process_single_conversation(
                 avatar=context.character_config.avatar,
             )
             latency.add_history_save((time.perf_counter() - save_started) * 1000)
-            logger.info("AI response completed (characters={})", len(full_response))
+            logger.info(
+                "TURN_PERSISTED history_uid={} (characters={})",
+                context.history_uid,
+                len(full_response),
+            )
             if not skip_history and not proactive:
                 observer = getattr(
                     context.agent_engine,

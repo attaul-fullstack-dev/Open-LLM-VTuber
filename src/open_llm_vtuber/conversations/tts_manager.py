@@ -117,7 +117,20 @@ class TTSTaskManager:
                 # Send payloads in order
                 while self._next_sequence_to_send in buffered_payloads:
                     next_payload = buffered_payloads.pop(self._next_sequence_to_send)
-                    await websocket_send(json.dumps(next_payload))
+                    try:
+                        await websocket_send(json.dumps(next_payload))
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as error:
+                        # Dead socket mid-turn: the text is already
+                        # accumulated by the caller, so abandon delivery and
+                        # let the turn persist instead of dying here.
+                        logger.debug(
+                            "TTS payload send skipped (connection unavailable): "
+                            "type={}",
+                            type(error).__name__,
+                        )
+                        return
                     self._next_sequence_to_send += 1
 
                 self._payload_queue.task_done()
