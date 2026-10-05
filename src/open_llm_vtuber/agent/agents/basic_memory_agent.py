@@ -816,6 +816,7 @@ class BasicMemoryAgent(AgentInterface):
         try:
             from ...autonomous_decision import classify_goal_evidence as classify
             from ...episodic_memory import load_episodic_events
+            from ... import world_state as _world_state
 
             state = getattr(self, "_character_state", None)
             if state is None:
@@ -823,7 +824,7 @@ class BasicMemoryAgent(AgentInterface):
             return classify(
                 goals=getattr(state, "goals", None) or [],
                 episodic_events=load_episodic_events(self._character_conf_uid) or [],
-                moment=moment or utcnow(),
+                moment=moment if moment is not None else _world_state.utcnow(),
             )
         except Exception as error:
             logger.debug(

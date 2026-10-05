@@ -402,7 +402,7 @@ class WebSocketHandler:
             )
             return False
 
-    def _goal_evidence_trigger(self, context: ServiceContext) -> bool:
+    def _goal_evidence_trigger(self, context: ServiceContext, now=None) -> bool:
         """True when an *active* stored goal has fresh deterministic evidence.
 
         This is the Autonomous Decision Layer's one contribution to proactive
@@ -413,6 +413,10 @@ class WebSocketHandler:
         existing Proactive V2 gate below remains the only authority on whether
         anything is actually dispatched.
 
+        ``now`` is an injectable clock (UTC aware). ``None`` means "use the
+        real clock" — the production path. Tests pass a fake instant so the
+        72h evidence horizon stays deterministic.
+
         Fail-soft: any problem means "no goal evidence", i.e. exactly the
         pre-existing behaviour.
         """
@@ -421,7 +425,11 @@ class WebSocketHandler:
             classifier = getattr(agent, "classify_goal_evidence", None)
             if not callable(classifier):
                 return False
-            decision = classifier()
+            try:
+                decision = classifier(now) if now is not None else classifier()
+            except TypeError:
+                # Test double / legacy facade without a clock parameter.
+                decision = classifier()
             if decision is None or not getattr(decision, "acts", False):
                 return False
             if str(getattr(decision, "outcome", "")) != OUTCOME_GOAL_BEHAVIOR:
@@ -451,6 +459,7 @@ class WebSocketHandler:
         context: ServiceContext,
         signals: ProactiveIntentSignals,
         budget: ProactiveBudgetState,
+        now=None,
     ):
         """Deterministic trigger priority. Never calls a model."""
         return classify_trigger(
@@ -465,7 +474,7 @@ class WebSocketHandler:
             meaningful_life_event=self._meaningful_life_event(
                 context, budget.last_proactive_at
             ),
-            goal_evidence=self._goal_evidence_trigger(context),
+            goal_evidence=self._goal_evidence_trigger(context, now=now),
         )
 
     async def _record_user_activity(self, client_uid: str) -> None:

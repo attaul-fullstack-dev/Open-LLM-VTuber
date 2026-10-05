@@ -698,18 +698,18 @@ class AgentFacadeTest(unittest.TestCase):
         agent._load_character_state("adlchar")
         self._write_events([event("e1", "gw coba masak chicken")])
         with patch(
-            "src.open_llm_vtuber.agent.agents.basic_memory_agent.utcnow",
+            "src.open_llm_vtuber.world_state.utcnow",
             return_value=NOW,
         ):
-            before = agent.classify_goal_evidence()
+            before = agent.classify_goal_evidence(moment=NOW)
             self.assertEqual(before.outcome, OUTCOME_NO_DECISION)
             agent.set_goal_status("try-three-dishes", "active")
-            fired = agent.classify_goal_evidence()
+            fired = agent.classify_goal_evidence(moment=NOW)
             self.assertEqual(fired.outcome, OUTCOME_GOAL_BEHAVIOR)
             agent.record_goal_evidence(
                 "try-three-dishes", fired.metadata["evidence_id"]
             )
-            again = agent.classify_goal_evidence()
+            again = agent.classify_goal_evidence(moment=NOW)
             self.assertFalse(again.acts)
             self.assertEqual(again.reason, "goal_evidence_consumed")
 
