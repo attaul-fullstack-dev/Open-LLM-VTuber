@@ -347,13 +347,25 @@ def normalize_stored_intention(item: Any) -> Optional[Dict[str, Any]]:
 
 
 def pending_intentions(stored: Any) -> List[Dict[str, Any]]:
-    """Pending intentions, oldest first (FIFO for reminders)."""
+    """Pending intentions, temporally relevant first (deterministic).
+
+    Due-soonest absolute ``due_at`` first so the bounded prompt block always
+    carries the most time-critical rows; undated rows sort last (they are
+    recallable but never urgent); ties break by oldest creation. ISO-8601
+    strings sort chronologically, so no parsing is needed for ordering.
+    """
     out = []
     for item in stored or []:
         parsed = normalize_stored_intention(item)
         if parsed is not None and parsed["status"] == STATUS_PENDING:
             out.append(parsed)
-    out.sort(key=lambda row: (row["created_at"] or "", row["id"]))
+    out.sort(
+        key=lambda row: (
+            row["due_at"] or "9999",
+            row["created_at"] or "",
+            row["id"],
+        )
+    )
     return out
 
 
