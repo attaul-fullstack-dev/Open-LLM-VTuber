@@ -564,6 +564,27 @@ class BasicMemoryAgent(AgentInterface):
         # Self Model v1: static identity + read-only live references. Pure
         # composer, no store, no LLM call. See self_model.py.
         live2d_name = getattr(self._live2d_model, "live2d_model_name", None)
+        # Derived activity preferences (WHAT I TEND TO LIKE): read-only
+        # aggregate over persisted evidence (world history + memories),
+        # rendered only when ESTABLISHED (>=3 items over >=2 days). Fail-soft:
+        # any problem means the line is omitted, never a broken prompt.
+        derived_preferences: tuple = ()
+        try:
+            from ...self_model import derive_activity_preferences as _derive_prefs
+
+            derived_preferences = tuple(
+                _derive_prefs(
+                    getattr(snapshot, "recent_activity_history", None),
+                    getattr(getattr(self, "_character_state", None), "memories", None),
+                    tz=self._user_timezone,
+                )
+            )
+        except Exception as error:
+            logger.debug(
+                "Derived preference context skipped: type={}",
+                type(error).__name__,
+            )
+            derived_preferences = ()
         parts.append(
             build_self_context(
                 character_name=self._character_name,
@@ -573,6 +594,7 @@ class BasicMemoryAgent(AgentInterface):
                 location=getattr(snapshot, "location", None),
                 relationship_status=self._relationship_state.status,
                 memory_count=len(self._character_state.memories),
+                preferences=derived_preferences,
             )
         )
         parts.append(

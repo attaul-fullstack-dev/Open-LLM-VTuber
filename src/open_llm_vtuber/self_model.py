@@ -215,11 +215,11 @@ def build_self_context(
     """Assemble the compact SELF block for the system prompt (pure).
 
     All live arguments are read-only references rendered at call time;
-    nothing is stored here. ``preferences`` is opt-in (default empty
-    renders byte-identical output); the agent does not pass it yet, so
-    the live prompt is unchanged in this phase. Output stays under
-    ``max_tokens``; overlong seed lists are truncated, never the
-    identity/boundary lines.
+    nothing is stored here. ``preferences`` carries the derived activity
+    candidates (established ones render, the rest is ignored); the agent
+    passes them from persisted world history + memories every turn.
+    Output stays under ``max_tokens``; overlong seed lists are truncated,
+    never the identity/boundary lines.
     """
     name = (character_name or SELF_IDENTITY_NAME).strip() or SELF_IDENTITY_NAME
     if live2d_model_name:
