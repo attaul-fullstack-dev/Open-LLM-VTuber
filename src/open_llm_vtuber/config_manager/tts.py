@@ -597,6 +597,10 @@ class ElevenLabsTTSConfig(I18nMixin):
     style: float = Field(0.0, alias="style")
     use_speaker_boost: bool = Field(True, alias="use_speaker_boost")
     speed: float = Field(0.80, ge=0.7, le=1.2, alias="speed")
+    # Voice Emotion: prepend the per-sentence emotion audio tag ([happy],
+    # [sad], ...) for ElevenLabs v3. Deterministic allowlist in
+    # voice_emotion.py; unknown emotions synthesize plain. Kill switch.
+    emotion_tags_enabled: bool = Field(True, alias="emotion_tags_enabled")
 
     DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
         "api_key": Description(
@@ -631,6 +635,10 @@ class ElevenLabsTTSConfig(I18nMixin):
         "speed": Description(
             en="Speech speed (0.7 to 1.2; 1.0 is normal speed)",
             zh="语 音 速 度 （ 0.7 到 1.2；1.0 为 正 常 速 度 ）",
+        ),
+        "emotion_tags_enabled": Description(
+            en="Prepend per-sentence emotion audio tags for ElevenLabs v3",
+            zh="为 ElevenLabs v3 在每句前添加情感音频标签",
         ),
 
     }

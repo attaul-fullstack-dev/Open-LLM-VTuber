@@ -131,6 +131,18 @@ async def handle_sentence_output(
         else:
             logger.debug("🚫 No translation engine available. Skipping translation.")
 
+        # Voice Emotion: per-sentence tag from THIS sentence's own detected
+        # emotions (stateless — a previous turn/sentence can never leak in).
+        # Only the synthesis text carries it; display/history/translation
+        # above are untouched.
+        emotion_tag = None
+        try:
+            from ..voice_emotion import emotion_tag_for
+
+            emotion_tag = emotion_tag_for(getattr(actions, "emotions", None))
+        except Exception:
+            emotion_tag = None
+
         full_response += display_text.text
         await tts_manager.speak(
             tts_text=tts_text,
@@ -140,6 +152,7 @@ async def handle_sentence_output(
             tts_engine=tts_engine,
             websocket_send=websocket_send,
             synthesize_audio=synthesize_audio,
+            emotion_tag=emotion_tag,
         )
     return full_response
 

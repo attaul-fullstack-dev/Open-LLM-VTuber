@@ -469,6 +469,7 @@ character_config:
       similarity_boost: 0.5 # 语音相似度增强（0.0 到 1.0）
       style: 0.0 # 语音风格夸张度（0.0 到 1.0）
       use_speaker_boost: true # 启用说话人增强以获得更好的质量
+      emotion_tags_enabled: true # 为 ElevenLabs v3 在每句前添加情感音频标签
 
     cartesia_tts:
       api_key: ''

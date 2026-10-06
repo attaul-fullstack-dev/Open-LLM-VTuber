@@ -25,6 +25,7 @@ class TTSEngine(TTSInterface):
         style: float = 0.0,
         use_speaker_boost: bool = True,
         speed: float = 0.80,
+        emotion_tags_enabled: bool = True,
     ):
         """
         Initializes the ElevenLabs TTS engine.
@@ -49,6 +50,9 @@ class TTSEngine(TTSInterface):
         self.style = style
         self.use_speaker_boost = use_speaker_boost
         self.speed = speed
+        # Voice Emotion kill switch: when False, the TTS manager synthesizes
+        # every sentence plain (no [tag] prefix), regardless of detected mood.
+        self.emotion_tags_enabled = bool(emotion_tags_enabled)
 
         # Determine file extension from output format
         if "mp3" in output_format:

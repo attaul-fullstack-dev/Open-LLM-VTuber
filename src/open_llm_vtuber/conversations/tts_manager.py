@@ -14,7 +14,29 @@ from ..utils.stream_audio import prepare_audio_payload
 from .types import WebSocketSend
 
 # Serialize ElevenLabs synthesis to avoid API concurrency-limit errors.
-_ELEVENLABS_TTS_SEMAPHORE = asyncio.Semaphore(1)
+# Per event loop (not one global): asyncio primitives bind to the loop that
+# first acquires them, so a single global semaphore breaks with "bound to a
+# different event loop" whenever the loop is recreated (tests, embedding
+# reuse) and every synthesis degrades to a silent payload. One slot per live
+# loop preserves the concurrency guarantee exactly where it matters.
+_ELEVENLABS_TTS_SEMAPHORES: Dict[int, asyncio.Semaphore] = {}
+
+
+def _elevenlabs_semaphore() -> asyncio.Semaphore:
+    """The ElevenLabs concurrency slot for the running loop.
+
+    Entries are keyed by loop identity and never pruned: each entry is tiny,
+    production creates exactly one, and a recycled id can only inherit an
+    uncontended slot from a dead loop (always safe).
+    """
+    loop = asyncio.get_running_loop()
+    key = id(loop)
+    existing = _ELEVENLABS_TTS_SEMAPHORES.get(key)
+    if existing is not None:
+        return existing
+    slot = asyncio.Semaphore(1)
+    _ELEVENLABS_TTS_SEMAPHORES[key] = slot
+    return slot
 
 
 class TTSTaskManager:
@@ -40,6 +62,7 @@ class TTSTaskManager:
         tts_engine: TTSInterface,
         websocket_send: WebSocketSend,
         synthesize_audio: bool = True,
+        emotion_tag: Optional[str] = None,
     ) -> None:
         """
         Queue a TTS task while maintaining order of delivery.
@@ -55,7 +78,16 @@ class TTSTaskManager:
                 send a text-only display payload (no TTS API call). Reuses the
                 existing silent/text-only payload path so the frontend and the
                 turn lifecycle behave exactly like the muted case.
+            emotion_tag: ElevenLabs v3 audio tag (e.g. "happy") for THIS
+                sentence only. Prepended as ``[tag]`` to the synthesis text
+                when the engine is ElevenLabs with tags enabled; display
+                text, history and translation input are never touched.
+                Stateless per call, so no emotion can leak across sentences.
         """
+        if emotion_tag and synthesize_audio and self._emotion_tags_allowed(tts_engine):
+            from ..voice_emotion import tag_tts_text
+
+            tts_text = tag_tts_text(tts_text, emotion_tag)
         if len(re.sub(r'[\s.,!?，。！？\'"』」）】\s]+', "", tts_text)) == 0:
             logger.debug("Empty TTS text, sending silent display payload")
             # Get current sequence number for silent payload
@@ -100,6 +132,16 @@ class TTSTaskManager:
             )
         )
         self.task_list.append(task)
+
+    @staticmethod
+    def _emotion_tags_allowed(tts_engine: TTSInterface) -> bool:
+        """True only for ElevenLabs engines with tags enabled (fail-soft)."""
+        try:
+            if not tts_engine.__class__.__module__.endswith(".elevenlabs_tts"):
+                return False
+            return bool(getattr(tts_engine, "emotion_tags_enabled", True))
+        except Exception:
+            return False
 
     async def _process_payload_queue(self, websocket_send: WebSocketSend) -> None:
         """
@@ -225,7 +267,7 @@ class TTSTaskManager:
             )
 
         if tts_engine.__class__.__module__.endswith(".elevenlabs_tts"):
-            async with _ELEVENLABS_TTS_SEMAPHORE:
+            async with _elevenlabs_semaphore():
                 logger.debug("ElevenLabs TTS concurrency slot acquired")
                 return await generate()
 

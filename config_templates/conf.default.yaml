@@ -494,6 +494,7 @@ character_config:
       similarity_boost: 0.5 # Voice similarity boost (0.0 to 1.0)
       style: 0.0 # Voice style exaggeration (0.0 to 1.0)
       use_speaker_boost: true # Enable speaker boost for better quality
+      emotion_tags_enabled: true # Prepend per-sentence emotion audio tags (ElevenLabs v3)
     
     cartesia_tts:
       api_key: ''

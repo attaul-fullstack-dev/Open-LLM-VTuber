@@ -185,6 +185,7 @@ class TTSFactory:
                 style=kwargs.get("style", 0.0),
                 use_speaker_boost=kwargs.get("use_speaker_boost", True),
                 speed=kwargs.get("speed", 0.80),
+                emotion_tags_enabled=kwargs.get("emotion_tags_enabled", True),
             )
         elif engine_type == "cartesia_tts":
             from .cartesia_tts import TTSEngine as CartesiaTTSEngine
