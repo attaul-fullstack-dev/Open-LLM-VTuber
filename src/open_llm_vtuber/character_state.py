@@ -809,15 +809,17 @@ def record_future_intention(
 ) -> Optional[Dict[str, Any]]:
     """Detect and persist one explicit reminder request (fail-soft).
 
-    Returns the stored entry, or None when the turn carried no reminder
-    request. Same-turn duplicates are not stored twice. Never raises.
+    Tries the narrow reminder grammar first (category A), then the natural
+    future-plan grammar (category B). Returns the stored entry, or None when
+    the turn carried neither. Same-turn duplicates are not stored twice.
+    Never raises.
     """
     try:
-        from .future_intentions import add_future_intention, detect_future_intention
+        from .future_intentions import add_future_intention, detect_any_future_intention
     except Exception:
         return None
     try:
-        detected = detect_future_intention(user_text, now=now, tz=tz)
+        detected = detect_any_future_intention(user_text, now=now, tz=tz)
     except Exception:
         return None
     if detected is None:
@@ -834,7 +836,8 @@ def record_future_intention(
         if not save_character_state(conf_uid, state):
             return None
         logger.info(
-            "Future intention stored: due_at={} text_chars={}",
+            "Future intention stored: kind={} due_at={} text_chars={}",
+            getattr(detected, "kind", "reminder"),
             detected.due_at,
             len(detected.text),
         )

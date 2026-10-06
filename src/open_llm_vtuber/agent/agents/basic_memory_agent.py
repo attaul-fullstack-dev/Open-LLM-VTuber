@@ -1389,7 +1389,7 @@ class BasicMemoryAgent(AgentInterface):
         return True
 
     def _observe_future_intention(self, user_text: str) -> bool:
-        """Capture an explicit reminder request stated in ordinary chat.
+        """Capture an explicit reminder request or natural future plan.
 
         Runs on the existing post-turn observer, so it adds no LLM call and
         no new lifecycle. Deterministic local detection only; fail-soft.

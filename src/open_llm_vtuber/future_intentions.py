@@ -1,21 +1,27 @@
-"""Future intentions — explicit reminder requests with absolute UTC due times.
+"""Future intentions — reminder requests AND natural future plans.
 
-A future intention is a user-stated reminder request ("tolong ingetin aku
-besok jam 7 ...", "jangan lupa nanti ..."). It lives in the existing
-``character_state/<conf_uid>.json`` file (same atomic store as memories,
-goals and preferences) — NOT a new memory system.
+Two capture paths share one bounded store (same ``character_state`` file —
+NOT a new memory system):
+
+- ``reminder``: explicit request ("tolong ingetin aku besok jam 7 ...").
+  Narrow verb + anchor grammar (unchanged).
+- ``plan`` (Phase 7): natural first-person future declaration ("besok aku
+  ada ujian", "Selasa aku bakal nanya lagi soal bug websocket").
+  Narrow subject + marker grammar; hypotheticals, questions, general
+  statements and stage-direction roleplay are rejected. False positive is
+  worse than false negative, so the grammar stays small on purpose.
 
 Layer separation:
 - episodic memory: something that already happened (past only by design).
 - character memories: durable facts ("ingat ...") — transient tasks rejected.
 - interaction preferences: HOW Mili talks.
-- future intentions (this module): WHAT Mili must remind the user about, WHEN.
+- future intentions (this module): WHAT the user will do / must be reminded
+  about, WHEN (absolute UTC ``due_at``, or None when undated).
 
-Detection is deterministic and narrow: a turn must contain BOTH a reminder
-verb AND a future anchor, and be short enough to be a request rather than
-narration. No LLM call, no scheduler, no background work. All timestamps are
-absolute UTC ISO-8601; relative labels ("besok", "nanti") are resolved ONCE
-at capture into ``due_at`` and never persisted as truth.
+No LLM call, no scheduler, no background work. Relative labels ("besok",
+"Selasa", "nanti") are resolved ONCE at capture into ``due_at`` and never
+persisted as truth. Undated plans (``due_at=None``) are recallable but never
+proactively due.
 """
 
 from __future__ import annotations
@@ -33,8 +39,12 @@ STATUS_PENDING = "pending"
 STATUS_DONE = "done"
 STATUS_CANCELLED = "cancelled"
 
+KIND_REMINDER = "reminder"
+KIND_PLAN = "plan"
+
 _MAX_INTENTION_CHARS = 220
 _MAX_PENDING = 20
+_MIN_PLAN_CHARS = 12
 
 # Reminder verbs: the user asks Mili to remind them.
 _REMINDER_VERB = re.compile(
@@ -54,6 +64,44 @@ _FUTURE_ANCHOR = re.compile(
     re.IGNORECASE,
 )
 
+# First-person subject: plans are statements about the USER's own future.
+# Third-person/general narration ("orang biasanya kerja besok") has no
+# subject here and is rejected. Fiction with a first-person narrator is a
+# documented residual risk; verbatim recall (never invented detail) bounds it.
+_PLAN_SUBJECT = re.compile(
+    r"\b(?:aku|gw|gue|gua|saya|ane)\b",
+    re.IGNORECASE,
+)
+
+# Future markers for natural plans: explicit anchors plus intent verbs.
+# Kept narrow on purpose; habitual/uncertain wording is rejected elsewhere.
+_PLAN_MARKER = re.compile(
+    r"\b(?:besok|lusa|nanti|minggu\s+depan|bulan\s+depan|tahun\s+depan|"
+    r"senin|selasa|rabu|kamis|jumat|sabtu|minggu|"
+    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+    r"tomorrow|next\s+week|next\s+month|"
+    r"bakal|akan|mau\b|rencana|berencana|planning|will\b|going\s+to|"
+    r"jam\s*\d{1,2}(?:[:.]\d{2})?|pukul\s*\d{1,2}(?:[:.]\d{2})?)\b",
+    re.IGNORECASE,
+)
+
+# Uncertainty / conditional: a plan that might not happen is not a plan.
+_HYPOTHETICAL = re.compile(
+    r"\b(?:kalau|kalo|jika|jikalau|bila|mungkin|misalnya|misal|seandainya|"
+    r"andaikan|kayaknya|barangkali|siapa\s+tahu|maybe|if\b|perhaps)\b",
+    re.IGNORECASE,
+)
+
+# Habitual statements describe routine, not a dated future intention.
+_HABITUAL = re.compile(
+    r"\b(?:biasanya|selalu|sering|setiap\s+(?:hari|pagi|minggu|bulan)|"
+    r"tiap\s+(?:hari|pagi)|kebiasaan|usually|always|every\s+day)\b",
+    re.IGNORECASE,
+)
+
+# Stage directions / quoted speech: roleplay framing, not a certain plan.
+_ROLEPLAY_FRAME = re.compile(r"^\s*[\*\(>]|[\*]$")
+
 # Questions that are pure recall checks, not reminder requests.
 _RECALL_QUESTION = re.compile(
     r"^(?:kamu|lu|mili)?\s*(?:masih\s+)?(?:ingat|inget)\b.*\?\s*$",
@@ -68,11 +116,25 @@ _JAM = re.compile(
 
 @dataclass(frozen=True)
 class FutureIntention:
-    """One detected reminder request (pure data)."""
+    """One detected reminder request or future plan (pure data)."""
 
     text: str
-    due_at: Optional[str]  # UTC ISO-8601 or None
+    due_at: Optional[str]  # UTC ISO-8601 or None (undated plan)
     created_at: str  # UTC ISO-8601
+    kind: str = KIND_REMINDER  # KIND_REMINDER | KIND_PLAN
+    tz: Optional[str] = None  # user tz name at capture (audit only)
+
+
+# Weekday (full names only — shorts are ambiguous) → Python weekday().
+_WEEKDAYS = {
+    "senin": 0, "monday": 0,
+    "selasa": 1, "tuesday": 1,
+    "rabu": 2, "wednesday": 2,
+    "kamis": 3, "thursday": 3,
+    "jumat": 4, "friday": 4,
+    "sabtu": 5, "saturday": 5,
+    "minggu": 6, "sunday": 6,
+}
 
 
 def _now_aware(moment: Optional[datetime]) -> datetime:
@@ -104,39 +166,58 @@ def _parse_due_at(
 ) -> Optional[str]:
     """Resolve the future anchor into an absolute UTC instant.
 
-    Minimal and deterministic: besok/lusa/tomorrow → 07:00 local,
-    explicit jam/HH:MM → that local time today (tomorrow if passed),
-    nanti/sore/malam ini → +3h, minggu depan → +7d 07:00.
-    Anything unrecognized → None (pending, never proactively due).
+    Day words set the DATE (besok/lusa/weekday/minggu/bulan depan, all at
+    07:00 local unless an explicit jam overrides the time); a bare jam sets
+    today (tomorrow if passed); nanti/sore/malam ini mean +3h.
+    Anything unrecognized → None (stored, recallable, never proactively due).
     """
     try:
         lowered = text.lower()
         local_now = moment.astimezone(tz)
+
+        def _at(day: datetime, hour: int, minute: int = 0) -> str:
+            due_local = day.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            return due_local.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+        def _jam_or(h: int, m: int = 0) -> tuple:
+            jam = _JAM.search(text)
+            if jam:
+                try:
+                    h = max(0, min(23, int(jam.group(1))))
+                    m = max(0, min(59, int(jam.group(2) or 0)))
+                except (TypeError, ValueError):
+                    pass
+            return h, m
+
+        for name, weekday in _WEEKDAYS.items():
+            if re.search(r"\b" + name + r"\b", lowered):
+                days_ahead = (weekday - local_now.weekday()) % 7
+                day = local_now + timedelta(days=days_ahead)
+                hour, minute = _jam_or(7)
+                due_local = day.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                if due_local <= local_now:
+                    due_local = due_local + timedelta(days=7)
+                return due_local.astimezone(timezone.utc).isoformat(timespec="seconds")
         if "lusa" in lowered or "day after tomorrow" in lowered:
-            due_local = (local_now + timedelta(days=2)).replace(
-                hour=7, minute=0, second=0, microsecond=0
-            )
-            return due_local.astimezone(timezone.utc).isoformat(timespec="seconds")
+            day = local_now + timedelta(days=2)
+            hour, minute = _jam_or(7)
+            return _at(day, hour, minute)
         if "besok" in lowered or "tomorrow" in lowered:
-            due_local = (local_now + timedelta(days=1)).replace(
-                hour=7, minute=0, second=0, microsecond=0
-            )
-            return due_local.astimezone(timezone.utc).isoformat(timespec="seconds")
+            day = local_now + timedelta(days=1)
+            hour, minute = _jam_or(7)
+            return _at(day, hour, minute)
         if "minggu depan" in lowered or "next week" in lowered:
-            due_local = (local_now + timedelta(days=7)).replace(
-                hour=7, minute=0, second=0, microsecond=0
-            )
-            return due_local.astimezone(timezone.utc).isoformat(timespec="seconds")
+            day = local_now + timedelta(days=7)
+            hour, minute = _jam_or(7)
+            return _at(day, hour, minute)
+        if "bulan depan" in lowered or "next month" in lowered:
+            day = local_now + timedelta(days=30)
+            hour, minute = _jam_or(7)
+            return _at(day, hour, minute)
         jam = _JAM.search(text)
         if jam:
-            try:
-                hour = max(0, min(23, int(jam.group(1))))
-                minute = max(0, min(59, int(jam.group(2) or 0)))
-            except (TypeError, ValueError):
-                hour, minute = 7, 0
-            due_local = local_now.replace(
-                hour=hour, minute=minute, second=0, microsecond=0
-            )
+            hour, minute = _jam_or(7)
+            due_local = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
             if due_local <= local_now:
                 due_local = due_local + timedelta(days=1)
             return due_local.astimezone(timezone.utc).isoformat(timespec="seconds")
@@ -147,6 +228,8 @@ def _parse_due_at(
             or "tonight" in lowered
         ):
             return (moment + timedelta(hours=3)).isoformat(timespec="seconds")
+        return None
+    except Exception:
         return None
     except Exception:
         return None
@@ -178,7 +261,62 @@ def detect_future_intention(
         text=text,
         due_at=_parse_due_at(text, moment, zone),
         created_at=_utc_iso(moment),
+        kind=KIND_REMINDER,
+        tz=str(tz or "") or None,
     )
+
+
+def detect_future_plan(
+    user_text: Any,
+    now: Optional[datetime] = None,
+    tz: Optional[str] = None,
+) -> Optional[FutureIntention]:
+    """Detect ONE natural future plan in a single user turn (category B).
+
+    Requires first-person subject + future marker + minimal substance.
+    Rejects hypotheticals (C), questions (D), habitual/general statements
+    (E) and stage-direction roleplay frames (F). Undated plans return
+    ``due_at=None``: stored and recallable, never proactively due.
+    Pure and deterministic.
+    """
+    text = _normalize(user_text)
+    if not text or len(text) < _MIN_PLAN_CHARS or len(text) > _MAX_INTENTION_CHARS:
+        return None
+    if text.rstrip().endswith(("?", "？")):
+        return None
+    if _RECALL_QUESTION.match(text):
+        return None
+    if _HYPOTHETICAL.search(text):
+        return None
+    if _HABITUAL.search(text):
+        return None
+    if _ROLEPLAY_FRAME.search(text):
+        return None
+    if not _PLAN_SUBJECT.search(text):
+        return None
+    if not _PLAN_MARKER.search(text):
+        return None
+    moment = _now_aware(now)
+    zone = _resolve_tz(tz)
+    return FutureIntention(
+        text=text,
+        due_at=_parse_due_at(text, moment, zone),
+        created_at=_utc_iso(moment),
+        kind=KIND_PLAN,
+        tz=str(tz or "") or None,
+    )
+
+
+def detect_any_future_intention(
+    user_text: Any,
+    now: Optional[datetime] = None,
+    tz: Optional[str] = None,
+) -> Optional[FutureIntention]:
+    """Reminder first (category A), then natural plan (category B)."""
+    found = detect_future_intention(user_text, now=now, tz=tz)
+    if found is not None:
+        return found
+    return detect_future_plan(user_text, now=now, tz=tz)
 
 
 def normalize_stored_intention(item: Any) -> Optional[Dict[str, Any]]:
@@ -193,6 +331,9 @@ def normalize_stored_intention(item: Any) -> Optional[Dict[str, Any]]:
         status = STATUS_PENDING
     due_at = _normalize(item.get("due_at", ""))
     created_at = _normalize(item.get("created_at", ""))
+    kind = _normalize(item.get("kind", "")) or KIND_REMINDER
+    if kind not in (KIND_REMINDER, KIND_PLAN):
+        kind = KIND_REMINDER
     return {
         "id": _normalize(item.get("id", "")) or uuid.uuid4().hex,
         "text": text,
@@ -200,6 +341,8 @@ def normalize_stored_intention(item: Any) -> Optional[Dict[str, Any]]:
         "created_at": created_at or None,
         "status": status,
         "source": _normalize(item.get("source", "")) or "conversation",
+        "kind": kind,
+        "tz": _normalize(item.get("tz", "")) or None,
     }
 
 
@@ -267,6 +410,8 @@ def add_future_intention(
             "created_at": detected.created_at,
             "status": STATUS_PENDING,
             "source": "conversation",
+            "kind": getattr(detected, "kind", KIND_REMINDER) or KIND_REMINDER,
+            "tz": getattr(detected, "tz", None),
         }
     )
     pending = [row for row in rows if row["status"] == STATUS_PENDING]
@@ -352,21 +497,25 @@ def build_future_intention_context(
         lines: List[str] = []
         used = 0
         for item in pending[:8]:
+            kind = item.get("kind") or KIND_REMINDER
+            tag = "remind" if kind == KIND_REMINDER else "upcoming"
             due_raw = item.get("due_at")
             if due_raw:
                 stamp = _parse_iso(due_raw)
                 if stamp is not None:
                     local = stamp.astimezone(zone)
                     line = (
-                        "- [remind due "
+                        "- ["
+                        + tag
+                        + " due "
                         + local.strftime("%b %d %H:%M %Z")
                         + "] "
                         + item["text"]
                     )
                 else:
-                    line = "- [remind, no due time] " + item["text"]
+                    line = "- [" + tag + ", no due time] " + item["text"]
             else:
-                line = "- [remind, no due time] " + item["text"]
+                line = "- [" + tag + ", no due time] " + item["text"]
             cost = estimate_tokens(line) + 4
             if used + cost > max_tokens:
                 break
@@ -375,8 +524,8 @@ def build_future_intention_context(
         if not lines:
             return ""
         header = (
-            "Standing reminder requests from the user (explicit; surface them "
-            "when due, never invent new ones):"
+            "Standing reminder requests and upcoming user plans (explicit or "
+            "directly stated; surface them when due, never invent new ones):"
         )
         return f"{header}\n" + "\n".join(lines)
     except Exception as error:
@@ -391,12 +540,16 @@ __all__ = [
     "STATUS_CANCELLED",
     "STATUS_DONE",
     "STATUS_PENDING",
+    "KIND_PLAN",
+    "KIND_REMINDER",
     "FutureIntention",
     "add_future_intention",
     "build_future_intention_context",
     "cancel_future_intention",
     "complete_future_intention",
+    "detect_any_future_intention",
     "detect_future_intention",
+    "detect_future_plan",
     "due_intentions",
     "normalize_stored_intention",
     "pending_intentions",
