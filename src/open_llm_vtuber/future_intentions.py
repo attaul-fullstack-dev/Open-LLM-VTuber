@@ -428,15 +428,36 @@ def add_future_intention(
     )
     pending = [row for row in rows if row["status"] == STATUS_PENDING]
     if len(pending) > _MAX_PENDING:
+        # Overflow evicts the least recall-critical rows first: undated rows
+        # (no absolute WHEN, never proactively due) go before dated ones, so
+        # a dated intention ("besok jam 07.00 ...") survives an accumulation
+        # of undated immediate-desire rows. Oldest first within each group
+        # (rows are appended chronologically); done/cancelled rows are never
+        # evicted here. Deterministic and pure.
         drop = len(pending) - _MAX_PENDING
-        skipped = 0
-        kept = []
-        for row in rows:
-            if row["status"] == STATUS_PENDING and skipped < drop:
-                skipped += 1
-                continue
-            kept.append(row)
-        rows = kept
+        pending_ids = [row["id"] for row in rows if row["status"] == STATUS_PENDING]
+        undated_ids = [
+            row["id"]
+            for row in rows
+            if row["status"] == STATUS_PENDING and not row.get("due_at")
+        ]
+        dated_ids = [
+            row["id"]
+            for row in rows
+            if row["status"] == STATUS_PENDING and row.get("due_at")
+        ]
+        evict = set(undated_ids[:drop])
+        remaining = drop - len(evict)
+        if remaining > 0:
+            evict.update(dated_ids[:remaining])
+        # Sanity fallback: if id bookkeeping ever disagrees (duplicate ids),
+        # evict the oldest pending rows in storage order as before.
+        if len(evict) < drop:
+            for row_id in pending_ids:
+                if len(evict) >= drop:
+                    break
+                evict.add(row_id)
+        rows = [row for row in rows if row["id"] not in evict]
     return rows
 
 
@@ -498,6 +519,11 @@ def build_future_intention_context(
     pending so the persona prompt stays untouched. No relative label is ever
     persisted — the rendered "in Xh" style suffix is derived per turn only
     when a due time exists, and the absolute instant is always shown.
+
+    Each row also carries a ``stated <Mon DD>`` tag derived per turn from
+    the persisted ``created_at`` (user timezone), so recall questions of the
+    form "kemarin aku bilang ... apa?" ground to the right row. Rows without
+    a parseable ``created_at`` render exactly as before (tag omitted).
     """
     pending = pending_intentions(stored)
     if not pending:
@@ -511,6 +537,14 @@ def build_future_intention_context(
         for item in pending[:8]:
             kind = item.get("kind") or KIND_REMINDER
             tag = "remind" if kind == KIND_REMINDER else "upcoming"
+            stated = ""
+            created_raw = item.get("created_at")
+            if created_raw:
+                created_stamp = _parse_iso(created_raw)
+                if created_stamp is not None:
+                    stated = ", stated " + created_stamp.astimezone(zone).strftime(
+                        "%b %d"
+                    )
             due_raw = item.get("due_at")
             if due_raw:
                 stamp = _parse_iso(due_raw)
@@ -521,13 +555,14 @@ def build_future_intention_context(
                         + tag
                         + " due "
                         + local.strftime("%b %d %H:%M %Z")
+                        + stated
                         + "] "
                         + item["text"]
                     )
                 else:
-                    line = "- [" + tag + ", no due time] " + item["text"]
+                    line = "- [" + tag + ", no due time" + stated + "] " + item["text"]
             else:
-                line = "- [" + tag + ", no due time] " + item["text"]
+                line = "- [" + tag + ", no due time" + stated + "] " + item["text"]
             cost = estimate_tokens(line) + 4
             if used + cost > max_tokens:
                 break
