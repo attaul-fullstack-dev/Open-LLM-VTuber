@@ -57,6 +57,43 @@ _USELESS_PAYLOADS = {
     "yak",
     "yap",
 }
+
+# Persistence nouns: the "sebagai X" clause must frame X as stored
+# information. Without this restriction a mid-sentence "simpan ... sebagai
+# ..." (e.g. "aku simpan uang sebagai dana darurat") would be misread as a
+# memory command. PERSIST-6042 fix: explicit save requests such as "simpan
+# fakta unik berikut sebagai informasi permanen: kode ..." must persist.
+_SEBAGAI_PERSIST_NOUN = (
+    r"(?:informasi|ingatan|fakta|data|catatan|kenangan|pengingat|"
+    r"arsip|memori|memory)\b"
+)
+_REMEMBER_SIMPAN_SEBAGAI = re.compile(
+    r"(?:^|[\s,;:!?…\-–—]+)"
+    r"(?:simpan|simpen|catat|catet)\b"
+    r"(?P<mid>.{0,120}?)"
+    r"\bsebagai\b\s+"
+    rf"(?P<rest>{_SEBAGAI_PERSIST_NOUN}.+)",
+    re.IGNORECASE,
+)
+# "Pastikan X tersimpan ..." asks Mili to guarantee persistence of X. When X
+# is not stored yet, storing X is the honest fulfillment (dedup keeps a
+# repeat harmless). A bare "pastikan ini tersimpan" carries no content and
+# is rejected by _meaningful_payload below.
+_REMEMBER_PASTIKAN_TERSIMPAN = re.compile(
+    r"^\s*pastikan\b(?P<item>.{1,160}?)\btersimpan\b",
+    re.IGNORECASE,
+)
+# Trailing adverbs that add no identity to a "pastikan" payload
+# ("PERSIST-6042 benar-benar" -> "PERSIST-6042").
+_PASTIKAN_TRAILING_FILLER = re.compile(
+    r"\s+(?:benar-benar|betul-betul|sungguh-sungguh|sungguh|pasti|dengan\s+baik)\s*$",
+    re.IGNORECASE,
+)
+# Triggers whose payload comes from a named regex group instead of the
+# generic tail extraction (the command is not message-initial).
+_GROUP_PAYLOAD_TRIGGERS = frozenset(
+    {"remember_simpan_sebagai", "remember_pastikan_tersimpan"}
+)
 _TEMPORARY_REMINDER_START = re.compile(
     r"^(?:makan|tidur|minum|mandi|mat(?:iin|ikan)|balas|cek|periksa|"
     r"nyalakan|hidupkan|kerja|bangun|telepon|kirim)\b",
@@ -152,6 +189,14 @@ _REMEMBER_PATTERNS = (
             rf"sebagai\s+ingatan|{_PARTICLE})(?:\s+{_PARTICLE})?",
             re.IGNORECASE,
         ),
+    ),
+    (
+        "remember_simpan_sebagai",
+        _REMEMBER_SIMPAN_SEBAGAI,
+    ),
+    (
+        "remember_pastikan_tersimpan",
+        _REMEMBER_PASTIKAN_TERSIMPAN,
     ),
     (
         "remember_masukkan",
@@ -256,19 +301,44 @@ def parse_memory_command(user_text: str) -> MemoryCommandResult:
         return _NONE
 
     for trigger, pattern in _REMEMBER_PATTERNS:
-        match = pattern.match(text)
+        if trigger in _GROUP_PAYLOAD_TRIGGERS:
+            # Mid-sentence triggers: .match() only tries position 0, so
+            # .search() is required for non-initial commands.
+            match = pattern.search(text)
+        else:
+            match = pattern.match(text)
         if not match:
             continue
-        payload, had_connector = _extract_payload(text, match.end())
+        if trigger in _GROUP_PAYLOAD_TRIGGERS:
+            payload = _group_payload(trigger, match)
+        else:
+            payload, had_connector = _extract_payload(text, match.end())
+            if trigger == "remember_jangan_lupa" and not _is_persistent_fact_reminder(
+                payload, had_connector
+            ):
+                return _NONE
+            if not _meaningful_payload(payload):
+                return _NONE
+            return MemoryCommandResult("remember", payload, trigger)
         if not _meaningful_payload(payload):
-            return _NONE
-        if trigger == "remember_jangan_lupa" and not _is_persistent_fact_reminder(
-            payload, had_connector
-        ):
             return _NONE
         return MemoryCommandResult("remember", payload, trigger)
 
     return _NONE
+
+
+def _group_payload(trigger: str, match: "re.Match[str]") -> str:
+    """Payload for mid-sentence triggers (command is not message-initial)."""
+    if trigger == "remember_simpan_sebagai":
+        mid = _collapse_spaces(match.group("mid") or "")
+        rest = _collapse_spaces(match.group("rest") or "")
+        combined = f"{mid} sebagai {rest}" if mid else f"sebagai {rest}"
+        return _collapse_spaces(_strip_edge_noise(combined))
+    if trigger == "remember_pastikan_tersimpan":
+        item = _collapse_spaces(match.group("item") or "")
+        item = _PASTIKAN_TRAILING_FILLER.sub("", item).strip()
+        return _collapse_spaces(_strip_edge_noise(item))
+    return ""
 
 
 # ---------------------------------------------------------------------------

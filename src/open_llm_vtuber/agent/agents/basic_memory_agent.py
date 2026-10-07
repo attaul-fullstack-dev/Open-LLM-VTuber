@@ -225,6 +225,12 @@ class BasicMemoryAgent(AgentInterface):
         # input text may carry an appended search block that must not pollute
         # the retrieval query. Empty means "fall back to the last user turn".
         self._episodic_query: str = ""
+        # Backend-verified memory command receipt for THIS turn only
+        # (PERSIST-6042 fix, part B). Set fresh on every chat_with_memory
+        # entry; cleared on proactive turns so a stale receipt can never
+        # leak into an assistant-only turn. Rendered into the system prompt
+        # by _relationship_system_prompt; empty means "no command".
+        self._memory_receipt_block: str = ""
         # Per-turn episodic retrieval selection (query, events), shared by the
         # prompt block and the Autonomous Decision Layer.
         self._episodic_selection_cache: Any = None
@@ -654,9 +660,46 @@ class BasicMemoryAgent(AgentInterface):
             episodic_block = ""
         if episodic_block:
             parts.append(episodic_block)
+        # Backend-verified memory receipt (PERSIST-6042 fix, part B): when
+        # this turn carried an explicit remember/forget request, the write
+        # already ran pre-turn and this block states the VERIFIED outcome.
+        # Placed after the memory/episodic blocks so it has the last word on
+        # save-claims: the model may confirm a save only when the receipt
+        # says STORED. Empty on ordinary turns (prompt byte-identical).
+        receipt_block = getattr(self, "_memory_receipt_block", "") or ""
+        if receipt_block:
+            parts.append(receipt_block)
         if world_line:
             parts.append(world_line)
         return "\n\n".join(parts)
+
+    def _refresh_memory_receipt(self, user_text: str) -> None:
+        """Pre-turn explicit memory command: parse, persist, verify.
+
+        Runs BEFORE the response is generated so the model reasons from the
+        verified write outcome instead of guessing "sudah aku simpan". The
+        post-turn observe_character_events still runs; add_character_memory
+        deduplicates, so the second write of the same payload is a no-op
+        (no duplicate rows). Fail-soft: any problem leaves an empty receipt
+        and the turn behaves exactly as before.
+        """
+        try:
+            from ...memory_receipt import (
+                build_memory_receipt_block,
+                process_memory_command,
+            )
+
+            receipt = process_memory_command(
+                user_text,
+                remember_fn=(
+                    lambda payload: self.add_character_memory(payload, explicit=True)
+                ),
+                forget_fn=self.remove_character_memory,
+            )
+            self._memory_receipt_block = build_memory_receipt_block(receipt)
+        except Exception as error:
+            logger.debug("Memory receipt skipped: type={}", type(error).__name__)
+            self._memory_receipt_block = ""
 
     def _sync_relationship_metadata(self, status: str, reason: str) -> None:
         """Mirror the character-level relationship into the active session file.
@@ -1948,6 +1991,34 @@ class BasicMemoryAgent(AgentInterface):
 
         return messages
 
+    @staticmethod
+    def _last_user_text(messages: List[Dict[str, Any]]) -> str:
+        """Plain text of the latest user message (multi-part safe).
+
+        Tool-loop iterations append tool results as user-role messages, so
+        this is only meaningful at turn entry, before any tool call.
+        """
+        try:
+            for message in reversed(messages or []):
+                if not isinstance(message, dict):
+                    continue
+                if message.get("role") != "user":
+                    continue
+                content = message.get("content", "")
+                if isinstance(content, str):
+                    return content
+                if isinstance(content, list):
+                    return " ".join(
+                        str(part.get("text", ""))
+                        for part in content
+                        if isinstance(part, dict)
+                        and part.get("type") == "text"
+                    ).strip()
+                return ""
+        except Exception:
+            return ""
+        return ""
+
     async def _claude_tool_interaction_loop(
         self,
         initial_messages: List[Dict[str, Any]],
@@ -2327,6 +2398,11 @@ class BasicMemoryAgent(AgentInterface):
             self.prompt_mode_flag = False
 
             messages = self._to_messages(input_data)
+            # Pre-turn verified memory receipt (PERSIST-6042 fix, part B):
+            # an explicit remember/forget request is persisted NOW so the
+            # response is generated from the verified outcome, never from a
+            # guess. Runs once per turn; tool-loop iterations below reuse it.
+            self._refresh_memory_receipt(self._last_user_text(messages))
             protected_start = max(0, len(messages) - 1)
             tools = None
             tool_mode = None
@@ -2431,6 +2507,9 @@ class BasicMemoryAgent(AgentInterface):
         async def proactive_with_memory() -> AsyncIterator[Union[str, Dict[str, Any]]]:
             self.reset_interrupt()
             self.prompt_mode_flag = False
+            # Assistant-only turn: no user command exists, so a receipt from
+            # a previous user turn must never leak into this prompt.
+            self._memory_receipt_block = ""
 
             messages = self._memory.copy()
             try:

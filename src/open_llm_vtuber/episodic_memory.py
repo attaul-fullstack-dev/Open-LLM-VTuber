@@ -65,6 +65,13 @@ _PAST_MARKERS = (
     "telah",
     "akhirnya",
     "kemaren",
+    # Whole-word past-completion verb (ID morphology): "menghabiskan 3 jam
+    # memperbaiki ..." states a completed expenditure of time. Listed as a
+    # full word so the \b gate below matches only the word itself.
+    "menghabiskan",
+    # Colloquial "spent/used up" ("habisin 3 jam ..."): standalone word,
+    # same completion semantics as "menghabiskan".
+    "habisin",
     "yesterday",
     "today",
     "earlier",
@@ -79,6 +86,20 @@ _PAST_MARKERS = (
     "days ago",
     "day ago",
 )
+
+
+# Whole-word compiled forms of the marker tuples below. The candidate gate
+# must never match a marker as a mere substring of another word
+# (PERSIST-6042 fix): "akan" inside "digunakan"/"makan", "telah" inside
+# "setelah", "mau" inside "semau", etc. Trailing spaces in the tuples are a
+# legacy word-boundary hack and are stripped here; \b does the job properly.
+def _word_pattern(marker: str) -> "re.Pattern[str]":
+    return re.compile(r"\b" + re.escape(marker.strip()) + r"\b")
+
+
+def _has_any_word(patterns: tuple, lowered: str) -> bool:
+    return any(rx.search(lowered) is not None for rx in patterns)
+
 
 # Deterministic "N days ago" references (ID + EN). Resolved arithmetically
 # from the request date; see resolve_occurred_at.
@@ -111,6 +132,10 @@ _FUTURE_MARKERS = (
     "going to",
     "want to buy",
 )
+
+# Whole-word marker matchers, compiled after the tuples above.
+_PAST_WORD_RES = tuple(_word_pattern(marker) for marker in _PAST_MARKERS)
+_FUTURE_WORD_RES = tuple(_word_pattern(marker) for marker in _FUTURE_MARKERS)
 _SMALLTALK = (
     "wkwk",
     "haha",
@@ -311,15 +336,13 @@ def is_episodic_candidate(text: Any) -> bool:
     if len(cleaned) < EPISODIC_MIN_TEXT_CHARS:
         return False
     lowered = cleaned.lower()
-    if not (
-        any(marker in lowered for marker in _PAST_MARKERS)
-        or _N_DAYS_AGO.search(lowered)
-    ):
+    # Whole-word matching only (PERSIST-6042 fix): plain `in` would fire on
+    # "akan" inside "digunakan" or "telah" inside "setelah".
+    if not (_has_any_word(_PAST_WORD_RES, lowered) or _N_DAYS_AGO.search(lowered)):
         return False
-    if any(marker in lowered for marker in _FUTURE_MARKERS):
+    if _has_any_word(_FUTURE_WORD_RES, lowered):
         has_past = bool(
-            any(marker in lowered for marker in _PAST_MARKERS)
-            or _N_DAYS_AGO.search(lowered)
+            _has_any_word(_PAST_WORD_RES, lowered) or _N_DAYS_AGO.search(lowered)
         )
         # Future intent dominates unless a completed past event is explicit.
         if (
