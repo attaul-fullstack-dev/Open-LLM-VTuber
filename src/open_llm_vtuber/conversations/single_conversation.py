@@ -91,7 +91,9 @@ async def process_single_conversation(
                 "World state reconcile skipped: type={}", type(error).__name__
             )
         # Send initial signals
-        await send_conversation_start_signals(websocket_send)
+        await send_conversation_start_signals(
+            websocket_send, history_uid=getattr(context, "history_uid", "") or ""
+        )
         latency.mark("websocket_first_output")
         logger.info(f"New Conversation Chain {session_emoji} started!")
 

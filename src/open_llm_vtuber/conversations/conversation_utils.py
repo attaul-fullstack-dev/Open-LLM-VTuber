@@ -179,16 +179,20 @@ async def handle_audio_output(
     return full_response
 
 
-async def send_conversation_start_signals(websocket_send: WebSocketSend) -> None:
+async def send_conversation_start_signals(
+    websocket_send: WebSocketSend,
+    history_uid: str = "",
+) -> None:
     """Send initial conversation signals (best-effort; see safe_send)."""
+    payload: Dict[str, Any] = {
+        "type": "control",
+        "text": "conversation-chain-start",
+    }
+    if history_uid:
+        payload["history_uid"] = history_uid
     await safe_send(
         websocket_send,
-        json.dumps(
-            {
-                "type": "control",
-                "text": "conversation-chain-start",
-            }
-        ),
+        json.dumps(payload),
     )
 
 

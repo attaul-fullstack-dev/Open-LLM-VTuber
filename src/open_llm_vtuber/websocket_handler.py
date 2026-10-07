@@ -1329,9 +1329,36 @@ class WebSocketHandler:
             if msg["role"] != "system"
         ]
         await websocket.send_text(
-            json.dumps({"type": "history-data", "messages": messages})
+            json.dumps(
+                {
+                    "type": "history-data",
+                    "history_uid": history_uid,
+                    "messages": messages,
+                }
+            )
         )
         self._subscriber_registry()[client_uid] = history_uid
+        # A turn detached by a mid-turn disconnect may still be running on
+        # this history: its chain-start went to a dead socket, so tell the
+        # new viewer explicitly instead of leaving the UI idle. Only
+        # DETACHED turns qualify — a live turn already owns its lifecycle
+        # (re-emitting chain-start would clear its audio queue mid-stream).
+        # The matching chain-end is sent by _deliver_history_to_subscriber
+        # when that turn completes.
+        try:
+            detached = self._detached_registry().get(history_uid)
+            if detached is not None and not detached.done():
+                await websocket.send_text(
+                    json.dumps(
+                        {
+                            "type": "control",
+                            "text": "conversation-chain-start",
+                            "history_uid": history_uid,
+                        }
+                    )
+                )
+        except Exception:
+            pass
         # Selecting history is activity.  Reconnect therefore starts a fresh
         # idle period and never replays timers/messages from the old socket.
         await self._activate_proactive_for_history(client_uid, history_uid)
@@ -1403,6 +1430,21 @@ class WebSocketHandler:
                 history_uid,
                 client_uid,
             )
+            # Close the lifecycle a fetch-time chain-start may have opened:
+            # the detached turn is done, so the viewer must return to idle.
+            # Skipped when the viewer already runs a newer live turn — that
+            # turn owns thinking now and will close it with its own chain-end.
+            live = self.current_conversation_tasks.get(client_uid or "")
+            if live is None or live.done():
+                await websocket.send_text(
+                    json.dumps(
+                        {
+                            "type": "control",
+                            "text": "conversation-chain-end",
+                            "history_uid": history_uid,
+                        }
+                    )
+                )
         except Exception as error:
             logger.warning(
                 "Detached turn resync skipped: history_uid={} type={}",

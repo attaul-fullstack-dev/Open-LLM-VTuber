@@ -158,6 +158,26 @@ async def handle_conversation_trigger(
             # abandon the trigger and silently drop the user's message. Here
             # the task is already owned by current_conversation_tasks, so
             # handle_disconnect can detach it like any other in-flight turn.
+            if orphan_candidates:
+                # Accepted but queued: tell the UI immediately so it shows
+                # thinking instead of sitting idle with no feedback until the
+                # orphan drains. Best-effort (dead socket fails silently).
+                # Deliberately NOT a chain-start: nothing is cleared and no
+                # new bubble starts; the real chain-start still opens the
+                # turn when process_single_conversation begins.
+                try:
+                    await safe_send(
+                        websocket.send_text,
+                        json.dumps(
+                            {
+                                "type": "control",
+                                "text": "conversation-turn-queued",
+                                "history_uid": turn_history_uid,
+                            }
+                        ),
+                    )
+                except Exception:
+                    pass
             for orphan_task in orphan_candidates:
                 logger.info(
                     "Waiting for detached in-flight turn on the same history "
