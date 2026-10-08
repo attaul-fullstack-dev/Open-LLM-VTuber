@@ -182,17 +182,57 @@ async def handle_audio_output(
 async def send_conversation_start_signals(
     websocket_send: WebSocketSend,
     history_uid: str = "",
+    request_id: str = "",
 ) -> None:
-    """Send initial conversation signals (best-effort; see safe_send)."""
+    """Send initial conversation signals (best-effort; see safe_send).
+
+    request_id identifies THIS turn (same id the audio payloads carry), so
+    the frontend can attribute late sentences to the right bubble instead
+    of relying on arrival timing.
+    """
     payload: Dict[str, Any] = {
         "type": "control",
         "text": "conversation-chain-start",
     }
     if history_uid:
         payload["history_uid"] = history_uid
+    if request_id:
+        payload["request_id"] = request_id
     await safe_send(
         websocket_send,
         json.dumps(payload),
+    )
+
+
+async def send_canonical_final(
+    websocket_send: WebSocketSend,
+    history_uid: str,
+    request_id: str,
+    text: str,
+) -> None:
+    """Deliver the persisted canonical AI text for one completed turn.
+
+    The persisted row is authoritative; the frontend reconciles the live
+    bubble(s) carrying request_id to exactly this text (idempotent: a
+    repeated event changes nothing). Best-effort like every other signal:
+    a dead socket must never break the turn. Never called when nothing was
+    persisted (cancelled/skipped turns send no canonical event).
+    """
+    if not history_uid or not request_id or not text:
+        return
+    # NOTE: routed by `type`, not by `text`: the canonical response text
+    # itself travels in `text`, so the control-text routing slot must not
+    # be reused for it (a duplicate "text" key would destroy the route).
+    await safe_send(
+        websocket_send,
+        json.dumps(
+            {
+                "type": "ai-final",
+                "history_uid": history_uid,
+                "request_id": request_id,
+                "text": text,
+            }
+        ),
     )
 
 

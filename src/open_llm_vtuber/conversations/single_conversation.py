@@ -9,6 +9,7 @@ import uuid
 from .conversation_utils import (
     create_batch_input,
     process_agent_output,
+    send_canonical_final,
     send_conversation_start_signals,
     process_user_input,
     finalize_conversation_turn,
@@ -92,7 +93,9 @@ async def process_single_conversation(
             )
         # Send initial signals
         await send_conversation_start_signals(
-            websocket_send, history_uid=getattr(context, "history_uid", "") or ""
+            websocket_send,
+            history_uid=getattr(context, "history_uid", "") or "",
+            request_id=latency.request_id,
         )
         latency.mark("websocket_first_output")
         logger.info(f"New Conversation Chain {session_emoji} started!")
@@ -326,6 +329,19 @@ async def process_single_conversation(
                 context.history_uid,
                 len(full_response),
             )
+            # Canonical sync: the row just persisted is authoritative. Tell
+            # the frontend its exact text so the live bubble converges to it
+            # (same condition as the persist above: skipped/cancelled turns
+            # persist nothing and therefore emit no canonical event).
+            try:
+                await send_canonical_final(
+                    websocket_send,
+                    history_uid=context.history_uid,
+                    request_id=latency.request_id,
+                    text=full_response,
+                )
+            except Exception:
+                pass
             if not skip_history and not proactive:
                 observer = getattr(
                     context.agent_engine,
