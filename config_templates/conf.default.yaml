@@ -487,8 +487,8 @@ character_config:
 
     elevenlabs_tts:
       api_key: ''
-      voice_id: '' # Voice ID from ElevenLabs
-      model_id: 'eleven_multilingual_v2' # Model ID (e.g., eleven_multilingual_v2)
+      voice_id: 'obflpiaPKugbCJ9NMBBv' # Voice ID from ElevenLabs
+      model_id: 'eleven_v3_conversational' # Model ID (e.g., eleven_v3_conversational)
       output_format: 'mp3_44100_128' # Output audio format (e.g., mp3_44100_128)
       stability: 0.5 # Voice stability (0.0 to 1.0)
       similarity_boost: 0.5 # Voice similarity boost (0.0 to 1.0)
