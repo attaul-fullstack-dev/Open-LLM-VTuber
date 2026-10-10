@@ -50,7 +50,7 @@ async def safe_send(websocket_send: WebSocketSend, payload: str) -> bool:
 # same caps pre-send; the server re-checks authoritatively because clients
 # are untrusted. Wire budget: aggregate raw bytes * 4/3 (base64) must stay
 # well under uvicorn's 16 MiB ws-max-size for the whole JSON message.
-MAX_IMAGES_PER_MESSAGE = 5
+MAX_IMAGES_PER_MESSAGE = 10
 MAX_IMAGE_FILE_BYTES = 5 * 1024 * 1024
 MAX_IMAGES_TOTAL_BYTES = 10 * 1024 * 1024
 

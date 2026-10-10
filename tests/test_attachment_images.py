@@ -158,6 +158,24 @@ class SanitizeLimitTests(unittest.TestCase):
             [(e["name"], e["reason"]) for e in errors], [("big.png", "too-large")]
         )
 
+    def test_boundary_ten_accepted_eleventh_refused(self):
+        images = [img(f"f{i}.png", n=10) for i in range(10)]
+        valid, errors = sanitize_images(images)
+        self.assertEqual(len(valid), 10)
+        self.assertEqual(errors, [])
+        images.append(img("f10.png", n=10))
+        valid, errors = sanitize_images(images)
+        self.assertEqual(len(valid), 10)
+        self.assertEqual([(e["name"], e["reason"]) for e in errors],
+                         [("f10.png", "too-many")])
+
+    def test_small_counts_always_pass(self):
+        for n in (1, 2, 5):
+            valid, errors = sanitize_images(
+                [img(f"f{i}.png", n=10) for i in range(n)])
+            self.assertEqual(len(valid), n, f"n={n}")
+            self.assertEqual(errors, [], f"n={n}")
+
     def test_count_cap_keeps_first_in_order(self):
         images = [img(f"f{i}.png", n=10) for i in range(MAX_IMAGES_PER_MESSAGE + 2)]
         valid, errors = sanitize_images(images)
