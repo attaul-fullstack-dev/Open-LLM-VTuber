@@ -25,6 +25,11 @@ from ..service_context import ServiceContext
 from ..chat_history_manager import store_message
 from .tts_manager import TTSTaskManager
 
+# Strong references to in-flight group attachment capture tasks (see usage
+# below). Same contract as the single-conversation path: an unreferenced task
+# may be garbage-collected mid-flight, losing the memory record.
+_GROUP_ATTACHMENT_CAPTURE_TASKS: set[asyncio.Task] = set()
+
 
 async def process_group_conversation(
     client_contexts: Dict[str, ServiceContext],
@@ -307,6 +312,32 @@ async def handle_group_member_turn(
             )
         else:
             logger.debug("Skipping storing AI response to history (proactive speak)")
+
+        # Attachment capture runs after this member's response is persisted,
+        # never blocking it: one batched describe call + validated store,
+        # fail-soft. Mirrors the single-conversation path; only turns that
+        # carried sanitized images qualify, and each character stores its own
+        # copy under its own conf_uid.
+        proactive = bool((metadata or {}).get("request_origin") == "proactive")
+        if images and not proactive and context.history_uid:
+            capture = getattr(context.agent_engine, "capture_attachment_memory", None)
+            if callable(capture):
+                try:
+                    task = asyncio.create_task(
+                        capture(
+                            images,
+                            new_context,
+                            context.history_uid,
+                            str((metadata or {}).get("latency_request_id") or ""),
+                        )
+                    )
+                    _GROUP_ATTACHMENT_CAPTURE_TASKS.add(task)
+                    task.add_done_callback(_GROUP_ATTACHMENT_CAPTURE_TASKS.discard)
+                except Exception as error:
+                    logger.debug(
+                        "Attachment capture scheduling skipped: type={}",
+                        type(error).__name__,
+                    )
 
     state.memory_index[current_member_uid] = len(state.conversation_history)
     state.group_queue.append(current_member_uid)
