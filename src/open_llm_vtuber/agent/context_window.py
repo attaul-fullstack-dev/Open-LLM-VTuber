@@ -20,6 +20,9 @@ KNOWN_CONTEXT_LIMITS: Dict[str, int] = {
     "mistral-small-2603": 256_000,
     "mistral-small-2506": 128_000,
     "openai/gpt-oss-20b": 131_072,
+    # Both tags resolve to the same Gemma 4 31B dense checkpoint; the provider
+    # reports gemma4.context_length=262144 for either one.
+    "gemma4:31b": 262_144,
     "gemma4:31b-cloud": 262_144,
 }
 

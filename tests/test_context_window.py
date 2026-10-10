@@ -126,6 +126,59 @@ class ContextWindowTests(unittest.TestCase):
         self.assertEqual(limit, 262_144)
         self.assertFalse(used_fallback)
 
+    def test_ollama_gemma4_31b_production_alias_does_not_use_fallback(self):
+        limit, used_fallback = resolve_context_limit("gemma4:31b")
+        self.assertEqual(limit, 262_144)
+        self.assertFalse(used_fallback)
+        self.assertNotEqual(limit, DEFAULT_CONTEXT_LIMIT)
+
+    def test_gemma4_31b_aliases_share_the_same_context_limit(self):
+        cloud_limit, _ = resolve_context_limit("gemma4:31b-cloud")
+        local_limit, _ = resolve_context_limit("gemma4:31b")
+        self.assertEqual(cloud_limit, local_limit)
+
+    def test_gemma4_31b_input_budget_keeps_reserved_output_and_margin(self):
+        selection = select_messages_for_context(
+            messages=[message("user", "halo")],
+            system_prompt="persona Mili",
+            model="gemma4:31b",
+            reserved_output_tokens=None,
+            safety_margin=1024,
+            protected_start=0,
+        )
+        self.assertEqual(selection.stats.context_limit, 262_144)
+        self.assertEqual(selection.stats.reserved_output, 1024)
+        self.assertEqual(selection.stats.safety_margin, 1024)
+        self.assertEqual(selection.stats.maximum_input_budget, 260_096)
+        self.assertFalse(selection.stats.used_fallback_limit)
+
+    def test_gemma4_31b_accepts_ten_images_within_budget(self):
+        ten_images = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "tolong lihat semua gambar ini"},
+                *(
+                    {"type": "image_url", "image_url": {"url": data_url}}
+                    for data_url in (
+                        "data:image/jpeg;base64," + "A" * 200_000 for _ in range(10)
+                    )
+                ),
+            ],
+        }
+        selection = select_messages_for_context(
+            messages=[ten_images],
+            system_prompt="persona " + "Mili " * 1800,
+            model="gemma4:31b",
+            reserved_output_tokens=None,
+            safety_margin=1024,
+            protected_start=0,
+        )
+        self.assertFalse(selection.stats.trimmed)
+        self.assertLessEqual(
+            selection.stats.estimated_input_tokens,
+            selection.stats.maximum_input_budget,
+        )
+
     def test_reserved_output_and_safety_margin_reduce_input_budget(self):
         selection = select_messages_for_context(
             messages=[message("user", "halo")],
