@@ -34,6 +34,9 @@ from ..agent.output_types import SentenceOutput, AudioOutput
 # Strong references to in-flight episodic capture tasks (see usage below).
 _EPISODIC_CAPTURE_TASKS: "set[asyncio.Task]" = set()
 
+# Strong references to in-flight attachment capture tasks (see usage below).
+_ATTACHMENT_CAPTURE_TASKS: "set[asyncio.Task]" = set()
+
 
 async def process_single_conversation(
     context: ServiceContext,
@@ -408,6 +411,31 @@ async def process_single_conversation(
                 except Exception as error:
                     logger.debug(
                         "Episodic capture scheduling skipped: type={}",
+                        type(error).__name__,
+                    )
+        # Attachment capture runs after the user-visible response, never
+        # blocking it: one batched describe call + validated store,
+        # fail-soft. Only turns that carried sanitized images qualify.
+        if images and not proactive and context.history_uid:
+            capture = getattr(context.agent_engine, "capture_attachment_memory", None)
+            if callable(capture):
+                try:
+                    task = asyncio.create_task(
+                        capture(
+                            images,
+                            input_text,
+                            context.history_uid,
+                            latency.request_id,
+                        )
+                    )
+                    # Strong reference until done: an unreferenced task may be
+                    # garbage-collected mid-flight, losing the record and its
+                    # latency measurement. Never awaited here.
+                    _ATTACHMENT_CAPTURE_TASKS.add(task)
+                    task.add_done_callback(_ATTACHMENT_CAPTURE_TASKS.discard)
+                except Exception as error:
+                    logger.debug(
+                        "Attachment capture scheduling skipped: type={}",
                         type(error).__name__,
                     )
         return full_response  # Return accumulated full_response

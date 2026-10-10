@@ -23,6 +23,7 @@ from .chat_history_manager import (
     get_history_list,
     update_metadate,
 )
+from .attachment_memory import delete_attachment_memories_for_session
 from .config_manager.utils import scan_config_alts_directory, scan_bg_directory
 from .conversations.conversation_handler import (
     handle_conversation_trigger,
@@ -904,6 +905,9 @@ class WebSocketHandler:
             "delete-character-memory": self._handle_delete_character_memory,
             "reset-character-memory": self._handle_reset_character_memory,
             "reset-character-state": self._handle_reset_character_state,
+            "fetch-attachment-memories": self._handle_fetch_attachment_memories,
+            "delete-attachment-memory": self._handle_delete_attachment_memory,
+            "clear-attachment-memories": self._handle_clear_attachment_memories,
             "interrupt-signal": self._handle_interrupt,
             "mic-audio-data": self._handle_audio_data,
             "mic-audio-end": self._handle_conversation_trigger,
@@ -1498,6 +1502,21 @@ class WebSocketHandler:
             context.character_config.conf_uid,
             history_uid,
         )
+        if success:
+            # Attachment memories reference their source conversation, so
+            # they must not outlive it. Episodic events intentionally keep
+            # their own lifecycle and are NOT cascaded here.
+            removed_attachments = delete_attachment_memories_for_session(
+                context.character_config.conf_uid,
+                history_uid,
+            )
+            if removed_attachments:
+                logger.info(
+                    "Attachment memories cascaded with history delete: "
+                    "history_uid={} removed={}",
+                    history_uid,
+                    removed_attachments,
+                )
         await websocket.send_text(
             json.dumps(
                 {
@@ -1664,6 +1683,78 @@ class WebSocketHandler:
                     {
                         "type": "character-state-reset",
                         "success": success,
+                    }
+                )
+            )
+        finally:
+            await self._resume_proactive_after_maintenance(client_uid, context)
+
+    async def _handle_fetch_attachment_memories(
+        self, websocket: WebSocket, client_uid: str, data: WSMessage
+    ) -> None:
+        """Return Mili's stored attachment memories (metadata + summaries)."""
+        context = self.client_contexts[client_uid]
+        memories = getattr(
+            context.agent_engine, "list_attachment_memories", lambda: []
+        )()
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "type": "attachment-memories",
+                    "memories": memories or [],
+                }
+            )
+        )
+
+    async def _handle_delete_attachment_memory(
+        self, websocket: WebSocket, client_uid: str, data: WSMessage
+    ) -> None:
+        """Forget one stored attachment memory (by record id).
+
+        Coordinated purge: the record plus the episodic events quoting it.
+        Transcript rows, rolling summaries, character facts, and world state
+        cannot be surgically removed and are reported back when they still
+        hold copies.
+        """
+        await self._pause_proactive_for_maintenance(client_uid)
+        context = self.client_contexts[client_uid]
+        try:
+            record_id = str(data.get("record_id", "") or "")
+            purge = getattr(context.agent_engine, "purge_attachment_memory", None)
+            status = (
+                dict(purge(record_id))
+                if (record_id and callable(purge))
+                else {"found": False, "record_id": record_id, "complete": False}
+            )
+            success = bool(status.get("attachment_removed", False))
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "attachment-memory-deleted",
+                        "success": success,
+                        "record_id": record_id,
+                        "purge": status,
+                    }
+                )
+            )
+        finally:
+            await self._resume_proactive_after_maintenance(client_uid, context)
+
+    async def _handle_clear_attachment_memories(
+        self, websocket: WebSocket, client_uid: str, data: WSMessage
+    ) -> None:
+        """Forget all stored attachment memories for this character."""
+        await self._pause_proactive_for_maintenance(client_uid)
+        context = self.client_contexts[client_uid]
+        try:
+            clear = getattr(context.agent_engine, "clear_attachment_memories", None)
+            removed = int(clear() if callable(clear) else 0)
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "attachment-memories-cleared",
+                        "success": True,
+                        "removed": removed,
                     }
                 )
             )

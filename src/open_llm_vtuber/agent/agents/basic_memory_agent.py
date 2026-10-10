@@ -111,6 +111,15 @@ from ...episodic_memory import (
     render_episodic_context,
     retrieve_episodic_events,
 )
+from ...attachment_memory import (
+    clear_attachment_memories,
+    delete_attachment_memory,
+    describe_and_store_attachments,
+    load_attachment_memories,
+    purge_attachment_memory,
+    render_attachment_context,
+    retrieve_attachment_memories,
+)
 import time
 from ...request_latency import (
     get_latency_tracker,
@@ -234,6 +243,8 @@ class BasicMemoryAgent(AgentInterface):
         # Per-turn episodic retrieval selection (query, events), shared by the
         # prompt block and the Autonomous Decision Layer.
         self._episodic_selection_cache: Any = None
+        # Per-turn attachment retrieval selection (query, records).
+        self._attachment_selection_cache: Any = None
 
         self._formatted_tools_openai = []
         self._formatted_tools_claude = []
@@ -660,6 +671,19 @@ class BasicMemoryAgent(AgentInterface):
             episodic_block = ""
         if episodic_block:
             parts.append(episodic_block)
+        # Attachment memories: metadata + factual summaries of files shared
+        # in any session, retrieved against the latest user turn. Separate
+        # block from episodic events; empty when nothing relevant scores.
+        # Failed (never-read) attachments are never retrieved.
+        try:
+            attachment_block = self._attachment_context_for_prompt()
+        except Exception as error:
+            logger.warning(
+                "Attachment retrieval skipped: type={}", type(error).__name__
+            )
+            attachment_block = ""
+        if attachment_block:
+            parts.append(attachment_block)
         # Backend-verified memory receipt (PERSIST-6042 fix, part B): when
         # this turn carried an explicit remember/forget request, the write
         # already ran pre-turn and this block states the VERIFIED outcome.
@@ -1357,6 +1381,172 @@ class BasicMemoryAgent(AgentInterface):
                 round(elapsed_ms, 2),
             )
 
+    def _attachment_selection(self) -> List[Dict[str, Any]]:
+        """ONE deterministic attachment retrieval per turn (mirrors episodic).
+
+        Loads this character's attachment store and scores only PROCESSED
+        records against the current turn's clean query. Cached per query for
+        the turn. Emits telemetry counts only — never summaries or filenames.
+        """
+        query = self._episodic_query_text()
+        if not self._character_conf_uid or not query:
+            return []
+        cached = getattr(self, "_attachment_selection_cache", None)
+        if isinstance(cached, tuple) and cached[0] == query:
+            return list(cached[1])
+        started = time.perf_counter()
+        records = load_attachment_memories(self._character_conf_uid) or []
+        if not records:
+            logger.debug("Attachment retrieval: no stored records.")
+            self._attachment_selection_cache = (query, [])
+            return []
+        selected = retrieve_attachment_memories(records, query) or []
+        elapsed_ms = round((time.perf_counter() - started) * 1000.0, 2)
+        if selected:
+            logger.info(
+                "Attachment retrieval: records={} selected={} elapsed_ms={}",
+                len(records),
+                len(selected),
+                elapsed_ms,
+            )
+        else:
+            logger.debug(
+                "Attachment retrieval: no relevant record for query_chars={} records={}.",
+                len(query),
+                len(records),
+            )
+        self._attachment_selection_cache = (query, list(selected))
+        return list(selected)
+
+    def _attachment_context_for_prompt(self) -> str:
+        """Render relevant attachment memories for the current turn.
+
+        Fail-soft: any problem yields "" and the turn is unaffected.
+        Never writes, never calls a model.
+        """
+        if not self._character_conf_uid:
+            return ""
+        selected = self._attachment_selection()
+        if not selected:
+            return ""
+        return render_attachment_context(
+            selected, tz=getattr(self, "_user_timezone", None)
+        )
+
+    async def capture_attachment_memory(
+        self,
+        images: List[Dict[str, Any]],
+        user_text: str,
+        history_uid: str,
+        request_id: str = "",
+    ) -> None:
+        """Fire-and-forget attachment capture for one completed turn.
+
+        Runs after the user-visible response; a single batched describe call
+        over the turn's images, then one stored record per attachment
+        (processed with a factual summary, or failed with an empty one).
+        Never raises; never blocks the conversation.
+        """
+        started = time.perf_counter()
+        outcome = "skipped"
+        try:
+            if not self._character_conf_uid or not history_uid:
+                return
+            if not images:
+                return
+            outcome = "rejected"
+            llm = getattr(self, "_llm", None)
+            chat_fn = getattr(llm, "chat_completion", None)
+            if not callable(chat_fn):
+                return
+            stored = await describe_and_store_attachments(
+                chat_fn,
+                self._character_conf_uid,
+                images,
+                user_text or "",
+                history_uid,
+                request_id or "",
+                utcnow(),
+                getattr(self, "_user_timezone", None),
+                summary_model=str(getattr(llm, "model", "") or ""),
+            )
+            if stored:
+                processed = sum(
+                    1 for item in stored if item.get("status") == "processed"
+                )
+                if processed == len(stored):
+                    outcome = "stored"
+                elif processed > 0:
+                    outcome = "partial"
+                else:
+                    outcome = "failed"
+            else:
+                outcome = "duplicate"
+        except Exception as error:
+            outcome = "error"
+            logger.warning(
+                "Attachment capture failed (turn unaffected): type={}",
+                type(error).__name__,
+            )
+        finally:
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            try:
+                tracker = get_latency_tracker()
+                if tracker:
+                    tracker.add_time("attachment_ms", elapsed_ms)
+            except Exception as error:
+                logger.debug(
+                    "Attachment latency tracker write skipped: type={}",
+                    type(error).__name__,
+                )
+            logger.info(
+                "Attachment capture latency: outcome={} elapsed_ms={}",
+                outcome,
+                round(elapsed_ms, 2),
+            )
+
+    def list_attachment_memories(self) -> List[Dict[str, Any]]:
+        """Return this character's attachment records (metadata only)."""
+        if not self._character_conf_uid:
+            return []
+        return load_attachment_memories(self._character_conf_uid)
+
+    def remove_attachment_memory(self, record_id: str) -> bool:
+        """Forget one stored attachment record by id."""
+        if not self._character_conf_uid or not record_id:
+            return False
+        removed = delete_attachment_memory(self._character_conf_uid, record_id)
+        logger.info(
+            "Attachment memory removal: record_removed={}",
+            removed,
+        )
+        return removed
+
+    def clear_attachment_memories(self) -> int:
+        """Forget all stored attachment records; returns the removed count."""
+        if not self._character_conf_uid:
+            return 0
+        removed = clear_attachment_memories(self._character_conf_uid)
+        logger.info(
+            "Attachment memories cleared: removed={}",
+            removed,
+        )
+        return removed
+
+    def purge_attachment_memory(self, record_id: str) -> Dict[str, Any]:
+        """Coordinated deletion for one attachment: record + episodic copies.
+
+        Transcript rows, rolling summaries, character facts, and world state
+        are reported as remaining when they still quote the attachment.
+        """
+        if not self._character_conf_uid or not record_id:
+            return {
+                "found": False,
+                "record_id": str(record_id or ""),
+                "complete": False,
+            }
+        return purge_attachment_memory(self._character_conf_uid, record_id)
+
     def observe_character_events(
         self,
         user_text: str,
@@ -1945,6 +2135,7 @@ class BasicMemoryAgent(AgentInterface):
         # New turn: drop the previous selection so a stale recall can never
         # leak into this turn's prompt or decision context.
         self._episodic_selection_cache = None
+        self._attachment_selection_cache = None
         messages = self._memory.copy()
         user_content = []
         text_prompt = self._to_text_prompt(input_data)

@@ -314,6 +314,32 @@ def save_episodic_events(conf_uid: str, events: List[Dict[str, Any]]) -> bool:
         return False
 
 
+def delete_episodic_events_by_ids(
+    conf_uid: str, event_ids: List[str]
+) -> Dict[str, Any]:
+    """Delete episodic events by exact id; nothing else is touched.
+
+    Returns ``{"removed": [...], "missing": [...], "saved": bool}``.
+    ``saved`` is False only when a matched event could not be persisted
+    away (then nothing was removed). An empty id list is a no-op success
+    that performs no write.
+    """
+    wanted = {str(item) for item in (event_ids or []) if str(item)}
+    if not wanted:
+        return {"removed": [], "missing": [], "saved": True}
+    events = load_episodic_events(conf_uid)
+    kept = [item for item in events if str(item.get("id", "")) not in wanted]
+    removed = [
+        item.get("id", "") for item in events if str(item.get("id", "")) in wanted
+    ]
+    missing = sorted(wanted - {str(item.get("id", "")) for item in events})
+    if not removed:
+        return {"removed": [], "missing": missing, "saved": True}
+    if not save_episodic_events(conf_uid, kept):
+        return {"removed": [], "missing": missing, "saved": False}
+    return {"removed": removed, "missing": missing, "saved": True}
+
+
 def _normalize_event_text(text: Any) -> str:
     return " ".join(str(text or "").lower().split()).strip(" .,!?;:，。！？；：")
 
