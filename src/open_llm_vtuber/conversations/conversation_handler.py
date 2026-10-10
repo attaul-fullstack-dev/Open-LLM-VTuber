@@ -11,7 +11,7 @@ from ..chat_history_manager import store_message
 from ..service_context import ServiceContext
 from .group_conversation import process_group_conversation
 from .single_conversation import process_single_conversation
-from .conversation_utils import EMOJI_LIST, safe_send
+from .conversation_utils import EMOJI_LIST, safe_send, sanitize_images
 from .types import GroupConversationState
 from prompts import prompt_loader
 
@@ -80,6 +80,25 @@ async def handle_conversation_trigger(
             return
 
     images = data.get("images")
+    # Multi-attachment gate: validate every file independently, keep the
+    # valid subset in order, and report each skip to the sender by name.
+    # The turn below (single or group path) always receives the sanitized
+    # list, so one bad file can never poison its siblings.
+    request_id = (metadata or {}).get("latency_request_id")
+    images, image_errors = sanitize_images(images, request_id=request_id)
+    if image_errors:
+        skipped = ", ".join(
+            f"{err['name']} ({err['reason']})" for err in image_errors
+        )
+        await safe_send(
+            websocket.send_text,
+            json.dumps(
+                {
+                    "type": "error",
+                    "message": f"Skipped {len(image_errors)} attachment(s): {skipped}",
+                }
+            ),
+        )
     session_emoji = np.random.choice(EMOJI_LIST)
 
     group = chat_group_manager.get_client_group(client_uid)

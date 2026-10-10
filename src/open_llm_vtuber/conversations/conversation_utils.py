@@ -1,6 +1,8 @@
 import asyncio
+import base64
+import binascii
 import re
-from typing import Optional, Union, Any, List, Dict
+from typing import Optional, Union, Any, List, Dict, Tuple
 import numpy as np
 import json
 from loguru import logger
@@ -44,6 +46,100 @@ async def safe_send(websocket_send: WebSocketSend, payload: str) -> bool:
 
 
 # Convert class methods to standalone functions
+# Multi-attachment limits for text-input images. The frontend enforces the
+# same caps pre-send; the server re-checks authoritatively because clients
+# are untrusted. Wire budget: aggregate raw bytes * 4/3 (base64) must stay
+# well under uvicorn's 16 MiB ws-max-size for the whole JSON message.
+MAX_IMAGES_PER_MESSAGE = 5
+MAX_IMAGE_FILE_BYTES = 5 * 1024 * 1024
+MAX_IMAGES_TOTAL_BYTES = 10 * 1024 * 1024
+
+_VALID_IMAGE_SOURCES = frozenset({"camera", "screen", "clipboard", "upload"})
+
+
+def _decoded_data_url_bytes(data_url: str) -> Optional[int]:
+    """Decoded byte length of a data-URL payload, or None if undecodable."""
+    try:
+        comma = data_url.index(",")
+        payload = data_url[comma + 1 :]
+        if not payload:
+            return None
+        return len(base64.b64decode(payload, validate=True))
+    except (ValueError, binascii.Error):
+        return None
+
+
+def sanitize_images(
+    images: Any, request_id: Optional[str] = None
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Split text-input attachments into (valid, errors).
+
+    Every accepted entry keeps its original dict untouched (including any
+    client `name`/`size` keys) and its position, so ordering is preserved
+    and same-name/same-content files can never overwrite each other — there
+    is no name- or content-keyed lookup anywhere on this path.
+
+    Each error is {"index", "name", "reason"} with reason in:
+    not-a-list, not-a-dict, bad-source, unsupported-type, bad-data,
+    too-large, too-many, total-too-large. Callers report errors to the user
+    (error event) and continue the turn with the valid subset; they must
+    never silently claim skipped files were processed. Pure w.r.t. the
+    turn: per-message state only, nothing stored, nothing written to disk.
+    """
+    if images is None:
+        return [], []
+    if not isinstance(images, list):
+        logger.warning(
+            "Attachments rejected (request_id={}): 'images' is {}, not a list",
+            request_id,
+            type(images).__name__,
+        )
+        return [], [{"index": -1, "name": "images", "reason": "not-a-list"}]
+    valid: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+    total_bytes = 0
+    for index, entry in enumerate(images):
+        fallback = f"image #{index + 1}"
+        if not isinstance(entry, dict):
+            errors.append({"index": index, "name": fallback, "reason": "not-a-dict"})
+            continue
+        name = entry.get("name")
+        label = name if isinstance(name, str) and name else fallback
+        if entry.get("source") not in _VALID_IMAGE_SOURCES:
+            errors.append({"index": index, "name": label, "reason": "bad-source"})
+            continue
+        mime = entry.get("mime_type")
+        if not isinstance(mime, str) or not mime.startswith("image/"):
+            errors.append({"index": index, "name": label, "reason": "unsupported-type"})
+            continue
+        data = entry.get("data")
+        if not isinstance(data, str) or not data.startswith("data:image/"):
+            errors.append({"index": index, "name": label, "reason": "bad-data"})
+            continue
+        size = _decoded_data_url_bytes(data)
+        if size is None:
+            errors.append({"index": index, "name": label, "reason": "bad-data"})
+            continue
+        if size > MAX_IMAGE_FILE_BYTES:
+            errors.append({"index": index, "name": label, "reason": "too-large"})
+            continue
+        if len(valid) >= MAX_IMAGES_PER_MESSAGE:
+            errors.append({"index": index, "name": label, "reason": "too-many"})
+            continue
+        if total_bytes + size > MAX_IMAGES_TOTAL_BYTES:
+            errors.append({"index": index, "name": label, "reason": "total-too-large"})
+            continue
+        total_bytes += size
+        valid.append(entry)
+    if errors:
+        logger.warning(
+            "Attachments skipped (request_id={}): {}",
+            request_id,
+            [(e["name"], e["reason"]) for e in errors],
+        )
+    return valid, errors
+
+
 def create_batch_input(
     input_text: str,
     images: Optional[List[Dict[str, Any]]],
@@ -264,9 +360,7 @@ async def finalize_conversation_turn(
     tracker = get_latency_tracker()
     if tts_manager.task_list:
         await asyncio.gather(*tts_manager.task_list)
-        await safe_send(
-            websocket_send, json.dumps({"type": "backend-synth-complete"})
-        )
+        await safe_send(websocket_send, json.dumps({"type": "backend-synth-complete"}))
 
         if tracker:
             tracker.mark("playback_start")
