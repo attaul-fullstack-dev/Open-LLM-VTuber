@@ -728,7 +728,7 @@ def remove_character_memory(conf_uid: str, text: str) -> Optional[CharacterState
 
 
 def remove_character_memory_count(
-    conf_uid: str, text: str
+    conf_uid: str, text: str, *, exact: bool = False
 ) -> tuple[Optional[CharacterState], int]:
     """Remove stored facts overlapping the given text.
 
@@ -737,19 +737,29 @@ def remove_character_memory_count(
     with a non-None state means nothing matched -- which callers must not
     report as a removal. (The boolean-only wrapper above maps that case to
     success for legacy callers, so receipt paths should prefer the count.)
+
+    ``exact=True`` deletes only rows whose normalized text equals the target.
+    The Memory Manager UI sends the exact stored text of the row the user
+    picked, so it must use ``exact=True``: the default overlap rule
+    (``target in text or text in target``) once deleted BOTH
+    ``"nantii"`` and ``"nantii [User has also provided images"`` for a single
+    delete of ``"nantii"``. The chat forget-command path keeps the default,
+    because a spoken phrase (``"lupain soal gw suka kopi"``) rarely equals
+    the stored fact (``"gw suka kopi"``) verbatim.
     """
     target = _normalize_memory_text(text)
     if not target:
         return load_character_state(conf_uid), 0
     state = load_character_state(conf_uid)
-    remaining = [
-        item
-        for item in state.memories
-        if not (
-            target in _normalize_memory_text(str(item.get("text", "")))
-            or _normalize_memory_text(str(item.get("text", ""))) in target
-        )
-    ]
+    remaining = []
+    for item in state.memories:
+        norm = _normalize_memory_text(str(item.get("text", "")))
+        if exact:
+            drop = bool(norm) and norm == target
+        else:
+            drop = bool(norm) and (target in norm or norm in target)
+        if not drop:
+            remaining.append(item)
     removed = len(state.memories) - len(remaining)
     if removed == 0:
         return state, 0

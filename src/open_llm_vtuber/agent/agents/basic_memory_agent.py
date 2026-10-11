@@ -1006,12 +1006,17 @@ class BasicMemoryAgent(AgentInterface):
         )
         return True
 
-    def remove_character_memory(self, text: str) -> bool:
+    def remove_character_memory(self, text: str, *, exact: bool = False) -> bool:
         """Forget stored facts overlapping the given text (character-level).
 
         True only when at least one row was actually removed. A request that
         matched nothing returns False (rather than a phantom success), so the
         memory receipt cannot assert a removal that never happened.
+
+        ``exact=True`` removes only the row whose normalized text equals the
+        target. The Memory Manager UI passes the exact stored text, so it
+        must use this mode; the default overlap mode is for spoken forget
+        commands whose phrasing differs from the stored fact.
         """
         if not self._character_conf_uid:
             return False
@@ -1019,7 +1024,7 @@ class BasicMemoryAgent(AgentInterface):
             from ...character_state import remove_character_memory_count
 
             state, removed = remove_character_memory_count(
-                self._character_conf_uid, text
+                self._character_conf_uid, text, exact=exact
             )
         except Exception:
             state, removed = None, 0
@@ -1103,8 +1108,28 @@ class BasicMemoryAgent(AgentInterface):
             return 0
 
     def list_character_memories(self) -> List[Dict[str, Any]]:
-        """Return stored long-term facts (for backend controls / future UI)."""
-        return list(self._character_state.memories)
+        """Return stored long-term facts (for backend controls / future UI).
+
+        Always re-reads the authoritative file instead of serving the
+        agent's in-memory snapshot. The snapshot is loaded once per history
+        resume, so facts stored afterwards -- by a sibling connection, by a
+        proactive turn on another client, or through any path that does not
+        rebind this agent -- would otherwise be missing from the Memory
+        Manager UI while Mili already recalls them. Fail-soft: on any read
+        problem, falls back to the snapshot rather than an empty list.
+        """
+        conf_uid = getattr(self, "_character_conf_uid", None)
+        if conf_uid:
+            try:
+                fresh = load_character_state(conf_uid)
+                return list(fresh.memories)
+            except Exception as error:
+                logger.debug(
+                    "Character memory list fell back to snapshot: type={}",
+                    type(error).__name__,
+                )
+        state = getattr(self, "_character_state", None)
+        return list(getattr(state, "memories", None) or [])
 
     async def ensure_conversation_title(self) -> str:
         """Generate and persist ONE title for the active conversation, or "".

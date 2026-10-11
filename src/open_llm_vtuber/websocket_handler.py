@@ -1702,13 +1702,27 @@ class WebSocketHandler:
     async def _handle_delete_character_memory(
         self, websocket: WebSocket, client_uid: str, data: dict
     ) -> None:
-        """Forget one stored long-term fact (by text)."""
+        """Forget one stored long-term fact (by text).
+
+        The Memory Manager UI sends the exact stored text of the row the
+        user picked, so the removal uses exact matching: the overlap rule
+        once deleted two rows (``"nantii"`` plus
+        ``"nantii [User has also provided images"``) for a single delete of
+        ``"nantii"``. An empty identifier is refused before any agent call,
+        so a malformed request can never become a wipe.
+        """
         await self._pause_proactive_for_maintenance(client_uid)
         context = self.client_contexts[client_uid]
         try:
             text = str(data.get("text", "") or "")
             remove = getattr(context.agent_engine, "remove_character_memory", None)
-            success = bool(text and callable(remove) and remove(text))
+            success = False
+            if text and callable(remove):
+                try:
+                    success = bool(remove(text, exact=True))
+                except TypeError:
+                    # Legacy facade without the keyword: overlap mode.
+                    success = bool(remove(text))
             await websocket.send_text(
                 json.dumps(
                     {
