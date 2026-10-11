@@ -45,7 +45,9 @@ def budget(daily: int = 0, last_proactive=None) -> ProactiveBudgetState:
 
 def write_events(events):
     os.makedirs("episodic", exist_ok=True)
-    with open(os.path.join("episodic", f"{CONF}.json"), "w", encoding="utf-8") as handle:
+    with open(
+        os.path.join("episodic", f"{CONF}.json"), "w", encoding="utf-8"
+    ) as handle:
         json.dump(events, handle)
 
 
@@ -67,7 +69,10 @@ def make_agent():
         live2d_model=SimpleNamespace(extract_emotion=lambda text: []),
         tts_preprocessor_config=TTSPreprocessorConfig(
             remove_special_char=True,
-            translator_config={"translate_audio": False, "translate_provider": "deeplx"},
+            translator_config={
+                "translate_audio": False,
+                "translate_provider": "deeplx",
+            },
         ),
     )
     agent._character_conf_uid = CONF
@@ -121,16 +126,30 @@ class TriggerWiringTest(unittest.TestCase):
         return patch.object(ws_mod, "utcnow", return_value=NOW)
 
     def test_no_goals_no_evidence_stays_low(self):
-        write_events([{"id": "e1", "event_text": "gw coba masak chicken",
-                       "occurred_at": (NOW - timedelta(hours=1)).isoformat()}])
+        write_events(
+            [
+                {
+                    "id": "e1",
+                    "event_text": "gw coba masak chicken",
+                    "occurred_at": (NOW - timedelta(hours=1)).isoformat(),
+                }
+            ]
+        )
         with self._utcnow():
             trigger = self.server._proactive_trigger(self.context, NO_SIGNALS, budget())
         self.assertEqual(trigger.priority, PRIORITY_LOW)
         self.assertEqual(trigger.reason, "generic_idle")
 
     def test_seed_goal_alone_stays_low(self):
-        write_events([{"id": "e1", "event_text": "gw coba masak chicken",
-                       "occurred_at": (NOW - timedelta(hours=1)).isoformat()}])
+        write_events(
+            [
+                {
+                    "id": "e1",
+                    "event_text": "gw coba masak chicken",
+                    "occurred_at": (NOW - timedelta(hours=1)).isoformat(),
+                }
+            ]
+        )
         with self._utcnow():
             trigger = self.server._proactive_trigger(self.context, NO_SIGNALS, budget())
         # goals were seeded on load but none is active yet
@@ -138,23 +157,147 @@ class TriggerWiringTest(unittest.TestCase):
         self.assertEqual(trigger.priority, PRIORITY_LOW)
 
     def test_active_goal_with_evidence_becomes_high(self):
-        write_events([{"id": "e1", "event_text": "gw coba masak chicken",
-                       "occurred_at": (NOW - timedelta(hours=1)).isoformat()}])
+        write_events(
+            [
+                {
+                    "id": "e1",
+                    "event_text": "gw coba masak chicken",
+                    "occurred_at": (NOW - timedelta(hours=1)).isoformat(),
+                }
+            ]
+        )
         self.agent.set_goal_status("try-three-dishes", "active")
         with self._utcnow():
             trigger = self.server._proactive_trigger(self.context, NO_SIGNALS, budget())
         self.assertEqual(trigger.priority, PRIORITY_HIGH)
         self.assertEqual(trigger.reason, "goal_evidence")
-        # and the evidence is pinned, so it cannot fire twice
-        self.agent.set_goal_status("try-three-dishes", "active")  # refused, no-op
+        # The evidence anchor is DEFERRED, not pinned here: while the
+        # evidence is still unconsumed the trigger must keep firing, exactly
+        # like a pending explicit reminder. Pinning at trigger time used to
+        # let a gate-suppressed turn consume the anchor without speaking,
+        # which permanently silenced the goal.
         with self._utcnow():
             repeat = self.server._proactive_trigger(self.context, NO_SIGNALS, budget())
-        self.assertEqual(repeat.priority, PRIORITY_LOW)
-        self.assertEqual(repeat.reason, "generic_idle")
+        self.assertEqual(repeat.priority, PRIORITY_HIGH)
+        self.assertEqual(repeat.reason, "goal_evidence")
+
+    def _goal_row(self, goal_id="try-three-dishes"):
+        from src.open_llm_vtuber.character_state import load_character_state
+
+        for row in load_character_state(CONF).goals or []:
+            if str(row.get("id")) == goal_id:
+                return row
+        return {}
+
+    def test_trigger_detection_does_not_pin_the_anchor(self):
+        write_events(
+            [
+                {
+                    "id": "e1",
+                    "event_text": "gw coba masak chicken",
+                    "occurred_at": (NOW - timedelta(hours=1)).isoformat(),
+                }
+            ]
+        )
+        self.agent.set_goal_status("try-three-dishes", "active")
+        with self._utcnow():
+            self.server._proactive_trigger(self.context, NO_SIGNALS, budget())
+        # detection alone must leave the authoritative file untouched
+        self.assertEqual(self._goal_row().get("last_evidence_id", ""), "")
+
+    def test_suppressed_turn_leaves_the_goal_pending(self):
+        write_events(
+            [
+                {
+                    "id": "e1",
+                    "event_text": "gw coba masak chicken",
+                    "occurred_at": (NOW - timedelta(hours=1)).isoformat(),
+                }
+            ]
+        )
+        self.agent.set_goal_status("try-three-dishes", "active")
+        cfg = ProactiveGateConfig()
+        with self._utcnow():
+            trigger = self.server._proactive_trigger(self.context, NO_SIGNALS, budget())
+        # daily ceiling: the gate suppresses the turn
+        self.assertFalse(
+            evaluate_gate(budget(60), cfg, trigger, now=NOW, tz=JKT).allowed
+        )
+        self.server._discard_pending_goal_evidence(self.context)
+        self.assertEqual(self._goal_row().get("last_evidence_id", ""), "")
+        # and the goal is therefore re-detected rather than lost forever
+        with self._utcnow():
+            again = self.server._proactive_trigger(self.context, NO_SIGNALS, budget())
+        self.assertEqual(again.reason, "goal_evidence")
+
+    def test_dispatch_consumes_the_anchor_exactly_once(self):
+        write_events(
+            [
+                {
+                    "id": "e1",
+                    "event_text": "gw coba masak chicken",
+                    "occurred_at": (NOW - timedelta(hours=1)).isoformat(),
+                }
+            ]
+        )
+        self.agent.set_goal_status("try-three-dishes", "active")
+        with self._utcnow():
+            self.server._proactive_trigger(self.context, NO_SIGNALS, budget())
+        self.server._consume_pending_goal_evidence(self.context)
+        self.assertTrue(self._goal_row().get("last_evidence_id"))
+        # consuming again is a no-op, so the same event cannot retrigger
+        self.server._consume_pending_goal_evidence(self.context)
+        with self._utcnow():
+            after = self.server._proactive_trigger(self.context, NO_SIGNALS, budget())
+        self.assertEqual(after.priority, PRIORITY_LOW)
+
+    def test_anchor_survives_a_concurrent_activation_by_another_session(self):
+        """The deferred pin must be a read-modify-write, not a snapshot save.
+
+        Another session activating the goal after this agent loaded state
+        used to be silently reverted when the anchor was persisted.
+        """
+        from src.open_llm_vtuber.character_state import (
+            load_character_state,
+            save_character_state,
+        )
+
+        write_events(
+            [
+                {
+                    "id": "e1",
+                    "event_text": "gw coba masak chicken",
+                    "occurred_at": (NOW - timedelta(hours=1)).isoformat(),
+                }
+            ]
+        )
+        self.agent.set_goal_status("try-three-dishes", "active")
+        with self._utcnow():
+            self.server._proactive_trigger(self.context, NO_SIGNALS, budget())
+        # a second writer completes the goal on disk behind our back
+        other = load_character_state(CONF)
+        for row in other.goals or []:
+            if row.get("id") == "morning-reading-week":
+                row["status"] = "done"
+        save_character_state(CONF, other)
+        self.server._consume_pending_goal_evidence(self.context)
+        statuses = {
+            str(row.get("id")): str(row.get("status"))
+            for row in load_character_state(CONF).goals or []
+        }
+        self.assertEqual(statuses.get("morning-reading-week"), "done")
+        self.assertTrue(self._goal_row().get("last_evidence_id"))
 
     def test_goal_decision_still_has_to_clear_the_real_gate(self):
-        write_events([{"id": "e1", "event_text": "gw coba masak chicken",
-                       "occurred_at": (NOW - timedelta(hours=1)).isoformat()}])
+        write_events(
+            [
+                {
+                    "id": "e1",
+                    "event_text": "gw coba masak chicken",
+                    "occurred_at": (NOW - timedelta(hours=1)).isoformat(),
+                }
+            ]
+        )
         self.agent.set_goal_status("try-three-dishes", "active")
         cfg = ProactiveGateConfig()
         with self._utcnow():
@@ -177,8 +320,15 @@ class TriggerWiringTest(unittest.TestCase):
         )
 
     def test_done_goal_no_longer_produces_evidence(self):
-        write_events([{"id": "e1", "event_text": "gw coba masak chicken",
-                       "occurred_at": (NOW - timedelta(hours=1)).isoformat()}])
+        write_events(
+            [
+                {
+                    "id": "e1",
+                    "event_text": "gw coba masak chicken",
+                    "occurred_at": (NOW - timedelta(hours=1)).isoformat(),
+                }
+            ]
+        )
         self.agent.set_goal_status("try-three-dishes", "active")
         self.agent.set_goal_status("try-three-dishes", "done")
         with self._utcnow():
@@ -186,15 +336,24 @@ class TriggerWiringTest(unittest.TestCase):
         self.assertEqual(trigger.priority, PRIORITY_LOW)
 
     def test_stale_evidence_does_not_trigger(self):
-        write_events([{"id": "e1", "event_text": "gw coba masak chicken",
-                       "occurred_at": (NOW - timedelta(days=30)).isoformat()}])
+        write_events(
+            [
+                {
+                    "id": "e1",
+                    "event_text": "gw coba masak chicken",
+                    "occurred_at": (NOW - timedelta(days=30)).isoformat(),
+                }
+            ]
+        )
         self.agent.set_goal_status("try-three-dishes", "active")
         with self._utcnow():
             trigger = self.server._proactive_trigger(self.context, NO_SIGNALS, budget())
         self.assertEqual(trigger.priority, PRIORITY_LOW)
 
     def test_agent_without_the_facade_is_fail_soft(self):
-        bare = SimpleNamespace(history_uid="h1", user_timezone=JKT, agent_engine=object())
+        bare = SimpleNamespace(
+            history_uid="h1", user_timezone=JKT, agent_engine=object()
+        )
         with self._utcnow():
             trigger = self.server._proactive_trigger(bare, NO_SIGNALS, budget())
         self.assertEqual(trigger.priority, PRIORITY_LOW)
@@ -217,8 +376,15 @@ class TriggerWiringTest(unittest.TestCase):
 
     def test_no_llm_call_is_made_by_the_decision_layer(self):
         """The trigger path must not touch the provider at all."""
-        write_events([{"id": "e1", "event_text": "gw coba masak chicken",
-                       "occurred_at": (NOW - timedelta(hours=1)).isoformat()}])
+        write_events(
+            [
+                {
+                    "id": "e1",
+                    "event_text": "gw coba masak chicken",
+                    "occurred_at": (NOW - timedelta(hours=1)).isoformat(),
+                }
+            ]
+        )
         self.agent.set_goal_status("try-three-dishes", "active")
         calls = []
 

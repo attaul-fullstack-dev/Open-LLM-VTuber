@@ -69,7 +69,7 @@ import os
 import threading
 import uuid
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -111,6 +111,13 @@ MIN_ENERGY = 0
 MAX_ENERGY = 100
 
 HISTORY_CAP = 10
+
+# Largest backwards gap between the persisted ``last_update_at`` and the
+# current moment that is still treated as ordinary clock skew and left
+# untouched. Anything further ahead is treated as a corrupt stamp and
+# repaired, because leaving it in place freezes the life state until the
+# wall clock catches up with the forged value.
+_MAX_BACKWARDS_SKEW = timedelta(hours=1)
 
 # Energy delta per elapsed hour, by activity. Positive recovers, negative
 # spends. Deliberately simple linear rates; no physiology simulation.
@@ -223,6 +230,28 @@ def _parse_iso(value: Any, fallback: datetime) -> datetime:
     except (TypeError, ValueError):
         return fallback
     return _ensure_aware(parsed)
+
+
+def _iso_or_none(value: Any) -> Optional[str]:
+    """Normalised UTC ISO string when ``value`` parses, else ``None``.
+
+    Used on load so a hand-edited or corrupted stamp can never enter
+    reconciliation. An unparseable ``activity_started_at`` used to be stored
+    verbatim, and ``_parse_iso`` then substituted the *current* moment as the
+    fallback, which made ``_activity_age_s`` return 0 on every call. That
+    permanently disables activity duration limits, the sleeping early exit
+    and stale-idle decisions, and the bad value was written straight back.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return None
+    return _to_iso(_ensure_aware(parsed))
 
 
 def _to_iso(value: datetime) -> str:
@@ -1156,6 +1185,17 @@ def reconcile(
         last_autonomous_decision_at=getattr(state, "last_autonomous_decision_at", None),
     )
     last = _parse_iso(baseline.last_update_at, moment)
+    repaired_future_stamp = False
+    if moment < last and (last - moment) > _MAX_BACKWARDS_SKEW:
+        # A stamp far ahead of the clock is corrupt (forged/hand-edited), and
+        # returning it unchanged freezes the life state for as long as the
+        # wall clock needs to catch up — years, in practice — because nothing
+        # else ever repairs it. Clamp it to now so the state self-heals.
+        # Small backwards skew (NTP jitter, fake test clocks) keeps the
+        # historical fail-soft "never move backwards" behaviour.
+        baseline.last_update_at = _to_iso(moment)
+        last = moment
+        repaired_future_stamp = True
     if moment < last:
         # Clock skew / backwards fake clock: fail-soft, never move backwards.
         return baseline, False
@@ -1192,6 +1232,9 @@ def reconcile(
         or updated.mood_ttl_turns != baseline.mood_ttl_turns
         or updated.mood_set_at != baseline.mood_set_at
         or updated.last_autonomous_decision_at != baseline.last_autonomous_decision_at
+        # A repaired future stamp must reach disk, otherwise the corruption
+        # is re-read on every load and never heals.
+        or repaired_future_stamp
     )
     if not changed:
         # No material difference: keep the old baseline (including
@@ -1438,6 +1481,16 @@ def _state_from_dict(data: Any, now: datetime, tz: Optional[str] = None) -> Worl
     decision_at = data.get("last_autonomous_decision_at")
     if decision_at is not None:
         decision_at = str(decision_at)
+    # Validate stamps on load: garbage must not survive into reconciliation
+    # (see ``_iso_or_none`` for why an unparseable start stamp freezes the
+    # life state). A missing/invalid start falls back to the last known
+    # update instant so the activity age stays meaningful.
+    last_update_at = _iso_or_none(data.get("last_update_at"))
+    if last_update_at is None:
+        last_update_at = fallback.last_update_at
+    activity_started_at = _iso_or_none(data.get("activity_started_at"))
+    if activity_started_at is None:
+        activity_started_at = last_update_at
     return WorldState(
         location=normalize_location(data.get("location", fallback.location)),
         activity=normalize_activity(data.get("activity", fallback.activity)),
@@ -1446,9 +1499,8 @@ def _state_from_dict(data: Any, now: datetime, tz: Optional[str] = None) -> Worl
         time_context=str(
             data.get("time_context", fallback.time_context) or fallback.time_context
         ),
-        activity_started_at=data.get("activity_started_at")
-        or fallback.activity_started_at,
-        last_update_at=data.get("last_update_at") or fallback.last_update_at,
+        activity_started_at=activity_started_at,
+        last_update_at=last_update_at,
         recent_activity_history=history,
         mood_ttl_turns=ttl,
         mood_set_at=mood_set_at,

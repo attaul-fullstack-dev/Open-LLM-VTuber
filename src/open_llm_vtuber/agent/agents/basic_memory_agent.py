@@ -514,9 +514,7 @@ class BasicMemoryAgent(AgentInterface):
             if recovered and recovered.get("text"):
                 out.append(recovered)
         except Exception as error:
-            logger.debug(
-                "Recovered context skipped: type={}", type(error).__name__
-            )
+            logger.debug("Recovered context skipped: type={}", type(error).__name__)
         return out
 
     @property
@@ -913,8 +911,48 @@ class BasicMemoryAgent(AgentInterface):
             state.goals = updated
             return bool(save_character_state(self._character_conf_uid, state))
         except Exception as error:
+            logger.debug("Goal evidence anchor failed: type={}", type(error).__name__)
+            return False
+
+    def record_goal_evidence_fresh(self, goal_id: str, evidence_id: str) -> bool:
+        """Pin a goal-evidence anchor with a read-modify-write on disk.
+
+        ``record_goal_evidence`` saves whatever snapshot the agent is
+        holding. That snapshot is loaded once per history load, so a goal
+        activated by another session in the meantime is silently reverted
+        when this agent persists. This variant re-reads the authoritative
+        file, applies only the goal anchor, and writes that back, so a
+        concurrent activation survives while the identical anchor is still
+        idempotent (``record_goal_evidence`` only moves on a real change).
+
+        Fail-soft: any read/merge problem falls back to the in-memory
+        snapshot path rather than dropping the anchor entirely.
+        """
+        try:
+            state = getattr(self, "_character_state", None)
+            if state is None:
+                return False
+            try:
+                fresh = load_character_state(self._character_conf_uid)
+            except Exception:
+                fresh = None
+            goals_source = getattr(fresh, "goals", None) if fresh is not None else None
+            if goals_source is None:
+                goals_source = getattr(state, "goals", None)
+            updated, changed = record_goal_evidence(
+                list(goals_source or []), goal_id, evidence_id
+            )
+            if not changed:
+                return False
+            state.goals = updated
+            target = fresh if fresh is not None else state
+            if fresh is not None:
+                fresh.goals = updated
+            return bool(save_character_state(self._character_conf_uid, target))
+        except Exception as error:
             logger.debug(
-                "Goal evidence anchor failed: type={}", type(error).__name__
+                "Goal evidence anchor (fresh) failed: type={}",
+                type(error).__name__,
             )
             return False
 
@@ -1004,9 +1042,7 @@ class BasicMemoryAgent(AgentInterface):
         except Exception:
             return []
 
-    def has_due_future_intention(
-        self, moment: Optional[datetime] = None
-    ) -> bool:
+    def has_due_future_intention(self, moment: Optional[datetime] = None) -> bool:
         """True when a pending reminder is due right now (pure read)."""
         try:
             from ...future_intentions import due_intentions
@@ -1020,9 +1056,7 @@ class BasicMemoryAgent(AgentInterface):
         except Exception:
             return False
 
-    def consume_due_future_intentions(
-        self, moment: Optional[datetime] = None
-    ) -> int:
+    def consume_due_future_intentions(self, moment: Optional[datetime] = None) -> int:
         """Mark all currently-due reminders done and persist. Returns count."""
         try:
             from ...character_state import consume_due_future_intentions as _consume
@@ -1400,9 +1434,12 @@ class BasicMemoryAgent(AgentInterface):
             logger.debug("Attachment retrieval: no stored records.")
             self._attachment_selection_cache = (query, [])
             return []
-        selected = retrieve_attachment_memories(
-            records, query, session_uid=self._history_uid or None
-        ) or []
+        selected = (
+            retrieve_attachment_memories(
+                records, query, session_uid=self._history_uid or None
+            )
+            or []
+        )
         elapsed_ms = round((time.perf_counter() - started) * 1000.0, 2)
         if selected:
             logger.info(
@@ -2204,8 +2241,7 @@ class BasicMemoryAgent(AgentInterface):
                     return " ".join(
                         str(part.get("text", ""))
                         for part in content
-                        if isinstance(part, dict)
-                        and part.get("type") == "text"
+                        if isinstance(part, dict) and part.get("type") == "text"
                     ).strip()
                 return ""
         except Exception:

@@ -195,6 +195,11 @@ class WebSocketHandler:
         self._proactive_gate_config = ProactiveGateConfig()
         self._proactive_machines: Dict[str, ProactiveStateMachine] = {}
         self._proactive_maintenance: set[str] = set()
+        # Goal-evidence anchors detected by a trigger but not yet consumed.
+        # key -> (agent, goal_id, evidence_id). Written by
+        # ``_goal_evidence_trigger`` and consumed only once the V2 gate
+        # allows the turn, so a suppressed turn cannot silently drop a goal.
+        self._pending_goal_evidence: Dict[str, tuple] = {}
 
         # Message handlers mapping
         self._message_handlers = self._init_message_handlers()
@@ -218,6 +223,61 @@ class WebSocketHandler:
             registry = {}
             self.__dict__["_history_subscribers"] = registry
         return registry
+
+    def _pending_goal_evidence_registry(self) -> Dict[str, tuple]:
+        """Deferred goal-evidence anchors, created on demand.
+
+        Lazily initialised so a handler built without ``__init__`` (tests,
+        partial construction) still behaves correctly instead of raising.
+        """
+        registry = self.__dict__.get("_pending_goal_evidence")
+        if registry is None:
+            registry = {}
+            self.__dict__["_pending_goal_evidence"] = registry
+        return registry
+
+    @staticmethod
+    def _goal_evidence_key(context: ServiceContext) -> str:
+        """Character-scoped key for a deferred goal-evidence anchor."""
+        agent = getattr(context, "agent_engine", None)
+        return str(getattr(agent, "_character_conf_uid", None) or id(context))
+
+    def _consume_pending_goal_evidence(self, context: ServiceContext) -> None:
+        """Pin a deferred goal-evidence anchor (dispatch time only).
+
+        Fail-soft: any problem leaves the anchor unpinned so the next cycle
+        re-detects it rather than losing the goal.
+        """
+        registry = self._pending_goal_evidence_registry()
+        key = self._goal_evidence_key(context)
+        entry = registry.pop(key, None)
+        if not entry:
+            return
+        agent, goal_id, evidence_id = entry
+        # Prefer the read-modify-write variant so the anchor cannot revert a
+        # goal another session activated since this agent last loaded state.
+        anchor = getattr(agent, "record_goal_evidence_fresh", None)
+        if not callable(anchor):
+            anchor = getattr(agent, "record_goal_evidence", None)
+        if not callable(anchor):
+            return
+        try:
+            anchor(goal_id, evidence_id)
+        except Exception as error:
+            logger.debug(
+                "Deferred goal evidence anchor failed: type={}",
+                type(error).__name__,
+            )
+
+    def _discard_pending_goal_evidence(self, context: ServiceContext) -> None:
+        """Drop a deferred anchor (gate suppression / disconnect).
+
+        The underlying evidence stays unconsumed on disk, so the goal is
+        simply re-detected on the next cycle.
+        """
+        self._pending_goal_evidence_registry().pop(
+            self._goal_evidence_key(context), None
+        )
 
     @staticmethod
     def _update_user_timezone(context: ServiceContext, data: dict) -> None:
@@ -442,7 +502,15 @@ class WebSocketHandler:
             evidence_id = (getattr(decision, "metadata", {}) or {}).get("evidence_id")
             anchor = getattr(agent, "record_goal_evidence", None)
             if callable(anchor) and goal_id and evidence_id:
-                anchor(goal_id, evidence_id)
+                # DEFERRED, not pinned here. Pinning inside the trigger used
+                # to let a gate-suppressed turn consume the evidence anchor
+                # without ever speaking, which permanently silenced the goal
+                # (classify_goal_evidence then never matched again). Mirror
+                # the explicit-reminder rule: a suppressed turn stays
+                # pending and is re-detected on the next cycle.
+                self._pending_goal_evidence_registry()[
+                    self._goal_evidence_key(context)
+                ] = (agent, goal_id, evidence_id)
             logger.info(
                 "Autonomous decision: outcome={} reason={} goal_id={} "
                 "evidence_id={} priority=high",
@@ -702,6 +770,9 @@ class WebSocketHandler:
                         decision_gate.priority,
                         decision_gate.daily_remaining,
                     )
+                    # Keep any deferred goal-evidence anchor unconsumed so
+                    # the goal survives this suppressed cycle.
+                    self._discard_pending_goal_evidence(context)
                     self._persist_budget(client_uid, conf_uid)
                     # Wait out the current window instead of spinning.
                     await asyncio.sleep(
@@ -728,15 +799,16 @@ class WebSocketHandler:
                     tz=getattr(context, "user_timezone", None),
                 )
                 self._persist_budget(client_uid, conf_uid)
+                # The turn is genuinely dispatched, so a deferred goal
+                # evidence anchor is consumed exactly once here.
+                self._consume_pending_goal_evidence(context)
                 # A dispatched reminder is consumed exactly once, so the same
                 # due row can never nag twice. Suppressed turns never reach
                 # here, so a gate-suppressed reminder stays pending.
                 if str(getattr(trigger, "reason", "")) == "explicit_reminder":
                     try:
                         agent = getattr(context, "agent_engine", None)
-                        consume = getattr(
-                            agent, "consume_due_future_intentions", None
-                        )
+                        consume = getattr(agent, "consume_due_future_intentions", None)
                         if callable(consume):
                             try:
                                 consumed = consume(utcnow())
@@ -1160,8 +1232,10 @@ class WebSocketHandler:
         self._proactive_maintenance.discard(client_uid)
         if client_uid in self.current_conversation_tasks:
             task = self.current_conversation_tasks[client_uid]
-            if task is not None and not task.done() and getattr(
-                task, "_olv_single_turn", False
+            if (
+                task is not None
+                and not task.done()
+                and getattr(task, "_olv_single_turn", False)
             ):
                 # RECONNECT ≠ NEW CONVERSATION: an in-flight single turn is
                 # detached, never cancelled, so its response still persists
@@ -1418,9 +1492,7 @@ class WebSocketHandler:
         try:
             messages = [
                 msg
-                for msg in get_history(
-                    context.character_config.conf_uid, history_uid
-                )
+                for msg in get_history(context.character_config.conf_uid, history_uid)
                 if msg["role"] != "system"
             ]
             await websocket.send_text(
@@ -1886,9 +1958,7 @@ class WebSocketHandler:
                 adopted = False
                 if claimed_uid:
                     try:
-                        if get_metadata(
-                            context.character_config.conf_uid, claimed_uid
-                        ):
+                        if get_metadata(context.character_config.conf_uid, claimed_uid):
                             context.history_uid = claimed_uid
                             context.agent_engine.set_memory_from_history(
                                 conf_uid=context.character_config.conf_uid,

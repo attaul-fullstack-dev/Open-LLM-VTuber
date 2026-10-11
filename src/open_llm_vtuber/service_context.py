@@ -512,9 +512,25 @@ class ServiceContext:
             prompt_content = prompt_loader.load_util(prompt_file)
 
             if prompt_name == "live2d_expression_prompt":
-                prompt_content = prompt_content.replace(
-                    "[<insert_emomap_keys>]", self.live2d_model.emo_str
-                )
+                # A failed/missing Live2D model leaves ``live2d_model`` as
+                # None (see ``init_live2d``). Dereferencing it here used to
+                # raise AttributeError and abort server startup via
+                # run_server.py's ``sys.exit(1)``, so a single bad avatar
+                # name bricked the whole launch. Fail-soft instead: drop the
+                # placeholder and keep the rest of the instructions.
+                emo_map = getattr(self.live2d_model, "emo_str", None) or ""
+                if emo_map:
+                    prompt_content = prompt_content.replace(
+                        "[<insert_emomap_keys>]", emo_map
+                    )
+                else:
+                    logger.warning(
+                        "Live2D emomap unavailable: "
+                        "expression prompt left without markers"
+                    )
+                    prompt_content = prompt_content.replace(
+                        "- [<insert_emomap_keys>]", "(none configured)"
+                    ).replace("[<insert_emomap_keys>]", "")
 
             if prompt_name == "mcp_prompt":
                 continue
