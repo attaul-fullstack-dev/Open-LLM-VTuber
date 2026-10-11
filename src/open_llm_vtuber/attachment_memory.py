@@ -61,11 +61,14 @@ _ATTACHMENT_SOURCES = frozenset({"camera", "screen", "clipboard", "upload"})
 
 ATTACHMENT_SUMMARY_SYSTEM = """You describe attached images factually so they can be remembered later.
 Return JSON only, exactly this shape:
-{"items": [{"index": 0, "visible": true, "summary": "<one or two short factual sentences in the user's language>"}, ...]}
+{"items": [{"index": 0, "visible": true, "summary": "<one or two short factual sentences in Bahasa Indonesia>"}, ...]}
 Rules: one entry per attached image, in order, with the matching index.
-Describe only what is visibly present in each image. Never invent people,
-text, objects, or details that are not clearly visible. If an image is
-blank, unreadable, corrupted, or you cannot see it, use
+Write every summary in Bahasa Indonesia. Describe only what is visibly
+present in each image, including names of objects, context, and any text
+visible in the image where relevant. Keep filenames, URLs, and technical
+identifiers exactly as they appear; do not translate them. Never invent
+people, text, objects, or details that are not clearly visible. If an image
+is blank, unreadable, corrupted, or you cannot see it, use
 {"index": N, "visible": false, "summary": null} for that entry.
 Never describe personality, preferences, or permanent traits of anyone."""
 

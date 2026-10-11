@@ -241,6 +241,21 @@ class DedupTest(TmpCwdTestCase):
 
 
 class PromptParseTest(unittest.TestCase):
+    def test_prompt_instructs_indonesian_summaries(self):
+        # Regression: summaries used to come back in English because the
+        # prompt only asked for "the user's language". The instruction must
+        # name Bahasa Indonesia explicitly while keeping identifiers intact.
+        system, _ = build_attachment_summary_prompt(
+            [image_item("a.png")],
+            "lihat ini",
+            datetime(2026, 10, 9, 10, 0, tzinfo=timezone.utc),
+            None,
+        )
+        self.assertIn("Bahasa Indonesia", system)
+        self.assertNotIn("user's language", system)
+        self.assertIn("JSON", system)
+        self.assertIn("filenames", system)
+
     def test_prompt_carries_all_images_in_order(self):
         items = [image_item("a.png"), image_item("b.png", data=DATA_URL_2)]
         system, messages = build_attachment_summary_prompt(
@@ -312,6 +327,32 @@ class DescribeTest(TmpCwdTestCase):
         self.assertEqual(stored[0]["request_id"], "req-9")
         self.assertEqual(stored[0]["summary_model"], "describe-fake")
         self.assertEqual(len(load_attachment_memories(CONF)), 2)
+
+    def test_indonesian_summary_stored_verbatim(self):
+        # An Indonesian summary from the model is stored exactly as-is:
+        # same status, same schema, no translation or rewriting step.
+        summary = "Iklan lowongan kerja paruh waktu untuk jasa kebersihan."
+        llm = DescribeFakeLLM(describe_response(summary))
+        stored = asyncio.run(
+            describe_and_store_attachments(
+                llm.chat_completion,
+                CONF,
+                [image_item("loker.png")],
+                "lihat gambar ini",
+                "sess-a",
+                "req-9",
+                datetime(2026, 10, 9, 10, 0, tzinfo=timezone.utc),
+                "Asia/Jakarta",
+                summary_model="describe-fake",
+            )
+        )
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]["status"], "processed")
+        self.assertEqual(stored[0]["summary"], summary)
+        self.assertEqual(stored[0]["filename"], "loker.png")
+        reloaded = load_attachment_memories(CONF)
+        self.assertEqual(len(reloaded), 1)
+        self.assertEqual(reloaded[0]["summary"], summary)
 
     def test_invisible_item_becomes_failed_without_summary(self):
         llm = DescribeFakeLLM(
