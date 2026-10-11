@@ -1821,12 +1821,16 @@ class WebSocketHandler:
         try:
             clear = getattr(context.agent_engine, "clear_attachment_memories", None)
             removed = int(clear() if callable(clear) else 0)
+            # clear() returns -1 when the wipe could not be persisted; that
+            # used to be reported as a success with removed=0, which the
+            # client cannot distinguish from "nothing was stored".
+            failed = removed < 0
             await websocket.send_text(
                 json.dumps(
                     {
                         "type": "attachment-memories-cleared",
-                        "success": True,
-                        "removed": removed,
+                        "success": not failed,
+                        "removed": max(removed, 0),
                     }
                 )
             )

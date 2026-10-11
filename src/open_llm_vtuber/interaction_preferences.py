@@ -62,6 +62,12 @@ _TEMPORARY_FRAME = re.compile(
 # Questions are always conversation, never a durable instruction.
 _QUESTION = re.compile(r"[?？]\s*$")
 
+# Stage directions and quoted speech are roleplay framing, not a standing
+# user instruction. The sibling detectors (future intentions, episodic)
+# reject the same framing; preferences must not be the one path that lets
+# an in-character line become a permanent preference.
+_ROLEPLAY_FRAME = re.compile(r"^\s*[\*\(>]|[\*]$")
+
 # Interaction dimensions. Each entry maps a category to the phrases that
 # name that dimension, plus whether the phrase carries a negative polarity.
 _DIMENSIONS: List[Tuple[str, Tuple[str, ...], Tuple[str, ...]]] = [
@@ -166,6 +172,11 @@ def detect_interaction_preference(
         return None
     if _QUESTION.search(text):
         return None
+    if _ROLEPLAY_FRAME.search(text):
+        # An in-character line that otherwise meets every gate (frame +
+        # dimension + polarity) must not be persisted as a permanent user
+        # preference.
+        return None
     if _TEMPORARY_FRAME.search(text):
         # A temporary request is a legitimate turn-level instruction, but it
         # must never be promoted to durable state.
@@ -233,7 +244,19 @@ def active_preferences(
     parsed = [p for p in (normalize_stored_preference(i) for i in stored or []) if p]
     active = [p for p in parsed if p["status"] == PREFERENCE_STATUS_ACTIVE]
     active.sort(key=lambda p: (p["updated_at"] or p["created_at"]), reverse=True)
-    return active
+    # Defensive: the writer maintains the one-per-category invariant, but a
+    # legacy, hand-edited, or corrupt file may hold two active rows for one
+    # category. Rendering both would hand the model contradictory guidance
+    # (e.g. "be formal" + "be casual"), so enforce the invariant here too and
+    # keep the newest.
+    seen: set = set()
+    unique: List[Dict[str, Any]] = []
+    for item in active:
+        if item["category"] in seen:
+            continue
+        seen.add(item["category"])
+        unique.append(item)
+    return unique
 
 
 def apply_preference(

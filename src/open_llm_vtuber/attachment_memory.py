@@ -139,12 +139,28 @@ def _valid_record(item: Any) -> Optional[Dict[str, Any]]:
     if source not in _ATTACHMENT_SOURCES:
         source = "upload"
     mime_type = str(item.get("mime_type", "") or "")
+    # Mirror the write path (`append_attachment_memory`), which only ever
+    # accepts `image/*`. A stricter read keeps a hand-edited or corrupted
+    # row (which no write could have produced) from becoming a memory.
+    if not mime_type.startswith("image/"):
+        return None
     filename = item.get("filename")
     filename = str(filename).strip() if filename is not None else None
     if filename == "":
         filename = None
+    raw_id = str(item.get("id", "") or "")
+    if not raw_id:
+        # A missing id used to be replaced with a fresh random uuid on EVERY
+        # load, so the row was unreachable by id: it could never be deleted
+        # or purged, and the failure was indistinguishable from "never
+        # existed". Derive a stable identity from the record's own content
+        # so the same row keeps the same id across loads.
+        seed = "|".join(
+            (content_hash, str(item.get("received_at", "") or ""), str(filename or ""))
+        )
+        raw_id = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
     return {
-        "id": str(item.get("id", "") or uuid.uuid4().hex),
+        "id": raw_id,
         "filename": filename,
         "mime_type": mime_type,
         "source": source,
@@ -285,12 +301,16 @@ def delete_attachment_memory(conf_uid: str, record_id: str) -> bool:
 
 
 def clear_attachment_memories(conf_uid: str) -> int:
-    """Delete all attachment records; returns the removed count."""
+    """Delete all attachment records; returns the removed count.
+
+    Returns 0 when nothing was stored, and -1 when the wipe could not be
+    persisted (so callers never present a failed wipe as a success).
+    """
     records = load_attachment_memories(conf_uid)
     if not records:
         return 0
     if not save_attachment_memories(conf_uid, []):
-        return 0
+        return -1
     return len(records)
 
 

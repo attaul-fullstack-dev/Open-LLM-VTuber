@@ -91,7 +91,9 @@ def create_new_history(conf_uid: str) -> str:
     # New format: UUID_YYYY-MM-DD_HH-MM-SS
     # Canonical persisted timestamps are tz-aware UTC. Existing naive
     # records keep sorting/parsing fine (same ISO prefix, no parser).
-    history_uid = f"{datetime.now(timezone.utc).strftime('%Y-%m-%d_%H-%M-%S')}_{uuid.uuid4().hex}"
+    history_uid = (
+        f"{datetime.now(timezone.utc).strftime('%Y-%m-%d_%H-%M-%S')}_{uuid.uuid4().hex}"
+    )
     conf_dir = _ensure_conf_dir(conf_uid)  # conf_uid is sanitized here
 
     # Create history file with empty metadata
@@ -146,13 +148,20 @@ def store_message(
     lock = _get_history_lock(filepath)
     with lock:
         history_data = []
+        unreadable = False
         if os.path.exists(filepath):
             try:
                 with open(filepath, "r", encoding="utf-8") as f:
                     history_data = json.load(f)
             except Exception:
-                logger.error(f"Failed to load history file: {filepath}")
-                pass
+                # Refuse to write. This path used to fall through with an
+                # empty list and then atomically overwrite the whole file
+                # with the single message being appended, so one transient
+                # read failure at save time silently collapsed an entire
+                # conversation. Preserving the existing file is the only
+                # non-destructive option; the snapshot backups are the
+                # recovery path for genuinely corrupt files.
+                unreadable = True
 
         now_str = datetime.now(timezone.utc).isoformat(timespec="seconds")
         new_item = {
@@ -166,6 +175,14 @@ def store_message(
             new_item["name"] = name
         if avatar is not None:
             new_item["avatar"] = avatar
+
+        if unreadable:
+            logger.critical(
+                "Refusing to append to an unreadable history file; "
+                "existing data preserved: {}",
+                filepath,
+            )
+            return
 
         history_data.append(new_item)
         _write_history_atomic(filepath, history_data)
@@ -218,7 +235,9 @@ def update_metadate(conf_uid: str, history_uid: str, metadata: dict) -> bool:
                 # Create new metadata with timestamp if none exists
                 new_metadata = {
                     "role": "metadata",
-                    "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "timestamp": datetime.now(timezone.utc).isoformat(
+                        timespec="seconds"
+                    ),
                 }
                 new_metadata.update(metadata)  # Add new fields
                 history_data.insert(0, new_metadata)
@@ -272,7 +291,9 @@ def update_summary_metadata(
             if metadata is None:
                 metadata = {
                     "role": "metadata",
-                    "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "timestamp": datetime.now(timezone.utc).isoformat(
+                        timespec="seconds"
+                    ),
                 }
                 history_data.insert(0, metadata)
             metadata.update(
@@ -377,9 +398,7 @@ def get_history_list(conf_uid: str, cleanup: bool = True) -> List[dict]:
                             latest_message["timestamp"] if latest_message else None
                         ),
                         "title": (
-                            str(metadata.get("title", "")).strip()
-                            if metadata
-                            else ""
+                            str(metadata.get("title", "")).strip() if metadata else ""
                         ),
                     }
                     histories.append(history_info)

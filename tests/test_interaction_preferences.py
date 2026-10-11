@@ -53,6 +53,15 @@ MUST_NOT_CAPTURE = [
     None,
 ]
 
+ROLEPLAY_MUST_NOT_CAPTURE = [
+    # In-character lines that otherwise meet every gate (frame + dimension
+    # + polarity): stage framing must keep them out of durable state.
+    "*mendorong* tolong jangan terlalu galak ke aku.",
+    "(marah) mulai sekarang jangan terlalu formal.",
+    "> jangan bercanda terus, aku lagi serius.",
+    "tolong jangan terlalu galak ke aku*",
+]
+
 
 class _FakeLLM:
     async def chat_completion(self, messages, system=None, **kwargs):
@@ -79,6 +88,74 @@ class DetectionTest(unittest.TestCase):
         for text in MUST_NOT_CAPTURE:
             with self.subTest(text=text):
                 self.assertIsNone(detect_interaction_preference(text, now=NOW))
+
+    def test_roleplay_framed_lines_are_not_captured(self):
+        for text in ROLEPLAY_MUST_NOT_CAPTURE:
+            with self.subTest(text=text):
+                self.assertIsNone(detect_interaction_preference(text, now=NOW))
+
+    def test_reader_enforces_one_active_preference_per_category(self):
+        """A legacy or hand-edited file may hold two active rows of one
+        category. The reader must keep the newest instead of rendering
+        contradictory guidance."""
+        rows = [
+            {
+                "id": "old",
+                "category": "tone",
+                "polarity": "avoid",
+                "text": "jangan galak",
+                "frame": "directive",
+                "created_at": "2026-09-01T00:00:00+00:00",
+                "updated_at": "2026-09-01T00:00:00+00:00",
+                "source": "conversation",
+                "status": "active",
+                "superseded_by": "",
+            },
+            {
+                "id": "new",
+                "category": "tone",
+                "polarity": "prefer",
+                "text": "santai aja",
+                "frame": "directive",
+                "created_at": "2026-10-01T00:00:00+00:00",
+                "updated_at": "2026-10-01T00:00:00+00:00",
+                "source": "conversation",
+                "status": "active",
+                "superseded_by": "",
+            },
+        ]
+        got = active_preferences(rows)
+        self.assertEqual([row["id"] for row in got], ["new"])
+
+    def test_reader_keeps_distinct_categories(self):
+        rows = [
+            {
+                "id": "a",
+                "category": "tone",
+                "polarity": "avoid",
+                "text": "jangan galak",
+                "frame": "directive",
+                "created_at": "2026-09-01T00:00:00+00:00",
+                "updated_at": "2026-09-01T00:00:00+00:00",
+                "source": "conversation",
+                "status": "active",
+                "superseded_by": "",
+            },
+            {
+                "id": "b",
+                "category": "address",
+                "polarity": "prefer",
+                "text": "panggil aku bro",
+                "frame": "directive",
+                "created_at": "2026-09-02T00:00:00+00:00",
+                "updated_at": "2026-09-02T00:00:00+00:00",
+                "source": "conversation",
+                "status": "active",
+                "superseded_by": "",
+            },
+        ]
+        got = active_preferences(rows)
+        self.assertEqual({row["id"] for row in got}, {"a", "b"})
 
     def test_target_example_is_tone_avoid(self):
         found = detect_interaction_preference(

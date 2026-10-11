@@ -259,6 +259,25 @@ class CharacterMemoryCommandIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(agent.list_character_memories(), [])
 
+    def test_forget_reports_real_removal_not_phantom_success(self):
+        """A forget that removes rows returns True; one that matches nothing
+        returns False instead of a phantom success."""
+        agent = self.make_agent()
+        self.assertTrue(
+            agent._observe_character_memory_request("Catet ya, gw suka kopi.")
+        )
+        # a real removal
+        self.assertTrue(agent.remove_character_memory("gw suka kopi"))
+        self.assertEqual(agent.list_character_memories(), [])
+        # nothing left to remove: must not claim a removal happened
+        self.assertFalse(agent.remove_character_memory("gw suka kopi"))
+        # matching nothing at all must also report honestly
+        self.assertFalse(agent.remove_character_memory("hal yang tidak ada"))
+
+    def test_forget_returns_false_when_nothing_is_stored(self):
+        agent = self.make_agent()
+        self.assertFalse(agent.remove_character_memory("apapun"))
+
     def test_memory_survives_new_chat_and_is_visible_through_api(self):
         create_new_history(self.conf_uid)
         agent = self.make_agent()

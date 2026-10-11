@@ -42,7 +42,6 @@ from ...character_state import (
     migrate_relationship_if_needed,
     record_goal_evidence,
     record_interaction_preference,
-    remove_character_memory as remove_persisted_character_memory,
     reset_character_memory as reset_persisted_character_memory,
     reset_character_state as reset_persisted_character_state,
     save_character_state,
@@ -1008,20 +1007,41 @@ class BasicMemoryAgent(AgentInterface):
         return True
 
     def remove_character_memory(self, text: str) -> bool:
-        """Forget stored facts overlapping the given text (character-level)."""
+        """Forget stored facts overlapping the given text (character-level).
+
+        True only when at least one row was actually removed. A request that
+        matched nothing returns False (rather than a phantom success), so the
+        memory receipt cannot assert a removal that never happened.
+        """
         if not self._character_conf_uid:
             return False
-        state = remove_persisted_character_memory(self._character_conf_uid, text)
-        if state is None:
-            logger.warning(
-                "Character memory removal failed: character_memory_updated=False"
+        try:
+            from ...character_state import remove_character_memory_count
+
+            state, removed = remove_character_memory_count(
+                self._character_conf_uid, text
             )
+        except Exception:
+            state, removed = None, 0
+        if state is None or removed == 0:
+            if state is not None:
+                self._character_state = state
+                logger.info(
+                    "Character memory removal matched nothing: "
+                    "character_memory_count={}",
+                    len(state.memories),
+                )
+            else:
+                logger.warning(
+                    "Character memory removal failed: character_memory_updated=False"
+                )
             return False
         self._character_state = state
         logger.info(
             "Character memory stats: character_memory_updated=True, "
-            "character_memory_count={}",
+            "character_memory_count={}, removed={}",
             len(state.memories),
+            removed,
         )
         return True
 
@@ -1555,6 +1575,8 @@ class BasicMemoryAgent(AgentInterface):
         if not self._character_conf_uid or not record_id:
             return False
         removed = delete_attachment_memory(self._character_conf_uid, record_id)
+        if removed:
+            self._invalidate_attachment_selection_cache()
         logger.info(
             "Attachment memory removal: record_removed={}",
             removed,
@@ -1562,10 +1584,16 @@ class BasicMemoryAgent(AgentInterface):
         return removed
 
     def clear_attachment_memories(self) -> int:
-        """Forget all stored attachment records; returns the removed count."""
+        """Forget all stored attachment records; returns the removed count.
+
+        Passes through -1 when the wipe could not be persisted, so the
+        caller can report failure instead of a phantom success.
+        """
         if not self._character_conf_uid:
             return 0
         removed = clear_attachment_memories(self._character_conf_uid)
+        if removed != 0:
+            self._invalidate_attachment_selection_cache()
         logger.info(
             "Attachment memories cleared: removed={}",
             removed,
@@ -1584,7 +1612,21 @@ class BasicMemoryAgent(AgentInterface):
                 "record_id": str(record_id or ""),
                 "complete": False,
             }
-        return purge_attachment_memory(self._character_conf_uid, record_id)
+        outcome = purge_attachment_memory(self._character_conf_uid, record_id)
+        if outcome.get("attachment_removed"):
+            self._invalidate_attachment_selection_cache()
+        return outcome
+
+    def _invalidate_attachment_selection_cache(self) -> None:
+        """Drop the per-turn attachment selection.
+
+        The selection is cached per query for the user turn, but the
+        proactive path reuses the last user turn's selection without going
+        through the invalidation in ``_to_messages``. A purge/delete/clear
+        must therefore invalidate explicitly, or a deleted summary would be
+        re-injected into a later proactive prompt.
+        """
+        self._attachment_selection_cache = None
 
     def observe_character_events(
         self,

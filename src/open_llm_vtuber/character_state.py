@@ -580,9 +580,29 @@ def _normalize_memory_text(text: str) -> str:
 # sentence survive being written twice in different surface forms.
 _MEMORY_STOPWORDS = frozenset(
     {
-        "aku", "gw", "gue", "gua", "ane", "saya", "user", "yang", "dengan",
-        "untuk", "dari", "pada", "itu", "ini", "ya", "sih", "deh", "dong",
-        "kok", "banget", "suka", "biasa", "selalu",
+        "aku",
+        "gw",
+        "gue",
+        "gua",
+        "ane",
+        "saya",
+        "user",
+        "yang",
+        "dengan",
+        "untuk",
+        "dari",
+        "pada",
+        "itu",
+        "ini",
+        "ya",
+        "sih",
+        "deh",
+        "dong",
+        "kok",
+        "banget",
+        "suka",
+        "biasa",
+        "selalu",
     }
 )
 
@@ -592,9 +612,7 @@ def _memory_significant_tokens(text: str) -> frozenset:
     raw = _normalize_memory_text(text)
     tokens = [
         token
-        for token in "".join(
-            ch if ch.isalnum() else " " for ch in raw
-        ).split()
+        for token in "".join(ch if ch.isalnum() else " " for ch in raw).split()
         if token and token not in _MEMORY_STOPWORDS
     ]
     return frozenset(tokens)
@@ -705,9 +723,24 @@ def record_interaction_preference(
 
 def remove_character_memory(conf_uid: str, text: str) -> Optional[CharacterState]:
     """Remove stored facts overlapping the given text; None on write failure."""
+    state, _removed = remove_character_memory_count(conf_uid, text)
+    return state
+
+
+def remove_character_memory_count(
+    conf_uid: str, text: str
+) -> tuple[Optional[CharacterState], int]:
+    """Remove stored facts overlapping the given text.
+
+    Returns ``(state, removed)``. ``state`` is None only on a write failure;
+    ``removed`` is the number of rows actually deleted. A zero ``removed``
+    with a non-None state means nothing matched -- which callers must not
+    report as a removal. (The boolean-only wrapper above maps that case to
+    success for legacy callers, so receipt paths should prefer the count.)
+    """
     target = _normalize_memory_text(text)
     if not target:
-        return load_character_state(conf_uid)
+        return load_character_state(conf_uid), 0
     state = load_character_state(conf_uid)
     remaining = [
         item
@@ -717,12 +750,13 @@ def remove_character_memory(conf_uid: str, text: str) -> Optional[CharacterState
             or _normalize_memory_text(str(item.get("text", ""))) in target
         )
     ]
-    if len(remaining) == len(state.memories):
-        return state
+    removed = len(state.memories) - len(remaining)
+    if removed == 0:
+        return state, 0
     state.memories = remaining
     if not save_character_state(conf_uid, state):
-        return None
-    return state
+        return None, 0
+    return state, removed
 
 
 def reset_character_memory(conf_uid: str) -> Optional[CharacterState]:
@@ -846,15 +880,11 @@ def record_future_intention(
                 return dict(item)
         return None
     except Exception as error:
-        logger.warning(
-            "Future intention not persisted: type={}", type(error).__name__
-        )
+        logger.warning("Future intention not persisted: type={}", type(error).__name__)
         return None
 
 
-def complete_future_intention(
-    conf_uid: str, intention_id: str
-) -> bool:
+def complete_future_intention(conf_uid: str, intention_id: str) -> bool:
     """Mark one reminder request done; False when missing or unwritable."""
     try:
         from .future_intentions import complete_future_intention as _complete

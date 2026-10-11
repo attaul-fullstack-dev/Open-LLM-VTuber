@@ -183,6 +183,58 @@ class StorageTest(TmpCwdTestCase):
         bad = record()
         bad["content_hash"] = "zzz"
         self.assertIsNone(append_attachment_memory(CONF, bad))
+
+    def test_row_missing_an_id_gets_a_stable_identity(self):
+        """A row with no id used to receive a fresh random uuid on EVERY
+        load, so it could never be deleted or purged by id: the failure was
+        indistinguishable from 'never existed'."""
+        import json
+
+        import src.open_llm_vtuber.attachment_memory as am
+
+        os.makedirs("attachment_memory", exist_ok=True)
+        row = record()
+        row.pop("id", None)
+        with open(f"attachment_memory/{CONF}.json", "w", encoding="utf-8") as fh:
+            json.dump([row], fh)
+        first = am.load_attachment_memories(CONF)
+        second = am.load_attachment_memories(CONF)
+        self.assertEqual(len(first), 1)
+        self.assertTrue(first[0]["id"])
+        self.assertEqual(first[0]["id"], second[0]["id"])
+        # and the stable id is actually usable for deletion
+        self.assertTrue(am.delete_attachment_memory(CONF, first[0]["id"]))
+        self.assertEqual(am.load_attachment_memories(CONF), [])
+
+    def test_row_with_non_image_mime_is_rejected_on_load(self):
+        """The write path only ever accepts image/*; the load path must not
+        be weaker, or a hand-edited row no write could have produced would
+        still become a memory."""
+        import json
+
+        import src.open_llm_vtuber.attachment_memory as am
+
+        os.makedirs("attachment_memory", exist_ok=True)
+        row = record()
+        row["mime_type"] = "text/plain"
+        with open(f"attachment_memory/{CONF}.json", "w", encoding="utf-8") as fh:
+            json.dump([row], fh)
+        self.assertEqual(am.load_attachment_memories(CONF), [])
+
+    def test_failed_wipe_reports_minus_one_not_zero(self):
+        """clear_attachment_memories returns -1 when the wipe cannot be
+        persisted, so callers never present a failed wipe as a success."""
+        import src.open_llm_vtuber.attachment_memory as am
+
+        self.assertIsNotNone(append_attachment_memory(CONF, record()))
+        with unittest.mock.patch.object(
+            am, "save_attachment_memories", return_value=False
+        ):
+            self.assertEqual(am.clear_attachment_memories(CONF), -1)
+        # and a genuinely empty store still reports 0
+        self.assertEqual(am.clear_attachment_memories("nobody-here"), 0)
+
+    def test_rejects_bad_mime_on_append(self):
         bad = record()
         bad["mime_type"] = "text/plain"
         self.assertIsNone(append_attachment_memory(CONF, bad))
@@ -1353,8 +1405,11 @@ class RetrievalAfterDeleteTest(TmpCwdTestCase):
         self.assertEqual(len(rows), 1)
         status = agent.purge_attachment_memory(rows[0]["id"])
         self.assertTrue(status["attachment_removed"])
-        # New turn resets both per-turn caches (mirrors _to_messages).
-        agent._attachment_selection_cache = None
+        # The purge itself must invalidate the per-turn selection: the
+        # proactive path reuses the last user turn's cache without going
+        # through the per-turn reset in _to_messages, so without this a
+        # deleted summary would be re-injected into a later proactive prompt.
+        self.assertIsNone(agent._attachment_selection_cache)
         agent._episodic_selection_cache = None
         self.assertEqual(agent._attachment_selection(), [])
         self.assertEqual(agent._attachment_context_for_prompt(), "")
