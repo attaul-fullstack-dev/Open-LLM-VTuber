@@ -42,6 +42,15 @@ ATTACHMENT_MAX_RECORDS = 200
 ATTACHMENT_TOP_N = 2
 ATTACHMENT_MAX_TOKENS = 300
 ATTACHMENT_SUMMARY_MAX_CHARS = 600
+# Fallback window for recently shared attachments (seconds). When keyword
+# scoring finds nothing, at most one record this fresh may be surfaced so a
+# question asked minutes after an upload can still recall it. Older,
+# unrelated attachments are never pulled in by the fallback.
+ATTACHMENT_FALLBACK_MAX_AGE_SECONDS = 900
+# Internal tag on fallback results. Stored records never carry this key
+# (_valid_record drops unknown keys); it only marks in-memory results so
+# rendering and telemetry can tell "recent" apart from "matched".
+ATTACHMENT_FALLBACK_TAG = "recent_attachment_fallback"
 
 ATTACHMENT_STATUS_PROCESSED = "processed"
 ATTACHMENT_STATUS_FAILED = "failed"
@@ -303,7 +312,15 @@ def delete_attachment_memories_for_session(conf_uid: str, session_uid: str) -> i
 
 
 def _normalize_attachment_text(value: Any) -> str:
-    return " ".join(str(value or "").lower().split()).strip()
+    """Lowercase and punctuation-normalize text for scoring (pure).
+
+    Punctuation becomes whitespace so "apa?" and "apa" (or "kucing.png"
+    and "kucing png") produce the same tokens. Only the scoring view is
+    affected; stored filenames and summaries are never modified.
+    """
+    lowered = str(value or "").lower()
+    spaced = re.sub(r"[^\w\s]", " ", lowered, flags=re.UNICODE)
+    return " ".join(spaced.split()).strip()
 
 
 def _attachment_token_set(text: str) -> set:
@@ -318,6 +335,22 @@ def _record_search_text(record: Dict[str, Any]) -> str:
     return _normalize_attachment_text(" ".join(parts))
 
 
+def _parse_iso_or_none(value: Any) -> Optional[datetime]:
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _record_reference_time(record: Dict[str, Any]) -> Optional[datetime]:
+    return _parse_iso_or_none(record.get("received_at", "")) or _parse_iso_or_none(
+        record.get("created_at", "")
+    )
+
+
 def _score_record(query_tokens: set, record: Dict[str, Any], now: datetime) -> float:
     record_tokens = _attachment_token_set(_record_search_text(record))
     if not query_tokens or not record_tokens:
@@ -327,18 +360,7 @@ def _score_record(query_tokens: set, record: Dict[str, Any], now: datetime) -> f
         return 0.0
     score = float(overlap)
 
-    def _parse_iso_or_none(value: Any) -> Optional[datetime]:
-        try:
-            parsed = datetime.fromisoformat(str(value))
-        except (TypeError, ValueError):
-            return None
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed
-
-    reference = _parse_iso_or_none(record.get("received_at", "")) or _parse_iso_or_none(
-        record.get("created_at", "")
-    )
+    reference = _record_reference_time(record)
     if reference is not None:
         try:
             age_days = (now - reference).total_seconds() / 86400.0
@@ -349,17 +371,72 @@ def _score_record(query_tokens: set, record: Dict[str, Any], now: datetime) -> f
     return score
 
 
+def _recent_fallback_candidate(
+    records: List[Dict[str, Any]],
+    moment: datetime,
+    session_uid: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Newest fresh PROCESSED record, preferably from the current session.
+
+    Returns a tagged in-memory copy, never a stored row. Records older than
+    ATTACHMENT_FALLBACK_MAX_AGE_SECONDS are ineligible, so an old,
+    unrelated attachment is never surfaced just because nothing matched.
+    """
+    best: Optional[Dict[str, Any]] = None
+    best_key: Optional[tuple] = None
+    for record in records or []:
+        try:
+            if record.get("status") != ATTACHMENT_STATUS_PROCESSED:
+                continue
+            if not str(record.get("summary", "") or "").strip():
+                continue
+            reference = _record_reference_time(record)
+            if reference is None:
+                continue
+            try:
+                age_seconds = (moment - reference).total_seconds()
+            except TypeError:
+                continue
+            if age_seconds < 0 or age_seconds > ATTACHMENT_FALLBACK_MAX_AGE_SECONDS:
+                continue
+            same_session = bool(
+                session_uid
+                and str(record.get("session_uid", "") or "") == str(session_uid)
+            )
+            # Prefer the current session, then the newest record.
+            key = (
+                1 if same_session else 0,
+                reference.isoformat(),
+                str(record.get("id", "")),
+            )
+            if best_key is None or key > best_key:
+                best_key = key
+                best = record
+        except Exception:
+            continue
+    if best is None:
+        return None
+    tagged = dict(best)
+    tagged[ATTACHMENT_FALLBACK_TAG] = True
+    return tagged
+
+
 def retrieve_attachment_memories(
     records: List[Dict[str, Any]],
     query: Any,
     *,
     now: Optional[datetime] = None,
     top_n: int = ATTACHMENT_TOP_N,
+    session_uid: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Selective keyword + recency retrieval over PROCESSED records only.
 
     Failed records (never read) are never returned: retrieval must not hand
-    the model a memory it cannot honestly use. Pure, no LLM, no I/O.
+    the model a memory it cannot honestly use. When keyword scoring finds
+    nothing, at most one fresh record (see
+    ATTACHMENT_FALLBACK_MAX_AGE_SECONDS) is returned tagged with
+    ATTACHMENT_FALLBACK_TAG, so a question asked minutes after an upload
+    can still recall it. Pure, no LLM, no I/O.
     """
     cleaned = " ".join(str(query or "").split()).strip()
     if not cleaned or not records:
@@ -370,13 +447,17 @@ def retrieve_attachment_memories(
             moment = moment.replace(tzinfo=timezone.utc)
         query_tokens = _attachment_token_set(_normalize_attachment_text(cleaned))
         scored = []
+        max_score = 0.0
+        candidates = 0
         for record in records:
             try:
                 if record.get("status") != ATTACHMENT_STATUS_PROCESSED:
                     continue
                 if not str(record.get("summary", "") or "").strip():
                     continue
+                candidates += 1
                 score = _score_record(query_tokens, record, moment)
+                max_score = max(max_score, score)
             except Exception:
                 continue
             if score > 0:
@@ -389,7 +470,26 @@ def retrieve_attachment_memories(
                     )
                 )
         scored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
-        return [row[3] for row in scored[: max(top_n, 0)]]
+        keyword_hits = [row[3] for row in scored[: max(top_n, 0)]]
+        if keyword_hits:
+            return keyword_hits
+        fallback_used = False
+        selected: List[Dict[str, Any]] = []
+        if max(top_n, 0) > 0:
+            fallback = _recent_fallback_candidate(records, moment, session_uid)
+            if fallback is not None:
+                fallback_used = True
+                selected = [fallback]
+        logger.info(
+            "Attachment retrieval miss: candidates={} query_tokens={} "
+            "max_score={} fallback={} selected={}",
+            candidates,
+            len(query_tokens),
+            round(max_score, 2),
+            fallback_used,
+            len(selected),
+        )
+        return selected
     except Exception as error:
         logger.warning(
             "Attachment retrieval failed (no records returned): type={}",
@@ -442,10 +542,19 @@ def render_attachment_context(
         used_tokens += line_tokens
     if not lines:
         return ""
-    header = (
-        "Relevant attachment memories (files shared earlier; the originals may "
-        "no longer be available, answer only from these stored notes):"
-    )
+    if records and all(item.get(ATTACHMENT_FALLBACK_TAG) is True for item in records):
+        # Fallback results did not match the question; say so plainly so the
+        # model treats them as recent context, never as proof they answer it.
+        header = (
+            "Recently shared attachments (shown because they are new, not "
+            "because they match the question; use only if actually relevant, "
+            "and never claim the note answers something it does not):"
+        )
+    else:
+        header = (
+            "Relevant attachment memories (files shared earlier; the originals may "
+            "no longer be available, answer only from these stored notes):"
+        )
     return f"{header}\n" + "\n".join(lines)
 
 

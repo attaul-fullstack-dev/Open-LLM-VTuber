@@ -15,10 +15,15 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+from loguru import logger
+
 from src.open_llm_vtuber.attachment_memory import (
+    ATTACHMENT_FALLBACK_TAG,
+    _attachment_token_set,
+    _normalize_attachment_text,
     append_attachment_memory,
     build_attachment_summary_prompt,
     clear_attachment_memories,
@@ -450,6 +455,188 @@ class RetrievalTest(TmpCwdTestCase):
         self.assertEqual(render_attachment_context([]), "")
 
 
+class RetrievalNormalizationTest(unittest.TestCase):
+    def test_punctuation_and_case_variants(self):
+        self.assertEqual(_normalize_attachment_text("Tentang APA?"), "tentang apa")
+        self.assertEqual(_normalize_attachment_text("kucing.png"), "kucing png")
+        self.assertEqual(_normalize_attachment_text("  Halo   Dunia  "), "halo dunia")
+        self.assertEqual(_normalize_attachment_text(""), "")
+        self.assertEqual(_normalize_attachment_text(None), "")
+
+    def test_token_set_after_normalization(self):
+        self.assertEqual(
+            _attachment_token_set(_normalize_attachment_text("Tentang APA?")),
+            {"tentang", "apa"},
+        )
+
+    def test_question_mark_matches_plain_word(self):
+        # "tentang apa?" shares the token "apa" with a summary containing it.
+        rec = record(summary="Jawaban atas apa yang ditanyakan.")
+        rec["received_at"] = "2026-10-11T05:57:00+00:00"
+        now = datetime(2026, 10, 11, 5, 58, 0, tzinfo=timezone.utc)
+        found = retrieve_attachment_memories([rec], "tentang apa?", now=now)
+        self.assertEqual(len(found), 1)
+        self.assertNotIn(ATTACHMENT_FALLBACK_TAG, found[0])
+
+
+class RetrievalFallbackTest(TmpCwdTestCase):
+    NOW = datetime(2026, 10, 11, 5, 58, 48, tzinfo=timezone.utc)
+
+    def _fresh_record(self, **over):
+        rec = record(**over)
+        rec["received_at"] = (self.NOW - timedelta(seconds=120)).isoformat(
+            timespec="seconds"
+        )
+        return rec
+
+    def test_keywordless_question_falls_back_to_fresh_attachment(self):
+        stored = append_attachment_memory(CONF, self._fresh_record())
+        self.assertIsNotNone(stored)
+        found = retrieve_attachment_memories(
+            load_attachment_memories(CONF), "apakah ada rencana lain", now=self.NOW
+        )
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["id"], stored["id"])
+        self.assertTrue(found[0].get(ATTACHMENT_FALLBACK_TAG))
+        # The tag is in-memory only: the stored row is untouched.
+        reloaded = load_attachment_memories(CONF)
+        self.assertEqual(len(reloaded), 1)
+        self.assertNotIn(ATTACHMENT_FALLBACK_TAG, reloaded[0])
+
+    def test_keyword_query_uses_primary_path_without_tag(self):
+        append_attachment_memory(CONF, self._fresh_record())
+        found = retrieve_attachment_memories(
+            load_attachment_memories(CONF), "kucing oranye sofa", now=self.NOW
+        )
+        self.assertEqual(len(found), 1)
+        self.assertNotIn(ATTACHMENT_FALLBACK_TAG, found[0])
+
+    def test_old_irrelevant_attachment_stays_out(self):
+        old = record()
+        old["received_at"] = "2026-10-01T00:00:00+00:00"
+        append_attachment_memory(CONF, old)
+        self.assertEqual(
+            retrieve_attachment_memories(
+                load_attachment_memories(CONF), "apakah ada rencana lain", now=self.NOW
+            ),
+            [],
+        )
+
+    def test_failed_records_never_retrieved(self):
+        failed = record(status="failed", summary="")
+        failed["received_at"] = (self.NOW - timedelta(seconds=60)).isoformat(
+            timespec="seconds"
+        )
+        append_attachment_memory(CONF, failed)
+        # No keyword overlap (fallback path skips failed)...
+        self.assertEqual(
+            retrieve_attachment_memories(
+                load_attachment_memories(CONF), "topik asing xyz", now=self.NOW
+            ),
+            [],
+        )
+        # ...and even an overlapping filename never surfaces a failed record.
+        self.assertEqual(
+            retrieve_attachment_memories(
+                load_attachment_memories(CONF), "kucing png", now=self.NOW
+            ),
+            [],
+        )
+
+    def test_fallback_respects_top_k_and_token_budget(self):
+        append_attachment_memory(CONF, self._fresh_record())
+        records = load_attachment_memories(CONF)
+        self.assertEqual(
+            retrieve_attachment_memories(
+                records, "tanpa kata kunci", now=self.NOW, top_n=0
+            ),
+            [],
+        )
+        found = retrieve_attachment_memories(records, "tanpa kata kunci", now=self.NOW)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(
+            render_attachment_context(found, now=self.NOW, max_tokens=5), ""
+        )
+        text = render_attachment_context(found, now=self.NOW)
+        self.assertIn("Recently shared attachments", text)
+
+    def test_other_character_records_excluded(self):
+        append_attachment_memory("otherchar", self._fresh_record())
+        own: list = []
+        found = retrieve_attachment_memories(own, "kucing oranye sofa", now=self.NOW)
+        self.assertEqual(found, [])
+        # Same query against the other character's own store still works there.
+        other = retrieve_attachment_memories(
+            load_attachment_memories("otherchar"), "kucing oranye sofa", now=self.NOW
+        )
+        self.assertEqual(len(other), 1)
+
+    def test_no_duplicate_records(self):
+        append_attachment_memory(CONF, self._fresh_record())
+        records = load_attachment_memories(CONF)
+        first = retrieve_attachment_memories(records, "tanpa kata kunci", now=self.NOW)
+        second = retrieve_attachment_memories(records, "tanpa kata kunci", now=self.NOW)
+        self.assertEqual(len(first), 1)
+        self.assertEqual([r["id"] for r in first], [r["id"] for r in second])
+
+    def test_same_session_preferred_over_newer_record(self):
+        mine = self._fresh_record(session="sess-now")
+        mine["received_at"] = (self.NOW - timedelta(seconds=300)).isoformat(
+            timespec="seconds"
+        )
+        theirs = self._fresh_record(
+            name="lain.jpg", data=DATA_URL_2, summary="Gambar lain.", session="sess-old"
+        )
+        theirs["received_at"] = (self.NOW - timedelta(seconds=60)).isoformat(
+            timespec="seconds"
+        )
+        append_attachment_memory(CONF, mine)
+        append_attachment_memory(CONF, theirs)
+        records = load_attachment_memories(CONF)
+        found = retrieve_attachment_memories(
+            records, "tanpa kata kunci", now=self.NOW, session_uid="sess-now"
+        )
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["session_uid"], "sess-now")
+        # Without session knowledge, the newest record wins.
+        found = retrieve_attachment_memories(records, "tanpa kata kunci", now=self.NOW)
+        self.assertEqual(found[0]["session_uid"], "sess-old")
+
+    def test_miss_logs_metadata_without_content(self):
+        append_attachment_memory(CONF, self._fresh_record())
+        lines: list = []
+        handler = logger.add(
+            lambda m: lines.append(str(m)), format="{message}", level="INFO"
+        )
+        try:
+            old = record()
+            old["received_at"] = "2026-10-01T00:00:00+00:00"
+            retrieve_attachment_memories([old], "apakah ada rencana lain", now=self.NOW)
+            retrieve_attachment_memories(
+                load_attachment_memories(CONF), "topik asing xyz", now=self.NOW
+            )
+        finally:
+            logger.remove(handler)
+        misses = [line for line in lines if "Attachment retrieval miss:" in line]
+        self.assertEqual(len(misses), 2)
+        # Stale record, no fallback: concrete values, not just field names.
+        self.assertIn(
+            "candidates=1 query_tokens=4 max_score=0.0 fallback=False selected=0",
+            misses[0],
+        )
+        # Fresh record, fallback taken: values must render too.
+        self.assertIn(
+            "candidates=1 query_tokens=3 max_score=0.0 fallback=True selected=1",
+            misses[1],
+        )
+        for line in misses:
+            self.assertNotIn("kucing oranye", line)
+            self.assertNotIn("apakah ada rencana", line)
+            self.assertNotIn("topik asing", line)
+            self.assertNotIn("%d", line)
+            self.assertNotIn("%s", line)
+
+
 class DeleteConsistencyTest(TmpCwdTestCase):
     def _seed_two_sessions(self):
         append_attachment_memory(CONF, record(session="sess-a"))
@@ -634,13 +821,59 @@ class AgentIntegrationTest(TmpCwdTestCase):
         system = agent._relationship_system_prompt("persona dasar")
         self.assertIn("Kucing oranye tidur di sofa.", system)
 
-    def test_agent_selection_empty_without_match(self):
+    def test_agent_selection_falls_back_to_fresh_record(self):
+        # A record captured seconds ago in this session is returned even
+        # when the question shares no keyword with it (fallback path).
         history_uid = create_new_history(CONF)
         llm = FakeAgentLLM(describe_response("Kucing oranye."))
         agent = make_agent(CONF, history_uid, llm)
         asyncio.run(
             agent.capture_attachment_memory([image_item()], "kucing", history_uid, "r")
         )
+        agent._episodic_query = "resep rendang ayam"
+        selected = agent._attachment_selection()
+        self.assertEqual(len(selected), 1)
+        self.assertTrue(selected[0].get("recent_attachment_fallback"))
+        self.assertIn("Kucing oranye.", agent._attachment_context_for_prompt())
+
+    def test_agent_selection_prefers_own_session(self):
+        # Two fresh records, no keyword overlap: the agent surfaces the one
+        # from its own session, proving session_uid is passed through.
+        # Timestamps are relative to now so the test never rots: both
+        # records stay inside the fallback window while keeping the
+        # age ordering under test (the other session's record is newer).
+        history_uid = create_new_history(CONF)
+        agent = make_agent(CONF, history_uid, FakeAgentLLM([]))
+        self.assertEqual(agent._history_uid, history_uid)
+        now = datetime.now(timezone.utc)
+        mine = record(session=history_uid, summary="Milik sesi ini.")
+        mine["received_at"] = (now - timedelta(seconds=300)).isoformat(
+            timespec="seconds"
+        )
+        theirs = record(
+            name="lain.jpg",
+            data=DATA_URL_2,
+            session="sesi-lain",
+            summary="Milik sesi lain.",
+        )
+        theirs["received_at"] = (now - timedelta(seconds=60)).isoformat(
+            timespec="seconds"
+        )
+        append_attachment_memory(CONF, mine)
+        append_attachment_memory(CONF, theirs)
+        agent._episodic_query = "hal yang sama sekali berbeda"
+        selected = agent._attachment_selection()
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0]["session_uid"], history_uid)
+
+    def test_agent_selection_empty_for_stale_records(self):
+        # The fallback never pulls old, unrelated attachments: a record
+        # older than the fallback window stays out of context.
+        history_uid = create_new_history(CONF)
+        agent = make_agent(CONF, history_uid, FakeAgentLLM([]))
+        old = record()
+        old["received_at"] = "2026-10-01T00:00:00+00:00"
+        self.assertIsNotNone(append_attachment_memory(CONF, old))
         agent._episodic_query = "resep rendang ayam"
         self.assertEqual(agent._attachment_selection(), [])
         self.assertEqual(agent._attachment_context_for_prompt(), "")

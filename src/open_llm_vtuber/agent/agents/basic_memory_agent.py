@@ -1400,7 +1400,9 @@ class BasicMemoryAgent(AgentInterface):
             logger.debug("Attachment retrieval: no stored records.")
             self._attachment_selection_cache = (query, [])
             return []
-        selected = retrieve_attachment_memories(records, query) or []
+        selected = retrieve_attachment_memories(
+            records, query, session_uid=self._history_uid or None
+        ) or []
         elapsed_ms = round((time.perf_counter() - started) * 1000.0, 2)
         if selected:
             logger.info(
