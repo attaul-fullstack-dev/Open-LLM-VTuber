@@ -28,6 +28,8 @@ from .agent.relationship_context import (
 )
 from .chat_history_manager import _sanitize_path_component
 from .interaction_preferences import (
+    PREFERENCE_STATUS_ACTIVE,
+    PREFERENCE_STATUS_SUPERSEDED,
     apply_preference,
     detect_interaction_preference,
     normalize_stored_preference,
@@ -907,6 +909,84 @@ def complete_future_intention(conf_uid: str, intention_id: str) -> bool:
         return bool(save_character_state(conf_uid, state))
     except Exception:
         return False
+
+
+def cancel_stored_future_intention(conf_uid: str, intention_id: str) -> bool:
+    """Cancel one pending reminder request; False when missing/unwritable.
+
+    Read-modify-write against the authoritative file (same discipline as the
+    goal-evidence anchor): only a PENDING row with this id transitions, so a
+    cancel can never complete, revive, or duplicate anything else.
+    """
+    try:
+        from .future_intentions import cancel_future_intention as _cancel
+
+        state = load_character_state(conf_uid)
+        updated, changed = _cancel(state.future_intentions, intention_id)
+        if not changed:
+            return False
+        state.future_intentions = updated
+        return bool(save_character_state(conf_uid, state))
+    except Exception:
+        return False
+
+
+def retract_interaction_preference(
+    conf_uid: str, preference_id: str
+) -> tuple[Optional[CharacterState], int]:
+    """Retract one stored interaction preference by id.
+
+    Returns ``(state, removed)``. There is no delete in the preference
+    lifecycle, so a retraction reuses the pre-existing terminal status:
+    the ACTIVE row becomes SUPERSEDED (``superseded_by="manual-retract"``),
+    which the prompt renderer already excludes. No schema change, no new
+    status value, no migration. Read-modify-write against the authoritative
+    file; only an ACTIVE row with this id transitions, so nothing else can
+    be completed, revived, or duplicated. A zero ``removed`` with a non-None
+    state means nothing matched and must not be reported as a removal.
+    """
+    try:
+        from .interaction_preferences import _now_iso as _pref_now_iso
+    except Exception:
+        _pref_now_iso = None  # type: ignore[assignment]
+    try:
+        target = str(preference_id or "").strip()
+        if not target:
+            return load_character_state(conf_uid), 0
+        state = load_character_state(conf_uid)
+        kept: List[Dict[str, Any]] = []
+        removed = 0
+        for item in state.interaction_preferences or []:
+            parsed = normalize_stored_preference(item)
+            if parsed is None:
+                kept.append(item)
+                continue
+            if parsed["id"] == target and parsed["status"] == PREFERENCE_STATUS_ACTIVE:
+                superseded = dict(parsed)
+                superseded["status"] = PREFERENCE_STATUS_SUPERSEDED
+                superseded["superseded_by"] = "manual-retract"
+                try:
+                    superseded["updated_at"] = (
+                        _pref_now_iso() if _pref_now_iso else _now_iso()
+                    )
+                except Exception:
+                    pass
+                kept.append(superseded)
+                removed += 1
+            else:
+                kept.append(item)
+        if removed == 0:
+            return state, 0
+        state.interaction_preferences = kept
+        if not save_character_state(conf_uid, state):
+            return None, 0
+        return state, removed
+    except Exception as error:
+        logger.debug(
+            "Interaction preference retract failed: type={}",
+            type(error).__name__,
+        )
+        return None, 0
 
 
 def consume_due_future_intentions(

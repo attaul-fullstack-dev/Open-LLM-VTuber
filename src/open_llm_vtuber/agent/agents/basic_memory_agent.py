@@ -1067,6 +1067,170 @@ class BasicMemoryAgent(AgentInterface):
         except Exception:
             return []
 
+    def list_memory_overview(
+        self, episodic_limit: int = 50
+    ) -> Dict[str, Any]:
+        """One consistent snapshot of every persistent memory store the
+        retrieval layer actually reads, for the Memory Manager UI.
+
+        Each category is re-read from its authoritative file (never merged
+        into a new store, never duplicated): character facts, active
+        interaction preferences, pending future intentions, the most recent
+        episodic events (bounded; ``total`` reports the full count), and the
+        current world/life state (read-only singleton). Derived data
+        (rolling summaries, transcripts) and prompt caches are deliberately
+        excluded. Fail-soft per category: one unreadable store never hides
+        the others.
+        """
+        conf_uid = getattr(self, "_character_conf_uid", None)
+        overview: Dict[str, Any] = {
+            "facts": [],
+            "preferences": [],
+            "intentions": [],
+            "episodic": {"total": 0, "events": []},
+            "world": None,
+        }
+        if not conf_uid:
+            return overview
+        try:
+            overview["facts"] = self.list_character_memories()
+        except Exception:
+            overview["facts"] = []
+        try:
+            from ...character_state import load_character_state
+            from ...future_intentions import pending_intentions
+            from ...interaction_preferences import active_preferences
+
+            fresh = load_character_state(conf_uid)
+            overview["preferences"] = active_preferences(
+                fresh.interaction_preferences
+            )
+            overview["intentions"] = pending_intentions(
+                fresh.future_intentions
+            )
+        except Exception as error:
+            logger.debug(
+                "Memory overview preferences/intentions skipped: type={}",
+                type(error).__name__,
+            )
+        try:
+            from ...episodic_memory import load_episodic_events
+
+            events = load_episodic_events(conf_uid) or []
+            limit = max(1, int(episodic_limit or 50))
+            overview["episodic"] = {
+                "total": len(events),
+                "events": list(reversed(events[-limit:])),
+            }
+        except Exception as error:
+            logger.debug(
+                "Memory overview episodic skipped: type={}",
+                type(error).__name__,
+            )
+        try:
+            from ...world_state import load_world_state
+
+            world = load_world_state(conf_uid)
+            overview["world"] = {
+                "location": getattr(world, "location", ""),
+                "activity": getattr(world, "activity", ""),
+                "energy": getattr(world, "energy", None),
+                "mood": getattr(world, "mood", ""),
+                "time_context": getattr(world, "time_context", ""),
+                "activity_started_at": getattr(world, "activity_started_at", ""),
+                "last_update_at": getattr(world, "last_update_at", ""),
+            }
+        except Exception as error:
+            logger.debug(
+                "Memory overview world state skipped: type={}",
+                type(error).__name__,
+            )
+        return overview
+
+    def remove_interaction_preference(self, preference_id: str) -> bool:
+        """Retract one stored interaction preference by id.
+
+        True only when an ACTIVE row actually transitioned (it becomes
+        SUPERSEDED, which the prompt renderer already excludes). Unknown or
+        already-superseded ids return False and change nothing.
+        """
+        if not self._character_conf_uid:
+            return False
+        try:
+            from ...character_state import retract_interaction_preference
+
+            state, removed = retract_interaction_preference(
+                self._character_conf_uid, preference_id
+            )
+        except Exception:
+            state, removed = None, 0
+        if state is None or removed == 0:
+            if state is not None:
+                self._character_state = state
+            return False
+        self._character_state = state
+        logger.info(
+            "Interaction preference retracted: preference_id={} removed={}",
+            preference_id,
+            removed,
+        )
+        return True
+
+    def cancel_future_intention(self, intention_id: str) -> bool:
+        """Cancel one pending reminder request by id.
+
+        True only when a PENDING row actually transitioned to CANCELLED.
+        """
+        if not self._character_conf_uid:
+            return False
+        try:
+            from ...character_state import cancel_stored_future_intention
+
+            ok = bool(
+                cancel_stored_future_intention(
+                    self._character_conf_uid, intention_id
+                )
+            )
+        except Exception:
+            return False
+        if not ok:
+            return False
+        try:
+            from ...character_state import load_character_state
+
+            self._character_state = load_character_state(
+                self._character_conf_uid
+            )
+        except Exception:
+            pass
+        logger.info(
+            "Future intention cancelled: intention_id={}", intention_id
+        )
+        return True
+
+    def delete_episodic_event(self, event_id: str) -> bool:
+        """Delete one episodic event by id.
+
+        True only when the authoritative file actually lost the row. Always
+        invalidates the per-turn episodic selection cache: without this, a
+        deleted event kept being served from cache and re-entered prompts
+        (proven resurrection vector).
+        """
+        if not self._character_conf_uid or not str(event_id or "").strip():
+            return False
+        try:
+            from ...episodic_memory import delete_episodic_events_by_ids
+
+            outcome = delete_episodic_events_by_ids(
+                self._character_conf_uid, [str(event_id)]
+            )
+        except Exception:
+            return False
+        removed = bool((outcome.get("removed") or []))
+        if removed:
+            self._episodic_selection_cache = None
+        return removed
+
     def has_due_future_intention(self, moment: Optional[datetime] = None) -> bool:
         """True when a pending reminder is due right now (pure read)."""
         try:
@@ -1640,6 +1804,10 @@ class BasicMemoryAgent(AgentInterface):
         outcome = purge_attachment_memory(self._character_conf_uid, record_id)
         if outcome.get("attachment_removed"):
             self._invalidate_attachment_selection_cache()
+        if outcome.get("episodic_removed"):
+            # The purge deletes episodic copies too; without this, a deleted
+            # event kept being served from the per-turn cache.
+            self._episodic_selection_cache = None
         return outcome
 
     def _invalidate_attachment_selection_cache(self) -> None:

@@ -977,6 +977,12 @@ class WebSocketHandler:
             "delete-character-memory": self._handle_delete_character_memory,
             "reset-character-memory": self._handle_reset_character_memory,
             "reset-character-state": self._handle_reset_character_state,
+            "fetch-memory-overview": self._handle_fetch_memory_overview,
+            "delete-episodic-event": self._handle_delete_episodic_event,
+            "delete-interaction-preference": (
+                self._handle_delete_interaction_preference
+            ),
+            "cancel-future-intention": self._handle_cancel_future_intention,
             "fetch-attachment-memories": self._handle_fetch_attachment_memories,
             "delete-attachment-memory": self._handle_delete_attachment_memory,
             "clear-attachment-memories": self._handle_clear_attachment_memories,
@@ -1698,6 +1704,122 @@ class WebSocketHandler:
                 }
             )
         )
+
+    async def _handle_fetch_memory_overview(
+        self, websocket: WebSocket, client_uid: str, data: WSMessage
+    ) -> None:
+        """Return every persistent memory store retrieval actually reads.
+
+        One round trip for the unified Memory Manager: character facts,
+        active preferences, pending intentions, recent episodic events
+        (bounded, with total), and the read-only world snapshot. Each
+        category is served from its authoritative store; nothing is merged
+        or duplicated for display.
+        """
+        context = self.client_contexts[client_uid]
+        overview_fn = getattr(context.agent_engine, "list_memory_overview", None)
+        try:
+            limit = int((data or {}).get("episodic_limit", 50) or 50)
+        except (TypeError, ValueError):
+            limit = 50
+        limit = max(1, min(limit, 200))
+        overview = (
+            overview_fn(limit)
+            if callable(overview_fn)
+            else {
+                "facts": [],
+                "preferences": [],
+                "intentions": [],
+                "episodic": {"total": 0, "events": []},
+                "world": None,
+            }
+        )
+        await websocket.send_text(
+            json.dumps({"type": "memory-overview", "overview": overview})
+        )
+
+    async def _handle_delete_episodic_event(
+        self, websocket: WebSocket, client_uid: str, data: dict
+    ) -> None:
+        """Delete one episodic event by its stable id.
+
+        An empty identifier is refused before any agent call, so a malformed
+        request can never become a wipe.
+        """
+        await self._pause_proactive_for_maintenance(client_uid)
+        context = self.client_contexts[client_uid]
+        try:
+            event_id = str(data.get("event_id", "") or "")
+            delete = getattr(context.agent_engine, "delete_episodic_event", None)
+            success = bool(event_id and callable(delete) and delete(event_id))
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "episodic-event-deleted",
+                        "success": success,
+                        "event_id": event_id,
+                    }
+                )
+            )
+        finally:
+            await self._resume_proactive_after_maintenance(client_uid, context)
+
+    async def _handle_delete_interaction_preference(
+        self, websocket: WebSocket, client_uid: str, data: dict
+    ) -> None:
+        """Retract one interaction preference by id (marks it superseded).
+
+        The preference lifecycle has no physical delete; the terminal status
+        already exists and the prompt renderer already excludes it, so this
+        is a status transition, not a row removal. Empty identifiers refused.
+        """
+        await self._pause_proactive_for_maintenance(client_uid)
+        context = self.client_contexts[client_uid]
+        try:
+            preference_id = str(data.get("preference_id", "") or "")
+            retract = getattr(
+                context.agent_engine, "remove_interaction_preference", None
+            )
+            success = bool(
+                preference_id and callable(retract) and retract(preference_id)
+            )
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "interaction-preference-deleted",
+                        "success": success,
+                        "preference_id": preference_id,
+                    }
+                )
+            )
+        finally:
+            await self._resume_proactive_after_maintenance(client_uid, context)
+
+    async def _handle_cancel_future_intention(
+        self, websocket: WebSocket, client_uid: str, data: dict
+    ) -> None:
+        """Cancel one pending reminder request by id.
+
+        Only a PENDING row transitions; done/cancelled/unknown ids report
+        failure and change nothing.
+        """
+        await self._pause_proactive_for_maintenance(client_uid)
+        context = self.client_contexts[client_uid]
+        try:
+            intention_id = str(data.get("intention_id", "") or "")
+            cancel = getattr(context.agent_engine, "cancel_future_intention", None)
+            success = bool(intention_id and callable(cancel) and cancel(intention_id))
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "future-intention-cancelled",
+                        "success": success,
+                        "intention_id": intention_id,
+                    }
+                )
+            )
+        finally:
+            await self._resume_proactive_after_maintenance(client_uid, context)
 
     async def _handle_delete_character_memory(
         self, websocket: WebSocket, client_uid: str, data: dict
