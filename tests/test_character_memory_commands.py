@@ -561,5 +561,119 @@ class ListFreshnessTest(unittest.TestCase):
         self.assertEqual(agent.list_character_memories(), [])
 
 
+class MemoryLifecycleAcceptanceTest(unittest.TestCase):
+    """End-to-end acceptance for the Memory Manager contract.
+
+    All isolated: a temporary working directory stands in for the stores, so
+    no production memory is ever used as test data.
+    """
+
+    def setUp(self):
+        self.old_cwd = os.getcwd()
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        os.chdir(self.temporary_directory.name)
+        self.conf_uid = "mili-memory-lifecycle"
+
+    def tearDown(self):
+        os.chdir(self.old_cwd)
+        self.temporary_directory.cleanup()
+
+    def _agent(self):
+        agent = object.__new__(BasicMemoryAgent)
+        agent._character_conf_uid = self.conf_uid
+        agent._character_state = load_character_state(self.conf_uid)
+        return agent
+
+    def _texts(self, agent):
+        return [row["text"] for row in agent.list_character_memories()]
+
+    def test_every_eligible_row_is_listed(self):
+        """Manual, automatic, untagged, and oddly-dated rows must all reach
+        the UI: only empty-text rows are legitimately dropped."""
+        import json as _json
+        import os as _os
+
+        _os.makedirs("character_state", exist_ok=True)
+        rows = [
+            {
+                "text": "manual fact",
+                "added_at": "2026-09-01T00:00:00+00:00",
+                "explicit": True,
+                "kind": "",
+            },
+            {
+                "text": "auto fact",
+                "added_at": "2026-09-02T00:00:00+00:00",
+                "explicit": False,
+                "kind": "",
+            },
+            {
+                "text": "legacy row without flags",
+                "added_at": "",
+                "explicit": False,
+                "kind": "",
+            },
+            {"text": "   ", "added_at": "", "explicit": True, "kind": ""},
+            "not-a-dict",
+        ]
+        with open(
+            _os.path.join("character_state", f"{self.conf_uid}.json"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            _json.dump({"memories": rows}, handle)
+        self.assertEqual(
+            self._texts(self._agent()),
+            ["manual fact", "auto fact", "legacy row without flags"],
+        )
+
+    def test_deleted_fact_stays_deleted_after_restart(self):
+        """Simulated restart (a brand-new agent reading cold disk) must not
+        resurrect a deleted fact, and the prompt block must exclude it while
+        keeping the survivor."""
+        from src.open_llm_vtuber.character_state import (
+            build_character_memory_context,
+        )
+
+        agent = self._agent()
+        self.assertTrue(agent.add_character_memory("kopi susu"))
+        self.assertTrue(agent.add_character_memory("teh manis"))
+        self.assertTrue(agent.remove_character_memory("kopi susu", exact=True))
+
+        restarted = self._agent()
+        self.assertEqual(self._texts(restarted), ["teh manis"])
+        block = build_character_memory_context(
+            restarted._character_state, tz="Asia/Jakarta"
+        )
+        self.assertNotIn("kopi susu", block)
+        self.assertIn("teh manis", block)
+
+    def test_context_block_respects_budget_and_explicit_first(self):
+        """Measurement pinning the efficiency contract: explicit facts come
+        first, and the rendered block stays within its token budget no
+        matter how many facts are stored."""
+        from src.open_llm_vtuber.agent.context_window import estimate_tokens
+        from src.open_llm_vtuber.character_state import (
+            CHARACTER_MEMORY_MAX_TOKENS,
+            build_character_memory_context,
+            load_character_state,
+        )
+
+        agent = self._agent()
+        for i in range(30):
+            self.assertTrue(
+                agent.add_character_memory(f"fakta otomatis nomor {i}", explicit=False)
+            )
+        self.assertTrue(agent.add_character_memory("fakta manual penting"))
+        state = load_character_state(self.conf_uid)
+        self.assertEqual(len(state.memories), 31)
+        block = build_character_memory_context(state, tz="Asia/Jakarta")
+        self.assertLessEqual(estimate_tokens(block), CHARACTER_MEMORY_MAX_TOKENS)
+        first_bullet = next(
+            line for line in block.splitlines() if line.startswith("- ")
+        )
+        self.assertIn("fakta manual penting", first_bullet)
+
+
 if __name__ == "__main__":
     unittest.main()

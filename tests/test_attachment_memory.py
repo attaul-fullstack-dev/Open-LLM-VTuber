@@ -1538,5 +1538,60 @@ class DeletionSideEffectTest(TmpCwdTestCase):
         self.assertTrue(any("kucing.png" in m["content"] for m in rows))
 
 
+class AttachmentLifecycleAcceptanceTest(TmpCwdTestCase):
+    """Acceptance for the Attachment Memory contract.
+
+    All isolated (TmpCwdTestCase); no production attachment is ever used.
+    """
+
+    def _capture(self):
+        history_uid = create_new_history(CONF)
+        llm = FakeAgentLLM(describe_response("Kucing oranye tidur di sofa."))
+        agent = make_agent(CONF, history_uid, llm)
+        asyncio.run(
+            agent.capture_attachment_memory(
+                [image_item()], "lihat kucingku", history_uid, "req-life"
+            )
+        )
+        rows = load_attachment_memories(CONF)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["summary"], "Kucing oranye tidur di sofa.")
+        return agent, history_uid
+
+    def _fresh_agent(self):
+        history_uid = create_new_history(CONF)
+        return make_agent(CONF, history_uid, FakeAgentLLM([]))
+
+    def test_summary_survives_without_the_original_file(self):
+        """The original bytes are never persisted, yet the summary stays
+        retrievable after a cold restart with no image data anywhere."""
+        self._capture()
+        raw = open(f"attachment_memory/{CONF}.json", encoding="utf-8").read()
+        self.assertNotIn("iVBORw0KGgo", raw)
+
+        restarted = self._fresh_agent()
+        restarted._episodic_query = "kucing oranye sofa"
+        selected = restarted._attachment_selection()
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0]["summary"], "Kucing oranye tidur di sofa.")
+        self.assertTrue(restarted._attachment_context_for_prompt())
+
+    def test_purge_leaves_no_active_copy_after_restart(self):
+        """After a complete purge, a brand-new agent (restart simulation)
+        selects nothing, renders nothing, and the prompt excludes it."""
+        agent, _history_uid = self._capture()
+        rows = load_attachment_memories(CONF)
+        self.assertEqual(len(rows), 1)
+        outcome = agent.purge_attachment_memory(rows[0]["id"])
+        self.assertTrue(outcome["attachment_removed"])
+
+        restarted = self._fresh_agent()
+        restarted._episodic_query = "kucing oranye sofa"
+        self.assertEqual(restarted._attachment_selection(), [])
+        self.assertEqual(restarted._attachment_context_for_prompt(), "")
+        system = restarted._relationship_system_prompt("persona dasar")
+        self.assertNotIn("Kucing oranye tidur di sofa.", system)
+
+
 if __name__ == "__main__":
     unittest.main()
