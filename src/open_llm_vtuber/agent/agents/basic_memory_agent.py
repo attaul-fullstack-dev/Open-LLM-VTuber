@@ -37,6 +37,7 @@ from ...character_state import (
     build_character_memory_context,
     complete_goal,
     ensure_seed_goals,
+    get_character_state_path,
     goal_status_counts,
     load_character_state,
     migrate_relationship_if_needed,
@@ -119,12 +120,41 @@ from ...attachment_memory import (
     render_attachment_context,
     retrieve_attachment_memories,
 )
+import json
+import os
 import time
 from ...request_latency import (
     get_latency_tracker,
     reset_latency_phase,
     set_latency_phase,
 )
+
+# Per-category read status for the Memory Manager overview. ``ok`` = read
+# succeeded and the store has rows; ``empty`` = read succeeded and the store
+# is genuinely empty; ``error`` = the store could not be read (unreadable or
+# corrupt file, or the reader raised). The UI must show a load-failure
+# message for ``error`` instead of claiming the category is empty.
+MEMORY_STATUS_OK = "ok"
+MEMORY_STATUS_EMPTY = "empty"
+MEMORY_STATUS_ERROR = "error"
+
+
+def _memory_store_health(filepath: str) -> str:
+    """Classify a JSON memory store file for the overview diagnostics.
+
+    Returns ``"missing"`` when absent, ``"error"`` when present but
+    unreadable or not valid JSON, otherwise ``"ok"``. Diagnostic only: never
+    raises, and never normalizes store semantics (that stays in each store).
+    """
+    if not filepath or not os.path.exists(filepath):
+        return "missing"
+    try:
+        with open(filepath, "r", encoding="utf-8") as handle:
+            json.load(handle)
+        return "ok"
+    except Exception:
+        return "error"
+
 
 # Request-only cue for every proactive turn. Proactive generation is a
 # system-initiated turn, so the provider request never contains a *current*
@@ -213,6 +243,11 @@ class BasicMemoryAgent(AgentInterface):
         self._relationship_state = RelationshipState()
         self._character_state = CharacterState()
         self._character_conf_uid: Optional[str] = None
+        # Cheap (mtime_ns, size) stamp of the character_state file last
+        # reflected in ``_character_state``. Lets retrieval pick up a
+        # sibling connection's write on the next turn without re-reading the
+        # file every turn. None forces one initial load.
+        self._character_state_stamp: Optional[tuple] = None
         # IANA timezone for user-local World State time rules (None = UTC).
         self._user_timezone: Optional[str] = None
         # Absolute timestamp (UTC ISO) of the latest message in a *previous*
@@ -396,6 +431,7 @@ class BasicMemoryAgent(AgentInterface):
         state = migrate_relationship_if_needed(conf_uid, state)
         self._character_state = state
         self._character_conf_uid = conf_uid
+        self._character_state_stamp = self._character_state_file_stamp(conf_uid)
         # Seed the finite self-model goals once, right where the state is
         # loaded. Idempotent: a character that already has goals keeps exactly
         # those (no re-seed, no status rewrite, no reactivation), and the seed
@@ -425,6 +461,45 @@ class BasicMemoryAgent(AgentInterface):
             state.relationship_status,
             len(state.memories),
         )
+
+    @staticmethod
+    def _character_state_file_stamp(conf_uid: str) -> Optional[tuple]:
+        """Cheap (mtime_ns, size) stamp of the character_state file."""
+        try:
+            path = get_character_state_path(conf_uid)
+        except Exception:
+            return None
+        try:
+            stat = os.stat(path)
+            return (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            return ("missing", 0)
+
+    def _refresh_character_state_if_changed(self) -> None:
+        """Adopt a sibling connection's character-state write before a turn.
+
+        Retrieval reads ``_character_state`` (resolved at history resume),
+        while the Memory Manager re-reads the file. Without this, a fact
+        added or removed by another ACTIVE connection stayed invisible to
+        retrieval until this connection resumed. A stat-based stamp gates the
+        reload, so the file is read only when it actually changed -- never on
+        every turn. Fail-soft: any problem leaves the current state in place.
+        """
+        conf_uid = getattr(self, "_character_conf_uid", None)
+        if not conf_uid:
+            return
+        stamp = self._character_state_file_stamp(conf_uid)
+        if stamp is None or stamp == getattr(self, "_character_state_stamp", None):
+            return
+        try:
+            refreshed = load_character_state(conf_uid)
+        except Exception as error:
+            logger.debug(
+                "Character state refresh skipped: type={}", type(error).__name__
+            )
+            return
+        self._character_state = refreshed
+        self._character_state_stamp = stamp
 
     @staticmethod
     def _latest_other_session_at(
@@ -522,6 +597,10 @@ class BasicMemoryAgent(AgentInterface):
         return self._relationship_state.status
 
     def _relationship_system_prompt(self, base_prompt: str) -> str:
+        # Adopt any sibling-connection write to the character state (facts,
+        # preferences, intentions) before rendering this turn. Cheap stat
+        # gate: a re-read happens only when the file actually changed.
+        self._refresh_character_state_if_changed()
         parts = [
             base_prompt,
             # Temporal anchor: reliable "today" (date + weekday + user tz).
@@ -1089,32 +1168,57 @@ class BasicMemoryAgent(AgentInterface):
             "intentions": [],
             "episodic": {"total": 0, "events": []},
             "world": None,
+            # Per-category read status: ok | empty | error. Added alongside
+            # the data (never replacing it) so a failed store is reported as
+            # failed instead of being silently rendered as "no data".
+            "status": {
+                "facts": MEMORY_STATUS_EMPTY,
+                "preferences": MEMORY_STATUS_EMPTY,
+                "intentions": MEMORY_STATUS_EMPTY,
+                "episodic": MEMORY_STATUS_EMPTY,
+                "world": MEMORY_STATUS_EMPTY,
+            },
         }
         if not conf_uid:
             return overview
+        status = overview["status"]
+
+        def _success_status(rows: Any, health: str) -> str:
+            if health == "error":
+                return MEMORY_STATUS_ERROR
+            return MEMORY_STATUS_OK if rows else MEMORY_STATUS_EMPTY
+
+        # Facts, preferences and intentions share one authoritative file.
+        character_health = "missing"
         try:
-            overview["facts"] = self.list_character_memories()
-        except Exception:
-            overview["facts"] = []
-        try:
-            from ...character_state import load_character_state
+            from ...character_state import (
+                get_character_state_path,
+                load_character_state,
+            )
             from ...future_intentions import pending_intentions
             from ...interaction_preferences import active_preferences
 
+            character_health = _memory_store_health(get_character_state_path(conf_uid))
             fresh = load_character_state(conf_uid)
-            overview["preferences"] = active_preferences(
-                fresh.interaction_preferences
-            )
-            overview["intentions"] = pending_intentions(
-                fresh.future_intentions
-            )
+            facts = list(fresh.memories)
+            preferences = active_preferences(fresh.interaction_preferences)
+            intentions = pending_intentions(fresh.future_intentions)
+            overview["facts"] = facts
+            overview["preferences"] = preferences
+            overview["intentions"] = intentions
+            status["facts"] = _success_status(facts, character_health)
+            status["preferences"] = _success_status(preferences, character_health)
+            status["intentions"] = _success_status(intentions, character_health)
         except Exception as error:
             logger.debug(
-                "Memory overview preferences/intentions skipped: type={}",
+                "Memory overview character state skipped: type={}",
                 type(error).__name__,
             )
+            status["facts"] = MEMORY_STATUS_ERROR
+            status["preferences"] = MEMORY_STATUS_ERROR
+            status["intentions"] = MEMORY_STATUS_ERROR
         try:
-            from ...episodic_memory import load_episodic_events
+            from ...episodic_memory import get_episodic_path, load_episodic_events
 
             events = load_episodic_events(conf_uid) or []
             limit = max(1, int(episodic_limit or 50))
@@ -1122,13 +1226,17 @@ class BasicMemoryAgent(AgentInterface):
                 "total": len(events),
                 "events": list(reversed(events[-limit:])),
             }
+            status["episodic"] = _success_status(
+                events, _memory_store_health(get_episodic_path(conf_uid))
+            )
         except Exception as error:
             logger.debug(
                 "Memory overview episodic skipped: type={}",
                 type(error).__name__,
             )
+            status["episodic"] = MEMORY_STATUS_ERROR
         try:
-            from ...world_state import load_world_state
+            from ...world_state import get_world_state_path, load_world_state
 
             world = load_world_state(conf_uid)
             overview["world"] = {
@@ -1140,11 +1248,17 @@ class BasicMemoryAgent(AgentInterface):
                 "activity_started_at": getattr(world, "activity_started_at", ""),
                 "last_update_at": getattr(world, "last_update_at", ""),
             }
+            health = _memory_store_health(get_world_state_path(conf_uid))
+            status["world"] = (
+                MEMORY_STATUS_ERROR if health == "error" else MEMORY_STATUS_OK
+            )
         except Exception as error:
             logger.debug(
                 "Memory overview world state skipped: type={}",
                 type(error).__name__,
             )
+            overview["world"] = None
+            status["world"] = MEMORY_STATUS_ERROR
         return overview
 
     def remove_interaction_preference(self, preference_id: str) -> bool:

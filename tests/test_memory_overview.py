@@ -102,6 +102,42 @@ class MemoryOverviewTest(unittest.TestCase):
         )
         self.assertIsNotNone(overview["world"])
         self.assertIn("activity", overview["world"])
+        self.assertEqual(
+            overview["status"],
+            {
+                "facts": "ok",
+                "preferences": "ok",
+                "intentions": "ok",
+                "episodic": "ok",
+                "world": "ok",
+            },
+        )
+
+    def test_overview_status_is_empty_for_a_fresh_character(self):
+        overview = self.agent.list_memory_overview()
+        self.assertEqual(
+            overview["status"],
+            {
+                "facts": "empty",
+                "preferences": "empty",
+                "intentions": "empty",
+                "episodic": "empty",
+                "world": "ok",
+            },
+        )
+
+    def test_overview_reports_error_status_when_a_store_cannot_be_read(self):
+        from unittest import mock
+
+        with mock.patch.object(
+            em, "load_episodic_events", side_effect=RuntimeError("boom")
+        ):
+            overview = self.agent.list_memory_overview()
+        self.assertEqual(overview["status"]["episodic"], "error")
+        self.assertEqual(overview["episodic"], {"total": 0, "events": []})
+        # independent stores keep their real status
+        self.assertEqual(overview["status"]["facts"], "empty")
+        self.assertEqual(overview["status"]["world"], "ok")
 
     def test_overview_bounds_episodic_and_reports_total(self):
         seed_episodic("OVERVIEW festival layang sore")
@@ -394,6 +430,8 @@ class MemoryOverviewHandlerTest(unittest.TestCase):
         self.assertIn("intentions", overview)
         self.assertIn("total", overview["episodic"])
         self.assertIn("world", overview)
+        self.assertIn("status", overview)
+        self.assertEqual(overview["status"]["facts"], "ok")
 
     def test_episodic_delete_round_trip(self):
         import asyncio as _asyncio
