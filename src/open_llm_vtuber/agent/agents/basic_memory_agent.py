@@ -1345,6 +1345,47 @@ class BasicMemoryAgent(AgentInterface):
             self._episodic_selection_cache = None
         return removed
 
+    def search_episodic_memory(
+        self, query: str = "", *, limit: int = 50, cursor: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Search stored episodic events for the Memory Manager UI.
+
+        Lets a user find an old event that the bounded overview list (latest
+        N) would never show, without loading the whole store into the UI.
+        Newest-first with keyset pagination; matching, ordering and ids all
+        come from the authoritative store. Read-only: never writes, never
+        touches other memory categories. Fail-soft with an explicit status so
+        the UI can tell "no matches" apart from "store could not be read".
+        """
+        empty: Dict[str, Any] = {
+            "events": [],
+            "total": 0,
+            "has_more": False,
+            "next_cursor": None,
+            "status": MEMORY_STATUS_EMPTY,
+        }
+        conf_uid = getattr(self, "_character_conf_uid", None)
+        if not conf_uid:
+            return empty
+        try:
+            from ...episodic_memory import (
+                get_episodic_path,
+                search_episodic_events,
+            )
+
+            found = search_episodic_events(conf_uid, query, limit=limit, cursor=cursor)
+            health = _memory_store_health(get_episodic_path(conf_uid))
+        except Exception as error:
+            logger.debug("Episodic search skipped: type={}", type(error).__name__)
+            return {**empty, "status": MEMORY_STATUS_ERROR}
+        if health == "error":
+            status = MEMORY_STATUS_ERROR
+        elif found["total"]:
+            status = MEMORY_STATUS_OK
+        else:
+            status = MEMORY_STATUS_EMPTY
+        return {**found, "status": status}
+
     def has_due_future_intention(self, moment: Optional[datetime] = None) -> bool:
         """True when a pending reminder is due right now (pure read)."""
         try:

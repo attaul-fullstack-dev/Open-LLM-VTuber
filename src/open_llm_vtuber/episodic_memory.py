@@ -384,6 +384,94 @@ def delete_episodic_events_by_ids(
     return {"removed": removed, "missing": missing, "saved": True}
 
 
+def _event_time_key(event: Dict[str, Any]) -> float:
+    """Absolute epoch of an event's reference time (occurred_at, else created_at).
+
+    Never keyed on storage order: an experience that happened long ago keeps
+    its old position no matter when its row was appended. Unparseable/missing
+    stamps fall to 0.0 so they sort as the oldest, never dropped.
+    """
+    for field in ("occurred_at", "created_at"):
+        parsed = _parse_iso_or_none(event.get(field))
+        if parsed is not None:
+            return parsed.timestamp()
+    return 0.0
+
+
+def _episodic_search_key(event: Dict[str, Any]) -> Tuple[float, str]:
+    return (_event_time_key(event), str(event.get("id", "") or ""))
+
+
+def _encode_episodic_cursor(event: Dict[str, Any]) -> str:
+    key = _episodic_search_key(event)
+    return json.dumps({"t": key[0], "i": key[1]}, ensure_ascii=False)
+
+
+def _decode_episodic_cursor(cursor: Any) -> Optional[Tuple[float, str]]:
+    if cursor is None or isinstance(cursor, (dict, list, tuple, bool)):
+        return None
+    text = str(cursor).strip()
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+        return (float(data["t"]), str(data["i"]))
+    except Exception:
+        return None
+
+
+def search_episodic_events(
+    conf_uid: str,
+    query: Any = "",
+    *,
+    limit: int = 50,
+    cursor: Any = None,
+) -> Dict[str, Any]:
+    """Deterministic newest-first episodic search with keyset pagination.
+
+    Matching is a case-insensitive, whitespace-normalized substring test over
+    ``event_text`` (an empty query matches every event, so "load more" can
+    browse the whole store). Ordering is total and stable -- reference time
+    descending, then the durable event id descending -- so an opaque keyset
+    ``cursor`` from the previous page returns exactly the rows strictly after
+    it. Because the cursor is anchored on row identity rather than an array
+    offset, appending or deleting events between pages can never skip or
+    duplicate a returned event.
+
+    Pure over the loaded store (soft cap 500 rows). Returns
+    ``{"events", "total", "has_more", "next_cursor"}`` where ``total`` is the
+    full match count for the query (independent of pagination).
+    """
+    try:
+        page_size = max(1, int(limit))
+    except (TypeError, ValueError):
+        page_size = 50
+    events = load_episodic_events(conf_uid) or []
+    needle = _normalize_event_text(query)
+    if needle:
+        matched = [
+            event
+            for event in events
+            if needle in _normalize_event_text(event.get("event_text", ""))
+        ]
+    else:
+        matched = list(events)
+    matched.sort(key=_episodic_search_key, reverse=True)
+    total = len(matched)
+    after = _decode_episodic_cursor(cursor)
+    if after is not None:
+        matched = [event for event in matched if _episodic_search_key(event) < after]
+    page = matched[:page_size]
+    has_more = len(matched) > page_size
+    next_cursor = _encode_episodic_cursor(page[-1]) if page and has_more else None
+    return {
+        "events": page,
+        "total": total,
+        "has_more": has_more,
+        "next_cursor": next_cursor,
+    }
+
+
 def _normalize_event_text(text: Any) -> str:
     return " ".join(str(text or "").lower().split()).strip(" .,!?;:，。！？；：")
 

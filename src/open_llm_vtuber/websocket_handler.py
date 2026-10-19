@@ -978,6 +978,7 @@ class WebSocketHandler:
             "reset-character-memory": self._handle_reset_character_memory,
             "reset-character-state": self._handle_reset_character_state,
             "fetch-memory-overview": self._handle_fetch_memory_overview,
+            "search-episodic-events": self._handle_search_episodic_events,
             "delete-episodic-event": self._handle_delete_episodic_event,
             "delete-interaction-preference": (
                 self._handle_delete_interaction_preference
@@ -1736,6 +1737,49 @@ class WebSocketHandler:
         )
         await websocket.send_text(
             json.dumps({"type": "memory-overview", "overview": overview})
+        )
+
+    async def _handle_search_episodic_events(
+        self, websocket: WebSocket, client_uid: str, data: WSMessage
+    ) -> None:
+        """Search episodic events so old ones are reachable from the UI.
+
+        The overview only carries the latest N events; this read-only search
+        serves an arbitrary query newest-first with a stable keyset cursor, so
+        the dialog can find an old event or page through the store without
+        loading all of it at once. Category stays episodic-only.
+        """
+        context = self.client_contexts[client_uid]
+        search_fn = getattr(context.agent_engine, "search_episodic_memory", None)
+        payload = data or {}
+        query = str(payload.get("query", "") or "")
+        cursor = payload.get("cursor")
+        if cursor is not None:
+            cursor = str(cursor)
+        try:
+            limit = int(payload.get("limit", 50) or 50)
+        except (TypeError, ValueError):
+            limit = 50
+        limit = max(1, min(limit, 200))
+        if callable(search_fn):
+            outcome = search_fn(query, limit=limit, cursor=cursor)
+        else:
+            outcome = {
+                "events": [],
+                "total": 0,
+                "has_more": False,
+                "next_cursor": None,
+                "status": "error",
+            }
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "type": "episodic-search-results",
+                    "query": query,
+                    "append": cursor is not None,
+                    **outcome,
+                }
+            )
         )
 
     async def _handle_delete_episodic_event(
