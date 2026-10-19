@@ -308,6 +308,131 @@ class StorageTest(unittest.TestCase):
             self.assertEqual(len(load_episodic_events("c1")), 5)
 
 
+class StableEventIdTest(unittest.TestCase):
+    """Legacy rows without an `id` must gain ONE durable id, not a fresh
+    random one per load. The Memory Manager showed a different id on every
+    refresh and, worse, deletion addressed an id that no longer existed on
+    the next read. Ids are derived from the persisted store only."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old = os.getcwd()
+        os.chdir(self._tmp.name)
+
+    def tearDown(self):
+        os.chdir(self._old)
+        self._tmp.cleanup()
+
+    def _write_raw(self, conf_uid, rows):
+        os.makedirs("episodic", exist_ok=True)
+        with open(f"episodic/{conf_uid}.json", "w", encoding="utf-8") as handle:
+            json.dump(rows, handle)
+
+    def _read_raw(self, conf_uid):
+        with open(f"episodic/{conf_uid}.json", "r", encoding="utf-8") as handle:
+            return json.load(handle)
+
+    def _legacy(self, text, created):
+        return {
+            "event_text": text,
+            "occurred_at": None,
+            "session_uid": "sess-legacy",
+            "source": "conversation",
+            "created_at": created,
+            "tz": JAKARTA,
+        }
+
+    def test_idless_rows_get_stable_id_across_reloads(self):
+        self._write_raw(
+            "c1",
+            [
+                self._legacy(
+                    "User fixed a websocket bug.", "2026-01-01T00:00:00+00:00"
+                ),
+            ],
+        )
+        first = load_episodic_events("c1")
+        second = load_episodic_events("c1")
+        self.assertTrue(first[0]["id"])
+        self.assertEqual(first[0]["id"], second[0]["id"])
+        # and the id is now durable on disk, not synthesized per read
+        self.assertEqual(self._read_raw("c1")[0]["id"], first[0]["id"])
+
+    def test_backfilled_id_survives_reorder_and_new_append(self):
+        self._write_raw(
+            "c1",
+            [
+                self._legacy(
+                    "User fixed a websocket bug.", "2026-01-01T00:00:00+00:00"
+                ),
+                self._legacy("User cooked rendang.", "2026-01-02T00:00:00+00:00"),
+            ],
+        )
+        original = {row["event_text"]: row["id"] for row in load_episodic_events("c1")}
+        # Manual reorder = "list order changed".
+        rows = self._read_raw("c1")
+        self._write_raw("c1", list(reversed(rows)))
+        reordered = {row["event_text"]: row["id"] for row in load_episodic_events("c1")}
+        self.assertEqual(original, reordered)
+        # A brand new append must not disturb existing ids.
+        appended = append_episodic_event("c1", {"event_text": "User ran a marathon."})
+        after = {row["event_text"]: row["id"] for row in load_episodic_events("c1")}
+        self.assertEqual(
+            after["User fixed a websocket bug."],
+            original["User fixed a websocket bug."],
+        )
+        self.assertEqual(
+            after["User cooked rendang."], original["User cooked rendang."]
+        )
+        self.assertEqual(after["User ran a marathon."], appended["id"])
+
+    def test_delete_stable_id_removes_only_target(self):
+        self._write_raw(
+            "c1",
+            [
+                self._legacy(
+                    "User fixed a websocket bug.", "2026-01-01T00:00:00+00:00"
+                ),
+                self._legacy("User cooked rendang.", "2026-01-02T00:00:00+00:00"),
+                self._legacy("User deployed the backend.", "2026-01-03T00:00:00+00:00"),
+            ],
+        )
+        ids = {row["event_text"]: row["id"] for row in load_episodic_events("c1")}
+        target = ids["User cooked rendang."]
+        outcome = em.delete_episodic_events_by_ids("c1", [target])
+        self.assertEqual(outcome["removed"], [target])
+        remaining = load_episodic_events("c1")
+        self.assertEqual(
+            sorted(row["event_text"] for row in remaining),
+            ["User deployed the backend.", "User fixed a websocket bug."],
+        )
+        # surviving ids are unchanged (deleting one never re-indexes others)
+        for row in remaining:
+            self.assertEqual(row["id"], ids[row["event_text"]])
+
+    def test_backfill_preserves_unknown_keys_and_invalid_rows(self):
+        rows = [
+            self._legacy("User fixed a websocket bug.", "2026-01-01T00:00:00+00:00"),
+            {"event_text": "", "custom": "keep"},  # invalid: must not be dropped
+            "junk-row",  # non-dict: must not be dropped
+        ]
+        self._write_raw("c1", rows)
+        load_episodic_events("c1")
+        persisted = self._read_raw("c1")
+        self.assertEqual(len(persisted), 3)
+        self.assertEqual(persisted[1]["custom"], "keep")
+        self.assertEqual(persisted[2], "junk-row")
+        self.assertTrue(persisted[0]["id"])
+
+    def test_append_assigns_id_without_read_backfill(self):
+        stored = append_episodic_event("c1", {"event_text": "User ran a marathon."})
+        self.assertTrue(stored["id"])
+        # An already-id'd store is never rewritten by a plain load.
+        before = os.path.getmtime("episodic/c1.json")
+        load_episodic_events("c1")
+        self.assertEqual(os.path.getmtime("episodic/c1.json"), before)
+
+
 class RetrievalTest(unittest.TestCase):
     def setUp(self):
         self._events = [

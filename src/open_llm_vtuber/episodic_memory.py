@@ -268,31 +268,75 @@ def _valid_event(item: Any) -> Optional[Dict[str, Any]]:
     }
 
 
+def _backfill_missing_event_ids(data: List[Any]) -> Tuple[List[Any], bool]:
+    """Give every dict row a durable ``id`` when it does not have one.
+
+    Legacy or hand-written stores may predate event ids. Synthesizing a fresh
+    uuid per load made the Memory Manager show an id that changed on every
+    refresh and, worse, made deletion address an id that no longer existed on
+    the next read (delete silently removed nothing). Backfilling once and
+    persisting it makes the id stable across refresh, new sessions, restarts,
+    reordering, and new appends.
+
+    Returns ``(rows, changed)``. Only dict rows are touched (a copy is made);
+    unknown keys and non-dict/invalid rows are preserved verbatim so a
+    backfill is never destructive.
+    """
+    rows: List[Any] = []
+    changed = False
+    for item in data:
+        if isinstance(item, dict) and not str(item.get("id", "") or "").strip():
+            item = dict(item)
+            item["id"] = uuid.uuid4().hex
+            changed = True
+        rows.append(item)
+    return rows, changed
+
+
 def load_episodic_events(conf_uid: str) -> List[Dict[str, Any]]:
-    """Load episodic events; missing/corrupt files yield an empty list."""
+    """Load episodic events; missing/corrupt files yield an empty list.
+
+    Rows stored before ids existed are assigned one durable id and written
+    back atomically (once); every later read is a pure read. The whole
+    read-modify-write runs under the store lock so two concurrent loads can
+    never persist different ids for the same row.
+    """
     try:
         filepath = get_episodic_path(conf_uid)
     except ValueError:
         return []
     if not os.path.exists(filepath):
         return []
-    try:
-        with open(filepath, "r", encoding="utf-8") as file:
-            data = json.load(file)
-    except Exception as error:
-        logger.error(
-            "Failed to load episodic events: error_type={}",
-            type(error).__name__,
-        )
-        return []
-    if not isinstance(data, list):
-        return []
-    events = []
-    for item in data:
-        parsed = _valid_event(item)
-        if parsed is not None:
-            events.append(parsed)
-    return events
+    lock = _get_episodic_lock(filepath)
+    with lock:
+        try:
+            with open(filepath, "r", encoding="utf-8") as file:
+                data = json.load(file)
+        except Exception as error:
+            logger.error(
+                "Failed to load episodic events: error_type={}",
+                type(error).__name__,
+            )
+            return []
+        if not isinstance(data, list):
+            return []
+        rows, changed = _backfill_missing_event_ids(data)
+        if changed:
+            try:
+                _write_episodic_atomic(filepath, rows)
+            except Exception as error:
+                # Fail-soft: still return the rows (with this call's ids);
+                # the next load retries the backfill.
+                logger.error(
+                    "Failed to persist episodic event ids: error_type={}",
+                    type(error).__name__,
+                )
+        events = []
+        for item in rows:
+            parsed = _valid_event(item)
+            if parsed is not None:
+                events.append(parsed)
+        return events
 
 
 def save_episodic_events(conf_uid: str, events: List[Dict[str, Any]]) -> bool:

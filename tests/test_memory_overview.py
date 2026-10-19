@@ -129,6 +129,60 @@ class MemoryOverviewTest(unittest.TestCase):
         self.assertEqual(first["intentions"], second["intentions"])
         self.assertEqual(first["episodic"], second["episodic"])
 
+    def test_overview_episodic_ids_stable_and_delete_isolated(self):
+        # Legacy store with rows predating ids: the overview must expose ONE
+        # durable id per row (not a fresh one per load), and deleting the
+        # chosen row must leave the others untouched.
+        import json as _json
+
+        rows = [
+            {
+                "event_text": "OVERVIEW legacy satu",
+                "occurred_at": None,
+                "session_uid": "sess-legacy",
+                "source": "conversation",
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "tz": JKT,
+            },
+            {
+                "event_text": "OVERVIEW legacy dua",
+                "occurred_at": None,
+                "session_uid": "sess-legacy",
+                "source": "conversation",
+                "created_at": "2026-01-02T00:00:00+00:00",
+                "tz": JKT,
+            },
+        ]
+        os.makedirs("episodic", exist_ok=True)
+        with open(f"episodic/{CONF}.json", "w", encoding="utf-8") as handle:
+            _json.dump(rows, handle)
+
+        first = self.agent.list_memory_overview()
+        second = self.agent.list_memory_overview()
+        ids_first = sorted(row["id"] for row in first["episodic"]["events"])
+        ids_second = sorted(row["id"] for row in second["episodic"]["events"])
+        self.assertTrue(all(ids_first))
+        self.assertEqual(ids_first, ids_second)
+
+        target = next(
+            row["id"]
+            for row in first["episodic"]["events"]
+            if row["event_text"] == "OVERVIEW legacy satu"
+        )
+        survivor = next(
+            row["id"]
+            for row in first["episodic"]["events"]
+            if row["event_text"] == "OVERVIEW legacy dua"
+        )
+        self.assertTrue(self.agent.delete_episodic_event(target))
+        after = self.agent.list_memory_overview()
+        self.assertEqual(after["episodic"]["total"], 1)
+        self.assertEqual(
+            [row["event_text"] for row in after["episodic"]["events"]],
+            ["OVERVIEW legacy dua"],
+        )
+        self.assertEqual(after["episodic"]["events"][0]["id"], survivor)
+
     def test_overview_without_a_character_is_empty_not_broken(self):
         self.agent._character_conf_uid = ""
         overview = self.agent.list_memory_overview()
