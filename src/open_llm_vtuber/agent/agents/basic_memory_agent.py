@@ -1389,6 +1389,12 @@ class BasicMemoryAgent(AgentInterface):
     def has_due_future_intention(self, moment: Optional[datetime] = None) -> bool:
         """True when a pending reminder is due right now (pure read)."""
         try:
+            # Adopt a sibling connection's write before deciding to fire: the
+            # proactive trigger runs before the turn builds its prompt, so
+            # without this a reminder stored by another ACTIVE connection would
+            # stay invisible until an unrelated turn refreshed the snapshot.
+            # Cheap stat gate (see _refresh_character_state_if_changed).
+            self._refresh_character_state_if_changed()
             from ...future_intentions import due_intentions
 
             return bool(

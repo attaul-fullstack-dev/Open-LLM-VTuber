@@ -26,6 +26,7 @@ from src.open_llm_vtuber.agent.agents.basic_memory_agent import BasicMemoryAgent
 from src.open_llm_vtuber.character_state import (
     build_character_memory_context,
     load_character_state,
+    record_future_intention,
 )
 from src.open_llm_vtuber.chat_history_manager import create_new_history
 from src.open_llm_vtuber.config_manager import TTSPreprocessorConfig
@@ -353,6 +354,26 @@ class KnownBoundaryTest(unittest.TestCase):
         self.agent._relationship_system_prompt("PERSONA")
         self.assertIs(self.agent._character_state, first)
         self.assertEqual(self.agent._character_state_stamp, stamp)
+
+    def test_cross_connection_due_reminder_triggers_without_a_turn(self):
+        # Proactive reminder trigger: B stores an ALREADY-DUE reminder; A owns
+        # the scheduler and must detect it BEFORE taking any turn. Otherwise a
+        # reminder written by a sibling active connection never fires until an
+        # unrelated turn happens to refresh A's snapshot.
+        make_agent()  # second active connection
+        past = datetime.now(timezone.utc) - timedelta(days=2)
+        stored = record_future_intention(
+            CONF,
+            "Ingatkan aku besok jam 7 pagi untuk CONS konsistensi.",
+            now=past,
+            tz=JKT,
+        )
+        self.assertIsNotNone(stored)
+        self.assertTrue(stored.get("due_at"))
+        self.assertTrue(
+            self.agent.has_due_future_intention(),
+            "a sibling connection's due reminder must be visible to the trigger",
+        )
 
 
 if __name__ == "__main__":
