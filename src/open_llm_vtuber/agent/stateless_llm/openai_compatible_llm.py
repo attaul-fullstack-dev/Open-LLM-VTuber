@@ -19,7 +19,7 @@ from openai.types.chat.chat_completion_chunk import ChoiceDeltaToolCall
 from loguru import logger
 import time
 
-from .stateless_llm_interface import StatelessLLMInterface
+from .stateless_llm_interface import LLMProviderErrorText, StatelessLLMInterface
 from ...mcpp.types import ToolCallObject
 from ...request_latency import (
     build_attempt_tracking_http_client,
@@ -278,7 +278,10 @@ class AsyncLLM(StatelessLLMInterface):
             )
             if tracker and latency_phase == "chat":
                 tracker.record_provider_error("timeout")
-            yield "Error calling the chat endpoint: Timeout. Failed to connect to the LLM API. Check the configurations and the reachability of the LLM backend. See the logs for details."
+            yield LLMProviderErrorText(
+                "Error calling the chat endpoint: Timeout. Failed to connect to the LLM API. Check the configurations and the reachability of the LLM backend. See the logs for details.",
+                category="timeout",
+            )
 
         except APIConnectionError as e:
             logger.error(
@@ -286,7 +289,10 @@ class AsyncLLM(StatelessLLMInterface):
             )
             if tracker and latency_phase == "chat":
                 tracker.record_provider_error("connection_error")
-            yield "Error calling the chat endpoint: Connection error. Failed to connect to the LLM API. Check the configurations and the reachability of the LLM backend. See the logs for details. Troubleshooting with documentation: [https://open-llm-vtuber.github.io/docs/faq#%E9%81%87%E5%88%B0-error-calling-the-chat-endpoint-%E9%94%99%E8%AF%AF%E6%80%8E%E4%B9%88%E5%8A%9E]"
+            yield LLMProviderErrorText(
+                "Error calling the chat endpoint: Connection error. Failed to connect to the LLM API. Check the configurations and the reachability of the LLM backend. See the logs for details. Troubleshooting with documentation: [https://open-llm-vtuber.github.io/docs/faq#%E9%81%87%E5%88%B0-error-calling-the-chat-endpoint-%E9%94%99%E8%AF%AF%E6%80%8E%E4%B9%88%E5%8A%9E]",
+                category="connection_error",
+            )
 
         except RateLimitError as e:
             logger.error(
@@ -294,7 +300,10 @@ class AsyncLLM(StatelessLLMInterface):
             )
             if tracker and latency_phase == "chat":
                 tracker.record_provider_error("rate_limit")
-            yield "Error calling the chat endpoint: Rate limit exceeded. Please try again later. See the logs for details."
+            yield LLMProviderErrorText(
+                "Error calling the chat endpoint: Rate limit exceeded. Please try again later. See the logs for details.",
+                category="rate_limit",
+            )
 
         except APIError as e:
             if "does not support tools" in str(e):
@@ -311,7 +320,10 @@ class AsyncLLM(StatelessLLMInterface):
             logger.info(f"temperature: {self.temperature}")
             if tracker and latency_phase == "chat":
                 tracker.record_provider_error("api_error")
-            yield "Error calling the chat endpoint: Error occurred while generating response. See the logs for details."
+            yield LLMProviderErrorText(
+                "Error calling the chat endpoint: Error occurred while generating response. See the logs for details.",
+                category="api_error",
+            )
 
         finally:
             if tracker:

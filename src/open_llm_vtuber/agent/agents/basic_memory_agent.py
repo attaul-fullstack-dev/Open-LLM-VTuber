@@ -13,7 +13,10 @@ from datetime import datetime, timezone
 from loguru import logger
 from .agent_interface import AgentInterface
 from ..output_types import SentenceOutput, DisplayText
-from ..stateless_llm.stateless_llm_interface import StatelessLLMInterface
+from ..stateless_llm.stateless_llm_interface import (
+    LLMProviderErrorText,
+    StatelessLLMInterface,
+)
 from ..stateless_llm.claude_llm import AsyncLLM as ClaudeAsyncLLM
 from ..stateless_llm.openai_compatible_llm import AsyncLLM as OpenAICompatibleAsyncLLM
 from ...chat_history_manager import (
@@ -176,6 +179,23 @@ PROACTIVE_TURN_CUE = "Continue the conversation naturally on your own."
 # cap the loop stops cleanly and the existing graceful/fail-soft response
 # path finishes the turn.
 TOOL_LOOP_MAX_ITERATIONS = 4
+
+
+def _provider_error_event(event: Any) -> Optional[Dict[str, Any]]:
+    """Normalize a provider failure from any adapter into one event shape."""
+    if isinstance(event, LLMProviderErrorText):
+        return {
+            "type": "provider_error",
+            "message": str(event),
+            "category": getattr(event, "category", "provider_error"),
+        }
+    if isinstance(event, dict) and event.get("type") in ("error", "provider_error"):
+        return {
+            "type": "provider_error",
+            "message": str(event.get("message") or "LLM provider error"),
+            "category": str(event.get("category") or "provider_error"),
+        }
+    return None
 
 
 class BasicMemoryAgent(AgentInterface):
@@ -2772,6 +2792,14 @@ class BasicMemoryAgent(AgentInterface):
             current_assistant_message_content.clear()
 
             async for event in stream:
+                provider_error = _provider_error_event(event)
+                if provider_error is not None:
+                    logger.warning(
+                        "Provider error during Claude tool loop: category={}",
+                        provider_error["category"],
+                    )
+                    yield provider_error
+                    return
                 if event["type"] == "text_delta":
                     text = event["text"]
                     current_turn_text += text
@@ -2934,6 +2962,14 @@ class BasicMemoryAgent(AgentInterface):
             goto_next_while_iteration = False
 
             async for event in stream:
+                provider_error = _provider_error_event(event)
+                if provider_error is not None:
+                    logger.warning(
+                        "Provider error during OpenAI tool loop: category={}",
+                        provider_error["category"],
+                    )
+                    yield provider_error
+                    return
                 if self.prompt_mode_flag:
                     if isinstance(event, str):
                         current_turn_text += event
@@ -3176,6 +3212,14 @@ class BasicMemoryAgent(AgentInterface):
                 )
                 complete_response = ""
                 async for event in token_stream:
+                    provider_error = _provider_error_event(event)
+                    if provider_error is not None:
+                        logger.warning(
+                            "Provider error during chat: category={}",
+                            provider_error["category"],
+                        )
+                        yield provider_error
+                        return
                     text_chunk = ""
                     if isinstance(event, dict) and event.get("type") == "text_delta":
                         text_chunk = event.get("text", "")
@@ -3338,6 +3382,14 @@ class BasicMemoryAgent(AgentInterface):
             )
             complete_response = ""
             async for event in token_stream:
+                provider_error = _provider_error_event(event)
+                if provider_error is not None:
+                    logger.warning(
+                        "Provider error during proactive generation: category={}",
+                        provider_error["category"],
+                    )
+                    yield provider_error
+                    return
                 text_chunk = ""
                 if isinstance(event, dict) and event.get("type") == "text_delta":
                     text_chunk = event.get("text", "")

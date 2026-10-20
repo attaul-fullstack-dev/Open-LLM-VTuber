@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 
 from .context_window import estimate_tokens
+from .stateless_llm.stateless_llm_interface import LLMProviderErrorText
 
 
 SUMMARY_SYSTEM_PROMPT = """You maintain a compact factual summary of an older chat.
@@ -168,6 +169,16 @@ class IncrementalSummarizer:
             SUMMARY_SYSTEM_PROMPT,
         )
         async for event in stream:
+            if isinstance(event, LLMProviderErrorText):
+                raise RuntimeError(
+                    "Summarizer provider error: "
+                    f"{getattr(event, 'category', 'provider_error')}"
+                )
+            if isinstance(event, dict) and event.get("type") in (
+                "error",
+                "provider_error",
+            ):
+                raise RuntimeError("Summarizer provider error")
             if isinstance(event, str):
                 chunks.append(event)
             elif isinstance(event, dict) and event.get("type") == "text_delta":

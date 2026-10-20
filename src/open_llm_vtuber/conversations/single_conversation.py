@@ -203,6 +203,7 @@ async def process_single_conversation(
         # the reactive life-state step after the stream (group chats skip
         # reactive observation in v1).
         turn_emotions: List[str] = []
+        provider_error_occurred = False
         try:
             if proactive:
                 proactive_chat = getattr(context.agent_engine, "chat_proactively", None)
@@ -233,6 +234,20 @@ async def process_single_conversation(
                     logger.debug(f"Sending tool status update: {output_item}")
 
                     await websocket_send(json.dumps(output_item))
+
+                elif (
+                    isinstance(output_item, dict)
+                    and output_item.get("type") == "provider_error"
+                ):
+                    provider_error_occurred = True
+                    category = output_item.get("category", "provider_error")
+                    message = output_item.get("message") or "LLM provider error"
+                    logger.warning(
+                        "Provider error surfaced to client: category={}", category
+                    )
+                    await websocket_send(
+                        json.dumps({"type": "error", "message": message})
+                    )
 
                 elif isinstance(output_item, (SentenceOutput, AudioOutput)):
                     # Handle SentenceOutput or AudioOutput
@@ -270,6 +285,12 @@ async def process_single_conversation(
                         "Unexpected item type from agent chat stream (content omitted)"
                     )
 
+            if provider_error_occurred:
+                # A provider failure is not an assistant turn. Discard any
+                # partial text so it is not persisted as history and so the
+                # proactive scheduler releases the reminder for a retry.
+                full_response = ""
+
         except Exception as e:
             logger.exception(
                 f"Error processing agent response stream: {e}"
@@ -282,6 +303,11 @@ async def process_single_conversation(
                     }
                 )
             )
+            if proactive:
+                # A proactive turn that raised is not a delivery. Return an
+                # empty response so the scheduler releases the reminder for a
+                # later retry instead of completing it from partial text.
+                full_response = ""
             # full_response will contain partial response before error
         latency.mark("agent_end")
         # --- End processing agent response ---

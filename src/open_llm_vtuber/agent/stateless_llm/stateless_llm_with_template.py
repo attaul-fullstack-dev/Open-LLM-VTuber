@@ -10,7 +10,7 @@ from jinja2 import Template
 from loguru import logger
 from typing import AsyncIterator, List, Dict, Any
 
-from .stateless_llm_interface import StatelessLLMInterface
+from .stateless_llm_interface import LLMProviderErrorText, StatelessLLMInterface
 
 
 TEMPLATES = {
@@ -170,11 +170,14 @@ class AsyncLLMWithTemplate(StatelessLLMInterface):
                             yield next_token
         except Exception as e:
             logger.error(f"LLM API WITH TEMPLATE: Error occurred: {e}")
-            logger.info(f"Base URL: {self.base_url}")
+            logger.info(f"Base URL: {self.completion_url}")
             logger.info(f"Model: {self.model}")
             logger.info("Message count: {}", len(messages))
             logger.info(f"temperature: {self.temperature}")
-            yield "Error calling the chat endpoint: Error occurred while generating response. See the logs for details."
+            yield LLMProviderErrorText(
+                "Error calling the chat endpoint: Error occurred while generating response. See the logs for details.",
+                category="api_error",
+            )
         finally:
             # make sure the stream is properly closed
             # so when interrupted, no more tokens will being generated.

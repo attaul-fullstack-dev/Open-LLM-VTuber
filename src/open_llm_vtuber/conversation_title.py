@@ -22,6 +22,8 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List
 
+from .agent.stateless_llm.stateless_llm_interface import LLMProviderErrorText
+
 TITLE_SYSTEM_PROMPT = """You write a very short title for a chat conversation.
 Reply with ONLY the title, nothing else. Rules: 4-7 words, no quotes, no
 markdown, no prefix like "Judul:" or "Title:", no trailing period. Use the
@@ -159,6 +161,13 @@ async def generate_title(llm_chat_fn: Any, messages: Any) -> str:
         # Support both async generators and plain awaitables returning text.
         if hasattr(stream, "__aiter__"):
             async for event in stream:
+                if isinstance(event, LLMProviderErrorText):
+                    return ""
+                if isinstance(event, dict) and event.get("type") in (
+                    "error",
+                    "provider_error",
+                ):
+                    return ""
                 if isinstance(event, str):
                     chunks.append(event)
                 elif isinstance(event, dict) and event.get("type") == "text_delta":
@@ -169,6 +178,8 @@ async def generate_title(llm_chat_fn: Any, messages: Any) -> str:
 
                 result = await stream if _inspect.isawaitable(stream) else stream
             except Exception:
+                return ""
+            if isinstance(result, LLMProviderErrorText):
                 return ""
             if isinstance(result, str):
                 chunks.append(result)

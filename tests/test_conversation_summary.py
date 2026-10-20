@@ -4,6 +4,9 @@ import tempfile
 import unittest
 
 from src.open_llm_vtuber.agent.agents.basic_memory_agent import BasicMemoryAgent
+from src.open_llm_vtuber.agent.stateless_llm.stateless_llm_interface import (
+    LLMProviderErrorText,
+)
 from src.open_llm_vtuber.agent.context_window import (
     estimate_message_tokens,
     estimate_messages_tokens,
@@ -31,11 +34,19 @@ class _SummaryFakeLLM:
     def __init__(self):
         self.summary_prompts = []
         self.fail_summary = False
+        self.fail_summary_typed = False
 
     async def chat_completion(self, messages, system=None, tools=None):
         if system == SUMMARY_SYSTEM_PROMPT:
             if self.fail_summary:
                 raise TimeoutError("synthetic timeout")
+            if self.fail_summary_typed:
+                yield LLMProviderErrorText(
+                    "Error calling the chat endpoint: Error occurred while "
+                    "generating response. See the logs for details.",
+                    category="api_error",
+                )
+                return
             prompt = messages[0]["content"]
             self.summary_prompts.append(prompt)
             facts = []
@@ -330,6 +341,46 @@ class RollingSummaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metadata["summary_through_message_index"], 2)
         self.assertEqual(request[-1], message("user", "lanjut"))
         self.assertTrue(request[0]["content"].startswith("Conversation context"))
+
+    async def test_typed_provider_error_is_not_persisted_as_summary(self):
+        stored = [
+            message("user", "Aku paling suka ramen."),
+            message("assistant", "Oke."),
+            message("user", "padding " * 700),
+            message("assistant", "padding " * 700),
+            message("user", "recent"),
+            message("assistant", "recent"),
+        ]
+        history_uid = self.create_history(stored)
+        update_metadate(
+            self.conf_uid,
+            history_uid,
+            {
+                "conversation_summary": "User mengatakan paling suka ramen.",
+                "summary_through_message_index": 2,
+                "summary_updated_at": "2026-01-01T00:00:00+00:00",
+            },
+        )
+        llm = _SummaryFakeLLM()
+        llm.fail_summary_typed = True
+        agent = self.make_agent(llm, history_uid)
+        messages = [*copy.deepcopy(agent._memory), message("user", "lanjut")]
+
+        await agent._prepare_context_with_summary(
+            messages,
+            agent._system,
+            protected_start=len(messages) - 1,
+        )
+
+        metadata = get_metadata(self.conf_uid, history_uid)
+        self.assertEqual(
+            metadata["conversation_summary"], "User mengatakan paling suka ramen."
+        )
+        self.assertEqual(metadata["summary_through_message_index"], 2)
+        self.assertNotIn(
+            "Error calling the chat endpoint",
+            metadata["conversation_summary"],
+        )
 
     async def test_summary_and_recent_context_fit_budget(self):
         stored = [

@@ -84,6 +84,15 @@ class RaisingAgent(FakeAgent):
         raise RuntimeError("vision provider down")
 
 
+class ProviderErrorAgent:
+    async def chat(self, input_data):
+        yield {
+            "type": "provider_error",
+            "message": "Error calling the chat endpoint: bad request",
+            "category": "api_error",
+        }
+
+
 class MissingCaptureAgent:
     async def chat(self, input_data):
         yield sentence("Balasan tanpa capture.")
@@ -337,6 +346,16 @@ class GroupAttachmentCaptureTest(unittest.TestCase):
         self.assertEqual(len(agent_b.capture_calls), 1)
         self.assertEqual(agent_a.capture_calls[0]["history_uid"], history_a)
         self.assertEqual(agent_b.capture_calls[0]["history_uid"], history_b)
+
+    def test_provider_error_does_not_persist_group_turn(self):
+        history_uid, state = self._history()
+        agent = ProviderErrorAgent()
+        context = make_context(CONF, history_uid, agent)
+        sent = run_member_turn("m1", context, state, [])
+
+        self.assertEqual(get_history(CONF, history_uid), [])
+        self.assertEqual(state.conversation_history, ["Human: lihat kucingku"])
+        self.assertTrue(any(payload.get("type") == "error" for payload in sent))
 
     def test_capture_task_is_strongly_referenced(self):
         """A fire-and-forget task must not be garbage-collected mid-flight."""

@@ -7,6 +7,8 @@ tests pin the contract: pending until delivered, id-based ownership, retry on
 failure, no duplicate send, and request-only prompt steering.
 """
 
+import asyncio
+import json
 import os
 import tempfile
 import unittest
@@ -15,6 +17,9 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from src.open_llm_vtuber.agent.agents.basic_memory_agent import BasicMemoryAgent
+from src.open_llm_vtuber.agent.stateless_llm.stateless_llm_interface import (
+    LLMProviderErrorText,
+)
 from src.open_llm_vtuber.character_state import (
     claim_due_future_intentions,
     complete_claimed_future_intentions,
@@ -22,7 +27,11 @@ from src.open_llm_vtuber.character_state import (
     release_claimed_future_intentions,
     save_character_state,
 )
-from src.open_llm_vtuber.chat_history_manager import create_new_history, store_message
+from src.open_llm_vtuber.chat_history_manager import (
+    create_new_history,
+    get_history,
+    store_message,
+)
 from src.open_llm_vtuber.config_manager import TTSPreprocessorConfig
 from src.open_llm_vtuber.future_intentions import (
     STATUS_DONE,
@@ -50,12 +59,125 @@ class _FakeLLM:
         yield "Iya, aku inget kok."
 
 
+class _ProviderErrorLLM(_FakeLLM):
+    """Provider adapter failure, shaped exactly like the OpenAI adapter."""
+
+    def __init__(self):
+        super().__init__()
+        self.called = asyncio.Event()
+
+    async def chat_completion(self, messages, system=None, tools=None):
+        self.calls.append(
+            {
+                "messages": [dict(message) for message in messages],
+                "system": system,
+            }
+        )
+        self.called.set()
+        yield LLMProviderErrorText(
+            "Error calling the chat endpoint: Error occurred while generating response. See the logs for details.",
+            category="api_error",
+        )
+
+
+class _ProviderExceptionLLM(_FakeLLM):
+    """Provider raises instead of yielding a typed error text."""
+
+    def __init__(self):
+        super().__init__()
+        self.called = asyncio.Event()
+
+    async def chat_completion(self, messages, system=None, tools=None):
+        self.calls.append(
+            {
+                "messages": [dict(message) for message in messages],
+                "system": system,
+            }
+        )
+        self.called.set()
+        raise RuntimeError("provider exploded")
+        yield ""  # pragma: no cover - keeps this function an async generator
+
+
+class _PartialThenExceptionLLM(_FakeLLM):
+    """Provider emits some text and then raises mid-stream."""
+
+    def __init__(self):
+        super().__init__()
+        self.called = asyncio.Event()
+
+    async def chat_completion(self, messages, system=None, tools=None):
+        self.calls.append(
+            {
+                "messages": [dict(message) for message in messages],
+                "system": system,
+            }
+        )
+        self.called.set()
+        yield "Aku inget "
+        raise RuntimeError("provider exploded after partial text")
+
+
+class _PartialThenProviderErrorLLM(_FakeLLM):
+    """Provider emits text then returns a typed error event."""
+
+    def __init__(self):
+        super().__init__()
+        self.called = asyncio.Event()
+
+    async def chat_completion(self, messages, system=None, tools=None):
+        self.calls.append(
+            {
+                "messages": [dict(message) for message in messages],
+                "system": system,
+            }
+        )
+        self.called.set()
+        yield "Aku inget "
+        yield LLMProviderErrorText(
+            "Error calling the chat endpoint: Error occurred while generating response. See the logs for details.",
+            category="api_error",
+        )
+
+
+class _ClaudeProviderErrorLLM(_FakeLLM):
+    """Claude-shaped stream that yields a partial delta then an error event."""
+
+    async def chat_completion(self, messages, system=None, tools=None):
+        self.calls.append(
+            {
+                "messages": [dict(message) for message in messages],
+                "system": system,
+            }
+        )
+        yield {"type": "text_delta", "text": "Aku "}
+        yield {"type": "error", "message": "Claude API error: overloaded"}
+
+
+class _SuccessLLM(_FakeLLM):
+    """Normal provider response with a completion signal for the test."""
+
+    def __init__(self):
+        super().__init__()
+        self.called = asyncio.Event()
+
+    async def chat_completion(self, messages, system=None, tools=None):
+        self.calls.append(
+            {
+                "messages": [dict(message) for message in messages],
+                "system": system,
+            }
+        )
+        self.called.set()
+        yield "Iya, aku ingetin minum obat ya."
+
+
 class _FakeLive2D:
     def extract_emotion(self, _text):
         return []
 
 
-def _make_agent(conf_uid, history_uid, llm_cls=_FakeLLM):
+def _make_agent(conf_uid, history_uid, llm_cls=_FakeLLM, context_window_override=2200):
     llm = llm_cls()
     agent = BasicMemoryAgent(
         llm=llm,
@@ -68,7 +190,7 @@ def _make_agent(conf_uid, history_uid, llm_cls=_FakeLLM):
                 "translate_provider": "deeplx",
             },
         ),
-        context_window_override=2200,
+        context_window_override=context_window_override,
     )
     agent.set_memory_from_history(conf_uid, history_uid)
     return agent, llm
@@ -440,6 +562,17 @@ class ReminderDispatchOrderingTests(unittest.IsolatedAsyncioTestCase):
                 history_uid=self.history_uid,
                 agent_engine=agent,
                 user_timezone="Asia/Jakarta",
+                asr_engine=None,
+                live2d_model=_FakeLive2D(),
+                tts_engine=None,
+                translate_engine=None,
+                voice_output_enabled=False,
+                character_config=SimpleNamespace(
+                    conf_uid=self.conf_uid,
+                    human_name="User",
+                    character_name="Mili",
+                    avatar="mili.png",
+                ),
             )
         }
         handler.client_connections = {"client": SimpleNamespace(send_text=AsyncMock())}
@@ -515,6 +648,215 @@ class ReminderDispatchOrderingTests(unittest.IsolatedAsyncioTestCase):
                 await timer
         return captured
 
+    async def _run_real(self, llm_cls):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        from src.open_llm_vtuber.proactive_chat import (
+            ProactiveChatConfig,
+            ProactiveStateMachine,
+        )
+
+        agent, llm = _make_agent(
+            self.conf_uid,
+            self.history_uid,
+            llm_cls=llm_cls,
+            context_window_override=5000,
+        )
+        handler = self._handler(agent)
+        sent_payloads = []
+
+        async def send_text(payload):
+            sent_payloads.append(json.loads(payload))
+
+        handler.client_connections = {"client": SimpleNamespace(send_text=send_text)}
+        machine = ProactiveStateMachine(
+            ProactiveChatConfig(
+                initial_idle_min_seconds=1,
+                initial_idle_max_seconds=1,
+                followup_idle_min_seconds=100,
+                followup_idle_max_seconds=100,
+            ),
+            randint=lambda minimum, _maximum: minimum,
+        )
+        state = machine.new_state(self.history_uid)
+        proactive_sent_calls = []
+        original_record_proactive_sent = machine.record_proactive_sent
+
+        def record_proactive_sent_spy(*args, **kwargs):
+            proactive_sent_calls.append(kwargs)
+            return original_record_proactive_sent(*args, **kwargs)
+
+        machine.record_proactive_sent = record_proactive_sent_spy
+
+        async def return_display_text(output, **_kwargs):
+            return output.display_text.text
+
+        with (
+            patch(
+                "src.open_llm_vtuber.conversations.single_conversation.process_agent_output",
+                new=return_display_text,
+            ),
+            patch(
+                "src.open_llm_vtuber.conversations.single_conversation.finalize_conversation_turn",
+                new=AsyncMock(),
+            ),
+        ):
+            timer = asyncio.create_task(
+                handler._run_proactive_timer("client", self.history_uid, state, machine)
+            )
+            handler._proactive_timer_tasks["client"] = timer
+            try:
+                await asyncio.wait_for(llm.called.wait(), 3)
+                # Let process_single_conversation settle the claim, then stop
+                # the timer before its next idle retry can call the provider.
+                await asyncio.sleep(0.3)
+            finally:
+                timer.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await timer
+        return agent, llm, sent_payloads, proactive_sent_calls
+
+    async def test_openai_tool_loop_surfaces_provider_error_not_text(self):
+        agent, llm = _make_agent(
+            self.conf_uid, self.history_uid, llm_cls=_ProviderErrorLLM
+        )
+        outputs = [
+            output
+            async for output in agent._openai_tool_interaction_loop(
+                [{"role": "user", "content": "halo"}], []
+            )
+        ]
+        self.assertEqual(len(llm.calls), 1)
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(outputs[0]["type"], "provider_error")
+        self.assertEqual(outputs[0]["category"], "api_error")
+        self.assertFalse(any(isinstance(output, str) for output in outputs))
+
+    async def test_claude_tool_loop_surfaces_provider_error_not_text(self):
+        agent, llm = _make_agent(
+            self.conf_uid, self.history_uid, llm_cls=_ClaudeProviderErrorLLM
+        )
+        outputs = [
+            output
+            async for output in agent._claude_tool_interaction_loop(
+                [{"role": "user", "content": "halo"}], []
+            )
+        ]
+        self.assertEqual(len(llm.calls), 1)
+        self.assertEqual(outputs[0], "Aku ")
+        self.assertEqual(outputs[-1]["type"], "provider_error")
+        self.assertEqual(outputs[-1]["category"], "provider_error")
+        self.assertEqual(outputs[-1]["message"], "Claude API error: overloaded")
+
+    async def test_provider_error_keeps_pending_and_out_of_history(self):
+        agent, llm, sent_payloads, proactive_sent_calls = await self._run_real(
+            _ProviderErrorLLM
+        )
+        self.assertEqual(len(llm.calls), 1)
+        stored = self._stored()
+        self.assertEqual(stored["status"], STATUS_PENDING)
+        self.assertNotIn("claimed_by", stored)
+        self.assertEqual(
+            [
+                message["role"]
+                for message in get_history(self.conf_uid, self.history_uid)
+            ],
+            ["human", "ai"],
+        )
+        self.assertEqual(proactive_sent_calls, [])
+        self.assertTrue(
+            any(
+                payload.get("type") == "error"
+                and "Error calling the chat endpoint" in payload.get("message", "")
+                for payload in sent_payloads
+            )
+        )
+
+    async def test_provider_exception_keeps_pending_and_out_of_history(self):
+        agent, llm, sent_payloads, proactive_sent_calls = await self._run_real(
+            _ProviderExceptionLLM
+        )
+        self.assertEqual(len(llm.calls), 1)
+        stored = self._stored()
+        self.assertEqual(stored["status"], STATUS_PENDING)
+        self.assertNotIn("claimed_by", stored)
+        self.assertEqual(
+            [
+                message["role"]
+                for message in get_history(self.conf_uid, self.history_uid)
+            ],
+            ["human", "ai"],
+        )
+        self.assertEqual(proactive_sent_calls, [])
+        self.assertTrue(
+            any(payload.get("type") == "error" for payload in sent_payloads)
+        )
+
+    async def test_partial_provider_exception_releases_and_stays_out_of_history(
+        self,
+    ):
+        agent, llm, sent_payloads, proactive_sent_calls = await self._run_real(
+            _PartialThenExceptionLLM
+        )
+        self.assertEqual(len(llm.calls), 1)
+        stored = self._stored()
+        self.assertEqual(stored["status"], STATUS_PENDING)
+        self.assertNotIn("claimed_by", stored)
+        self.assertEqual(
+            [
+                message["role"]
+                for message in get_history(self.conf_uid, self.history_uid)
+            ],
+            ["human", "ai"],
+        )
+        self.assertEqual(proactive_sent_calls, [])
+        self.assertTrue(
+            any(payload.get("type") == "error" for payload in sent_payloads)
+        )
+
+    async def test_partial_then_provider_error_discards_partial_text(self):
+        agent, llm, sent_payloads, proactive_sent_calls = await self._run_real(
+            _PartialThenProviderErrorLLM
+        )
+        self.assertEqual(len(llm.calls), 1)
+        stored = self._stored()
+        self.assertEqual(stored["status"], STATUS_PENDING)
+        self.assertNotIn("claimed_by", stored)
+        history = get_history(self.conf_uid, self.history_uid)
+        self.assertEqual([message["role"] for message in history], ["human", "ai"])
+        self.assertFalse(any("Aku inget" in message["content"] for message in history))
+        self.assertEqual(proactive_sent_calls, [])
+        self.assertTrue(
+            any(payload.get("type") == "error" for payload in sent_payloads)
+        )
+        self.assertFalse(
+            any(
+                payload.get("type") == "audio"
+                and "Error calling the chat endpoint"
+                in json.dumps(payload, ensure_ascii=False)
+                for payload in sent_payloads
+            )
+        )
+
+    async def test_successful_turn_still_completes_and_persists(self):
+        agent, llm, sent_payloads, proactive_sent_calls = await self._run_real(
+            _SuccessLLM
+        )
+        self.assertEqual(len(llm.calls), 1)
+        stored = self._stored()
+        self.assertEqual(stored["status"], STATUS_DONE)
+        self.assertNotIn("claimed_by", stored)
+        history = get_history(self.conf_uid, self.history_uid)
+        self.assertEqual(
+            [message["role"] for message in history], ["human", "ai", "ai"]
+        )
+        self.assertIn("aku ingetin minum obat ya", history[-1]["content"])
+        self.assertEqual(len(proactive_sent_calls), 1)
+        self.assertFalse(
+            any(payload.get("type") == "error" for payload in sent_payloads)
+        )
+
     async def test_prompt_sees_pending_text_and_success_completes(self):
         captured = await self._run("Iya, aku ingetin minum obat ya.")
         self.assertEqual(captured["status_at_prompt"], STATUS_PENDING)
@@ -530,3 +872,120 @@ class ReminderDispatchOrderingTests(unittest.IsolatedAsyncioTestCase):
         stored = self._stored()
         self.assertEqual(stored["status"], STATUS_PENDING)
         self.assertNotIn("claimed_by", stored)
+
+
+class ProviderErrorTextTests(unittest.IsolatedAsyncioTestCase):
+    async def test_openai_adapter_preserves_provider_error_categories(self):
+        import httpx
+        from openai import (
+            APIConnectionError,
+            APIStatusError,
+            APITimeoutError,
+            RateLimitError,
+        )
+
+        from src.open_llm_vtuber.agent.stateless_llm.openai_compatible_llm import (
+            AsyncLLM,
+        )
+
+        request = httpx.Request("POST", "http://127.0.0.1:1/v1/chat/completions")
+        limited = httpx.Response(429, request=request)
+        bad_request = httpx.Response(400, request=request)
+        cases = [
+            ("timeout", APITimeoutError(request), "timeout"),
+            (
+                "connection",
+                APIConnectionError(request=request),
+                "connection_error",
+            ),
+            (
+                "rate_limit",
+                RateLimitError("limited", response=limited, body=None),
+                "rate_limit",
+            ),
+            (
+                "bad_request",
+                APIStatusError("bad request", response=bad_request, body=None),
+                "api_error",
+            ),
+        ]
+
+        for name, error, expected_category in cases:
+            with self.subTest(name=name):
+                llm = AsyncLLM(
+                    model="reminder-error-test",
+                    base_url="http://127.0.0.1:1/v1",
+                    llm_api_key="test",
+                )
+                try:
+                    with patch.object(
+                        llm.client.chat.completions, "create", side_effect=error
+                    ):
+                        events = [
+                            event
+                            async for event in llm.chat_completion(
+                                [{"role": "user", "content": "hi"}]
+                            )
+                        ]
+                finally:
+                    await llm.client.close()
+
+                self.assertEqual(len(events), 1)
+                self.assertIsInstance(events[0], LLMProviderErrorText)
+                self.assertEqual(events[0].category, expected_category)
+                self.assertIn("Error calling the chat endpoint", str(events[0]))
+
+    async def test_openai_adapter_marks_api_error_as_typed_not_content(self):
+        import httpx
+        from openai import APIError
+
+        from src.open_llm_vtuber.agent.stateless_llm.openai_compatible_llm import (
+            AsyncLLM,
+        )
+
+        llm = AsyncLLM(
+            model="reminder-error-test",
+            base_url="http://127.0.0.1:1/v1",
+            llm_api_key="test",
+        )
+        request = httpx.Request("POST", "http://127.0.0.1:1/v1/chat/completions")
+        error = APIError("Error code: 400 - bad request", request=request, body=None)
+        try:
+            with patch.object(llm.client.chat.completions, "create", side_effect=error):
+                events = [
+                    event
+                    async for event in llm.chat_completion(
+                        [{"role": "user", "content": "hi"}]
+                    )
+                ]
+        finally:
+            await llm.client.close()
+
+        self.assertEqual(len(events), 1)
+        self.assertIsInstance(events[0], LLMProviderErrorText)
+        self.assertEqual(events[0].category, "api_error")
+        self.assertIn("Error calling the chat endpoint", str(events[0]))
+
+    async def test_template_adapter_marks_failure_as_typed_not_content(self):
+        from src.open_llm_vtuber.agent.stateless_llm.stateless_llm_with_template import (
+            AsyncLLMWithTemplate,
+        )
+
+        llm = AsyncLLMWithTemplate(
+            model="reminder-error-test",
+            base_url="http://127.0.0.1:1/v1/chat/completions",
+        )
+        with patch(
+            "src.open_llm_vtuber.agent.stateless_llm.stateless_llm_with_template.requests.post",
+            side_effect=RuntimeError("template endpoint down"),
+        ):
+            events = [
+                event
+                async for event in llm.chat_completion(
+                    [{"role": "user", "content": "hi"}]
+                )
+            ]
+
+        self.assertEqual(len(events), 1)
+        self.assertIsInstance(events[0], LLMProviderErrorText)
+        self.assertEqual(events[0].category, "api_error")

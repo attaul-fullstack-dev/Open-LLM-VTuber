@@ -10,6 +10,9 @@ import tempfile
 import unittest
 
 from src.open_llm_vtuber.agent.agents.basic_memory_agent import BasicMemoryAgent
+from src.open_llm_vtuber.agent.stateless_llm.stateless_llm_interface import (
+    LLMProviderErrorText,
+)
 from src.open_llm_vtuber.chat_history_manager import (
     create_new_history,
     get_history,
@@ -53,6 +56,30 @@ class _FailingLLM(_TitleLLM):
         self.calls += 1
         raise RuntimeError("provider down")
         yield "unreachable"  # pragma: no cover
+
+
+class _TypedErrorLLM(_TitleLLM):
+    def __init__(self):
+        super().__init__(["unused"])
+
+    async def chat_completion(self, messages, system=None, tools=None):
+        self.calls += 1
+        yield LLMProviderErrorText(
+            "Error calling the chat endpoint: Timeout. See the logs for details.",
+            category="timeout",
+        )
+
+
+class _TypedErrorAwaitableLLM(_TitleLLM):
+    def __init__(self):
+        super().__init__(["unused"])
+
+    async def chat_completion(self, messages, system=None, tools=None):
+        self.calls += 1
+        return LLMProviderErrorText(
+            "Error calling the chat endpoint: Timeout. See the logs for details.",
+            category="timeout",
+        )
 
 
 class _FakeLive2D:
@@ -200,6 +227,32 @@ class GenerationTest(TitleBase):
         title = run(agent.ensure_conversation_title())
         self.assertEqual(title, "Setting Webhook Timeout")
         self.assertEqual(llm.calls, 1)
+
+    def test_provider_error_never_becomes_title(self):
+        history_uid = create_new_history(CONF)
+        self.say(history_uid, "halo", "Hai!")
+        self.say(
+            history_uid,
+            "gimana cara setting webhook biar tidak timeout?",
+            "Coba naikkan timeout ke 30 detik.",
+        )
+        agent = make_agent(CONF, history_uid, _TypedErrorLLM())
+        title = run(agent.ensure_conversation_title())
+        self.assertEqual(title, "")
+        self.assertFalse(get_metadata(CONF, history_uid).get("title"))
+
+    def test_awaitable_provider_error_never_becomes_title(self):
+        history_uid = create_new_history(CONF)
+        self.say(history_uid, "halo", "Hai!")
+        self.say(
+            history_uid,
+            "gimana cara setting webhook biar tidak timeout?",
+            "Coba naikkan timeout ke 30 detik.",
+        )
+        agent = make_agent(CONF, history_uid, _TypedErrorAwaitableLLM())
+        title = run(agent.ensure_conversation_title())
+        self.assertEqual(title, "")
+        self.assertFalse(get_metadata(CONF, history_uid).get("title"))
 
     def test_title_persisted_in_history_metadata(self):
         history_uid = create_new_history(CONF)

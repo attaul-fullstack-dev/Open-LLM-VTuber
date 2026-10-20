@@ -381,6 +381,7 @@ async def process_member_response(
 ) -> str:
     """Process group member's response, handling text/audio and tool status events."""
     full_response = ""
+    provider_error_occurred = False
 
     try:
         # agent.chat now yields Union[SentenceOutput, Dict[str, Any]]
@@ -403,6 +404,19 @@ async def process_member_response(
                     logger.warning(
                         "Cannot broadcast tool status: broadcast_func or group_members missing."
                     )
+            elif (
+                isinstance(output_item, dict)
+                and output_item.get("type") == "provider_error"
+            ):
+                provider_error_occurred = True
+                payload = {
+                    "type": "error",
+                    "message": output_item.get("message") or "LLM provider error",
+                }
+                if broadcast_func and group_members:
+                    await broadcast_func(group_members, payload)
+                else:
+                    await current_ws_send(json.dumps(payload))
             elif isinstance(output_item, (SentenceOutput, AudioOutput)):
                 # Handle SentenceOutput or AudioOutput: Send to current user, broadcast audio later if needed
                 response_part = await process_agent_output(
@@ -430,5 +444,9 @@ async def process_member_response(
                 {"type": "error", "message": f"Error processing response: {str(e)}"}
             )
         )
+        provider_error_occurred = True
+
+    if provider_error_occurred:
+        full_response = ""
 
     return full_response

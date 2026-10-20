@@ -2,6 +2,23 @@ import abc
 from typing import AsyncIterator, List, Dict, Any
 
 
+class LLMProviderErrorText(str):
+    """Provider failure text that is not assistant content.
+
+    Adapters historically yielded a plain error string when the provider
+    failed. Agents could not distinguish that string from a normal text
+    chunk, so failures were persisted as chat history and counted as
+    successful proactive deliveries. This ``str`` subclass keeps backwards
+    compatibility for string-only consumers while giving delivery-sensitive
+    callers a typed signal.
+    """
+
+    def __new__(cls, text: str, category: str = "provider_error"):
+        instance = super().__new__(cls, text)
+        instance.category = category
+        return instance
+
+
 class StatelessLLMInterface(metaclass=abc.ABCMeta):
     """
     Interface for a stateless language model.
