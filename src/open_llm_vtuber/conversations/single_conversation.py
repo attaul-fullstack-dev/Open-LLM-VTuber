@@ -210,10 +210,14 @@ async def process_single_conversation(
                     raise RuntimeError(
                         "Active conversation agent does not support proactive chat"
                     )
-                agent_output_stream = proactive_chat(
-                    followup_context=(metadata or {}).get("proactive_followup"),
-                    intent_context=(metadata or {}).get("proactive_intent"),
-                )
+                proactive_kwargs = {
+                    "followup_context": (metadata or {}).get("proactive_followup"),
+                    "intent_context": (metadata or {}).get("proactive_intent"),
+                }
+                due_reminders = (metadata or {}).get("proactive_due_reminders")
+                if due_reminders:
+                    proactive_kwargs["due_reminders"] = due_reminders
+                agent_output_stream = proactive_chat(**proactive_kwargs)
             else:
                 # agent.chat yields Union[SentenceOutput, Dict[str, Any]]
                 agent_output_stream = context.agent_engine.chat(batch_input)

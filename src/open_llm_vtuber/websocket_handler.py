@@ -2,6 +2,7 @@ from typing import Dict, List, Optional, Callable, TypedDict, Any
 from fastapi import WebSocket, WebSocketDisconnect
 import asyncio
 import json
+import uuid
 from enum import Enum
 import numpy as np
 from loguru import logger
@@ -531,9 +532,10 @@ class WebSocketHandler:
 
         Reads the existing ``future_intentions`` rows (same character-state
         file as memories/goals) through the agent facade's pure ``due``
-        check. No LLM, no timer, no queue. Consumption happens at dispatch
-        time (not here) so a gate-suppressed turn does not silently drop a
-        reminder. Fail-soft: any problem means "no due reminder".
+        check. No LLM, no timer, no queue. Rows are claimed just before the
+        provider call and completed only after a delivered response, so a
+        gate-suppressed or failed turn never drops the reminder. Fail-soft:
+        any problem means "no due reminder".
         """
         try:
             agent = getattr(context, "agent_engine", None)
@@ -715,8 +717,18 @@ class WebSocketHandler:
     ) -> None:
         """Sleep until randomized eligibility, then generate at most one turn."""
         current_task = asyncio.current_task()
+        # Reminder dispatch bookkeeping lives across the whole attempt so a
+        # failure path can settle (complete or release) the same claim.
+        claim_owner = ""
+        claimed_reminders: List[Dict[str, Any]] = []
+        claimed_ids: List[str] = []
+        agent = None
         try:
             while self._proactive_conditions_allow(client_uid, history_uid):
+                claim_owner = ""
+                claimed_reminders = []
+                claimed_ids = []
+                agent = None
                 await asyncio.sleep(machine.seconds_until_eligible(state))
                 if not self._proactive_conditions_allow(client_uid, history_uid):
                     return
@@ -791,6 +803,47 @@ class WebSocketHandler:
                 if revision != state.activity_revision:
                     state.proactive_generation_in_progress = False
                     return
+                # Claim due reminders BEFORE the provider call. The row stays
+                # pending (so its text is in the prompt) and carries
+                # owner+lease (so only one connection can deliver it). A
+                # concurrent attempt gets nothing and never calls the model.
+                if str(getattr(trigger, "reason", "")) == "explicit_reminder":
+                    claim_owner = f"{client_uid}:{uuid.uuid4().hex}"
+                    agent = getattr(context, "agent_engine", None)
+                    claim = getattr(agent, "claim_due_future_intentions", None)
+                    if callable(claim):
+                        try:
+                            try:
+                                claimed_reminders = claim(claim_owner, utcnow())
+                            except TypeError:
+                                claimed_reminders = claim(claim_owner)
+                        except Exception as error:
+                            logger.debug(
+                                "Future intention claim skipped: type={}",
+                                type(error).__name__,
+                            )
+                            claimed_reminders = []
+                    else:
+                        claimed_reminders = []
+                    if not claimed_reminders:
+                        # Another live attempt owns the reminder (or the
+                        # claim could not be persisted). No model call, no
+                        # budget charge, no premature consumption.
+                        state.proactive_generation_in_progress = False
+                        logger.info(
+                            "Future intention claim unavailable: reason={} "
+                            "owner_retained=false",
+                            getattr(trigger, "reason", ""),
+                        )
+                        await asyncio.sleep(
+                            min(60.0, max(5.0, machine.seconds_until_eligible(state)))
+                        )
+                        continue
+                    claimed_ids = [
+                        str(row.get("id", ""))
+                        for row in claimed_reminders
+                        if row.get("id")
+                    ]
                 record_proactive_dispatch(
                     budget,
                     gate_config,
@@ -802,27 +855,8 @@ class WebSocketHandler:
                 # The turn is genuinely dispatched, so a deferred goal
                 # evidence anchor is consumed exactly once here.
                 self._consume_pending_goal_evidence(context)
-                # A dispatched reminder is consumed exactly once, so the same
-                # due row can never nag twice. Suppressed turns never reach
-                # here, so a gate-suppressed reminder stays pending.
-                if str(getattr(trigger, "reason", "")) == "explicit_reminder":
-                    try:
-                        agent = getattr(context, "agent_engine", None)
-                        consume = getattr(agent, "consume_due_future_intentions", None)
-                        if callable(consume):
-                            try:
-                                consumed = consume(utcnow())
-                            except TypeError:
-                                consumed = consume()
-                            logger.info(
-                                "Future intention consumed on dispatch: count={}",
-                                int(consumed or 0),
-                            )
-                    except Exception as error:
-                        logger.debug(
-                            "Future intention consume skipped: type={}",
-                            type(error).__name__,
-                        )
+                # The reminder stays pending until this turn proves delivery;
+                # see the completion/release settlement after generation.
                 logger.info(
                     "Proactive chat generation started: request_origin=proactive, "
                     "ignored_count={} priority={} trigger={} "
@@ -913,9 +947,38 @@ class WebSocketHandler:
                         "request_origin": "proactive",
                         "proactive_followup": followup_context.as_dict(),
                         "proactive_intent": intent_context.as_dict(),
+                        "proactive_due_reminders": [
+                            str(row.get("text", ""))
+                            for row in claimed_reminders
+                            if str(row.get("text", "")).strip()
+                        ],
                     },
                 )
                 state.proactive_generation_in_progress = False
+                # Delivery success is the same boundary the proactive state
+                # machine already trusts: a truthy response string returned
+                # without an exception. Only then may the reminder become
+                # done; an empty/failed turn releases it for a later retry.
+                if claimed_ids:
+                    settle_name = (
+                        "complete_claimed_future_intentions"
+                        if response
+                        else "release_claimed_future_intentions"
+                    )
+                    settle = getattr(agent, settle_name, None)
+                    if callable(settle):
+                        try:
+                            settled = settle(claim_owner, claimed_ids)
+                            logger.info(
+                                "Future intention claims settled: outcome={} count={}",
+                                "completed" if response else "released",
+                                int(settled or 0),
+                            )
+                        except Exception as error:
+                            logger.debug(
+                                "Future intention settlement skipped: type={}",
+                                type(error).__name__,
+                            )
                 if response and revision == state.activity_revision:
                     machine.record_proactive_sent(
                         state, response_text=response, intent=decision.intent
@@ -950,6 +1013,16 @@ class WebSocketHandler:
             raise
         except Exception as error:
             state.proactive_generation_in_progress = False
+            # An exception means no deliverable response was returned; release
+            # this attempt's claim so the reminder stays retryable instead of
+            # being lost as a premature "done".
+            if agent is not None and claimed_ids:
+                release = getattr(agent, "release_claimed_future_intentions", None)
+                if callable(release):
+                    try:
+                        release(claim_owner, claimed_ids)
+                    except Exception:
+                        pass
             logger.warning(
                 "Proactive generation failed safely: type={}",
                 type(error).__name__,

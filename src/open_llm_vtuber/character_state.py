@@ -989,12 +989,115 @@ def retract_interaction_preference(
         return None, 0
 
 
+def claim_due_future_intentions(
+    conf_uid: str,
+    *,
+    owner: str,
+    now: Optional[datetime] = None,
+    lease_seconds: int = 600,
+) -> List[Dict[str, Any]]:
+    """Atomically claim due pending reminders for one dispatch attempt.
+
+    Returns the claimed rows (with ``claimed_by``/``claim_until``) or an empty
+    list when another live attempt owns them. Rows stay ``pending`` so the
+    reminder text still renders in the proactive prompt; ``status`` becomes
+    ``done`` only after ``complete_claimed_future_intentions``.
+    """
+    try:
+        from .future_intentions import claim_due_intentions as _claim
+
+        filepath = get_character_state_path(conf_uid)
+        with _get_state_lock(filepath):
+            state = load_character_state(conf_uid)
+            rows, claimed = _claim(
+                state.future_intentions,
+                now=now,
+                owner=owner,
+                lease_seconds=lease_seconds,
+            )
+            if not claimed:
+                return []
+            state.future_intentions = rows
+            if not save_character_state(conf_uid, state):
+                return []
+            return claimed
+    except Exception as error:
+        logger.debug("Future intention claim failed: type={}", type(error).__name__)
+        return []
+
+
+def complete_claimed_future_intentions(
+    conf_uid: str,
+    *,
+    owner: str,
+    intention_ids: List[str],
+) -> int:
+    """Mark only ``owner``'s claimed reminders done; returns count."""
+    try:
+        from .future_intentions import complete_claimed_intentions as _complete
+
+        filepath = get_character_state_path(conf_uid)
+        with _get_state_lock(filepath):
+            state = load_character_state(conf_uid)
+            rows, completed = _complete(
+                state.future_intentions,
+                owner=owner,
+                intention_ids=intention_ids,
+            )
+            if not completed:
+                return 0
+            state.future_intentions = rows
+            if not save_character_state(conf_uid, state):
+                return 0
+            return completed
+    except Exception as error:
+        logger.debug(
+            "Future intention completion failed: type={}", type(error).__name__
+        )
+        return 0
+
+
+def release_claimed_future_intentions(
+    conf_uid: str,
+    *,
+    owner: str,
+    intention_ids: List[str],
+) -> int:
+    """Release ``owner``'s claims so an undelivered reminder can retry."""
+    try:
+        from .future_intentions import release_intention_claims as _release
+
+        filepath = get_character_state_path(conf_uid)
+        with _get_state_lock(filepath):
+            state = load_character_state(conf_uid)
+            rows, released = _release(
+                state.future_intentions,
+                owner=owner,
+                intention_ids=intention_ids,
+            )
+            if not released:
+                return 0
+            state.future_intentions = rows
+            if not save_character_state(conf_uid, state):
+                return 0
+            return released
+    except Exception as error:
+        logger.debug("Future intention release failed: type={}", type(error).__name__)
+        return 0
+
+
 def consume_due_future_intentions(
     conf_uid: str,
     *,
     now: Optional[datetime] = None,
 ) -> int:
-    """Mark all currently-due reminders done; returns count consumed."""
+    """Legacy direct completion of all due reminders; returns count.
+
+    The proactive dispatcher no longer calls this: it claims rows before the
+    prompt and completes them only after delivery (see
+    ``claim_due_future_intentions`` / ``complete_claimed_future_intentions``).
+    Kept for existing callers and tests that explicitly consume on demand.
+    """
     try:
         from .future_intentions import complete_future_intention as _complete
         from .future_intentions import due_intentions

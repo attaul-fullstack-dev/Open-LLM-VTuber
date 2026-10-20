@@ -1432,6 +1432,93 @@ class BasicMemoryAgent(AgentInterface):
         except Exception:
             return 0
 
+    def claim_due_future_intentions(
+        self,
+        owner: str,
+        moment: Optional[datetime] = None,
+        lease_seconds: int = 600,
+    ) -> List[Dict[str, Any]]:
+        """Claim due reminders for this proactive attempt; empty when taken."""
+        try:
+            from ...character_state import claim_due_future_intentions as _claim
+            from ...character_state import load_character_state
+
+            if not self._character_conf_uid:
+                return []
+            # Adopt siblings' writes first: the claim is a read-modify-write
+            # against the authoritative file, so a stale snapshot could hide
+            # a reminder stored by another active connection.
+            self._refresh_character_state_if_changed()
+            claimed = _claim(
+                self._character_conf_uid,
+                owner=owner,
+                now=moment,
+                lease_seconds=lease_seconds,
+            )
+            try:
+                refreshed = load_character_state(self._character_conf_uid)
+                if refreshed is not None:
+                    self._character_state = refreshed
+            except Exception:
+                pass
+            return list(claimed or [])
+        except Exception:
+            return []
+
+    def complete_claimed_future_intentions(
+        self, owner: str, intention_ids: List[str]
+    ) -> int:
+        """Mark this attempt's claimed reminders done after delivery."""
+        try:
+            from ...character_state import (
+                complete_claimed_future_intentions as _complete,
+            )
+            from ...character_state import load_character_state
+
+            if not self._character_conf_uid:
+                return 0
+            count = _complete(
+                self._character_conf_uid,
+                owner=owner,
+                intention_ids=intention_ids,
+            )
+            try:
+                refreshed = load_character_state(self._character_conf_uid)
+                if refreshed is not None:
+                    self._character_state = refreshed
+            except Exception:
+                pass
+            return int(count)
+        except Exception:
+            return 0
+
+    def release_claimed_future_intentions(
+        self, owner: str, intention_ids: List[str]
+    ) -> int:
+        """Release this attempt's claims so an undelivered reminder retries."""
+        try:
+            from ...character_state import (
+                release_claimed_future_intentions as _release,
+            )
+            from ...character_state import load_character_state
+
+            if not self._character_conf_uid:
+                return 0
+            count = _release(
+                self._character_conf_uid,
+                owner=owner,
+                intention_ids=intention_ids,
+            )
+            try:
+                refreshed = load_character_state(self._character_conf_uid)
+                if refreshed is not None:
+                    self._character_state = refreshed
+            except Exception:
+                pass
+            return int(count)
+        except Exception:
+            return 0
+
     def list_character_memories(self) -> List[Dict[str, Any]]:
         """Return stored long-term facts (for backend controls / future UI).
 
@@ -3110,6 +3197,7 @@ class BasicMemoryAgent(AgentInterface):
             Union[Dict[str, Any], ProactiveFollowupContext]
         ] = None,
         intent_context: Optional[Union[Dict[str, Any], ProactiveIntentContext]] = None,
+        due_reminders: Optional[List[str]] = None,
     ) -> Callable[[], AsyncIterator[Union[SentenceOutput, Dict[str, Any]]]]:
         """Create an assistant-only turn using the normal character context.
 
@@ -3194,6 +3282,21 @@ class BasicMemoryAgent(AgentInterface):
                 current_system_prompt = "\n\n".join(
                     [current_system_prompt, intent_block]
                 )
+            reminder_lines = [
+                str(text).strip()
+                for text in (due_reminders or [])
+                if str(text).strip()
+            ]
+            if reminder_lines:
+                reminder_block = (
+                    "A scheduled reminder is due RIGHT NOW. Deliver it in this "
+                    "message, faithfully and naturally, instead of starting an "
+                    "unrelated topic:\n"
+                    + "\n".join(f"- {line}" for line in reminder_lines)
+                )
+                current_system_prompt = "\n\n".join(
+                    [current_system_prompt, reminder_block]
+                )
             try:
                 request_messages = await self._prepare_context_with_summary(
                     messages,
@@ -3254,10 +3357,16 @@ class BasicMemoryAgent(AgentInterface):
             Union[Dict[str, Any], ProactiveFollowupContext]
         ] = None,
         intent_context: Optional[Union[Dict[str, Any], ProactiveIntentContext]] = None,
+        due_reminders: Optional[List[str]] = None,
     ) -> AsyncIterator[Union[SentenceOutput, Dict[str, Any]]]:
-        """Generate one proactive assistant message without a fake user turn."""
+        """Generate one proactive assistant message without a fake user turn.
+
+        ``due_reminders`` carries the exact texts claimed for this attempt so
+        the request prompt instructs the model to deliver them now. It is
+        request-only and never enters ``_memory`` or the transcript.
+        """
         proactive_chat = self._proactive_chat_function_factory(
-            followup_context, intent_context
+            followup_context, intent_context, due_reminders
         )
         async for output in proactive_chat():
             yield output

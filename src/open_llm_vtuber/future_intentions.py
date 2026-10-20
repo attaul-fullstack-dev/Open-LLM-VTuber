@@ -334,7 +334,7 @@ def normalize_stored_intention(item: Any) -> Optional[Dict[str, Any]]:
     kind = _normalize(item.get("kind", "")) or KIND_REMINDER
     if kind not in (KIND_REMINDER, KIND_PLAN):
         kind = KIND_REMINDER
-    return {
+    normalized = {
         "id": _normalize(item.get("id", "")) or uuid.uuid4().hex,
         "text": text,
         "due_at": due_at or None,
@@ -344,6 +344,16 @@ def normalize_stored_intention(item: Any) -> Optional[Dict[str, Any]]:
         "kind": kind,
         "tz": _normalize(item.get("tz", "")) or None,
     }
+    # Dispatch claims are transient delivery bookkeeping, not a new state
+    # machine: a pending row may be claimed by exactly one proactive attempt
+    # until its lease expires. Only persist a complete claim pair so a partial
+    # write can never make a row look owned forever.
+    claimed_by = _normalize(item.get("claimed_by", ""))
+    claim_until = _normalize(item.get("claim_until", ""))
+    if claimed_by and claim_until:
+        normalized["claimed_by"] = claimed_by
+        normalized["claim_until"] = claim_until
+    return normalized
 
 
 def pending_intentions(stored: Any) -> List[Dict[str, Any]]:
@@ -393,6 +403,132 @@ def due_intentions(
         if stamp is not None and stamp <= moment:
             out.append(item)
     return out
+
+
+def _claim_expired(row: Dict[str, Any], moment: datetime) -> bool:
+    until = _parse_iso(row.get("claim_until"))
+    return until is None or until <= moment
+
+
+def claim_due_intentions(
+    stored: Any,
+    *,
+    now: Optional[datetime] = None,
+    owner: str = "",
+    lease_seconds: int = 600,
+) -> tuple:
+    """Claim due pending intentions for one dispatch attempt (pure).
+
+    Returns ``(new_list, claimed_rows)``. A row already claimed by another
+    owner with an unexpired lease is left untouched, so two connections can
+    never generate the same reminder. Only an expired lease (a crashed or
+    interrupted sender) can be taken over. Claiming never changes ``status``:
+    the row stays ``pending`` so the reminder text still reaches the prompt,
+    and it becomes ``done`` only after a verified delivery.
+    """
+    moment = _now_aware(now)
+    claimant = _normalize(owner)
+    if not claimant:
+        return (list(stored or []), [])
+    lease_until = moment + timedelta(seconds=max(1, int(lease_seconds)))
+    out = []
+    claimed = []
+    for item in stored or []:
+        parsed = normalize_stored_intention(item)
+        if parsed is None:
+            continue
+        if parsed["status"] == STATUS_PENDING:
+            stamp = _parse_iso(parsed.get("due_at"))
+            holder = _normalize(parsed.get("claimed_by", ""))
+            blocked = (
+                bool(holder)
+                and holder != claimant
+                and not _claim_expired(parsed, moment)
+            )
+            if stamp is not None and stamp <= moment and not blocked:
+                claimed_row = dict(parsed)
+                claimed_row["claimed_by"] = claimant
+                claimed_row["claim_until"] = _utc_iso(lease_until)
+                claimed.append(claimed_row)
+                parsed = claimed_row
+        out.append(parsed)
+    return (out, claimed)
+
+
+def release_intention_claims(
+    existing: Any,
+    *,
+    owner: str,
+    intention_ids: Any,
+) -> tuple:
+    """Drop ``owner``'s claims on the given ids (pure ``(new_list, count)``).
+
+    Used when the turn produced no deliverable response, so the reminder can
+    be retried by the next eligible cycle.
+    """
+    claimant = _normalize(owner)
+    targets = {_normalize(value) for value in (intention_ids or [])}
+    targets.discard("")
+    if not claimant or not targets:
+        return (list(existing or []), 0)
+    out = []
+    released = 0
+    for item in existing or []:
+        parsed = normalize_stored_intention(item)
+        if parsed is None:
+            continue
+        if (
+            parsed["status"] == STATUS_PENDING
+            and parsed["id"] in targets
+            and _normalize(parsed.get("claimed_by", "")) == claimant
+        ):
+            updated = dict(parsed)
+            updated.pop("claimed_by", None)
+            updated.pop("claim_until", None)
+            out.append(updated)
+            released += 1
+        else:
+            out.append(parsed)
+    return (out, released)
+
+
+def complete_claimed_intentions(
+    existing: Any,
+    *,
+    owner: str,
+    intention_ids: Any,
+) -> tuple:
+    """Mark ``owner``'s claimed rows done (pure ``(new_list, count)``).
+
+    Completion is id-based and owner-guarded: only rows this attempt still
+    holds may transition. A row taken over after an expired lease is never
+    completed by the previous owner.
+    """
+    claimant = _normalize(owner)
+    targets = {_normalize(value) for value in (intention_ids or [])}
+    targets.discard("")
+    if not claimant or not targets:
+        return (list(existing or []), 0)
+    out = []
+    completed = 0
+    for item in existing or []:
+        parsed = normalize_stored_intention(item)
+        if parsed is None:
+            continue
+        if (
+            parsed["status"] == STATUS_PENDING
+            and parsed["id"] in targets
+            and _normalize(parsed.get("claimed_by", "")) == claimant
+        ):
+            updated = dict(parsed)
+            updated["status"] = STATUS_DONE
+            updated.pop("claimed_by", None)
+            updated.pop("claim_until", None)
+            out.append(updated)
+            completed += 1
+        else:
+            out.append(parsed)
+    return (out, completed)
 
 
 def add_future_intention(
@@ -477,6 +613,8 @@ def complete_future_intention(
         if parsed["id"] == target and parsed["status"] == STATUS_PENDING:
             updated = dict(parsed)
             updated["status"] = STATUS_DONE
+            updated.pop("claimed_by", None)
+            updated.pop("claim_until", None)
             out.append(updated)
             changed = True
         else:
@@ -500,6 +638,8 @@ def cancel_future_intention(
         if parsed["id"] == target and parsed["status"] == STATUS_PENDING:
             updated = dict(parsed)
             updated["status"] = STATUS_CANCELLED
+            updated.pop("claimed_by", None)
+            updated.pop("claim_until", None)
             out.append(updated)
             changed = True
         else:
