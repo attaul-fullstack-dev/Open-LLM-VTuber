@@ -4,7 +4,7 @@ import re
 import time
 import uuid
 from datetime import datetime
-from typing import List, Optional, Dict
+from typing import Awaitable, Callable, List, Optional, Dict, Tuple
 from loguru import logger
 
 from ..agent.output_types import DisplayText, Actions
@@ -20,6 +20,80 @@ from .types import WebSocketSend
 # reuse) and every synthesis degrades to a silent payload. One slot per live
 # loop preserves the concurrency guarantee exactly where it matters.
 _ELEVENLABS_TTS_SEMAPHORES: Dict[int, asyncio.Semaphore] = {}
+
+
+def _stamp_turn_identity(payload: Dict, tracker) -> Dict:
+    """Attach this turn's identity to a content frame.
+
+    ``request_id`` names the ATTEMPT, ``msg_id`` names the LOGICAL message
+    (stable across retries). The frontend opens/updates one bubble per
+    ``msg_id``, so both must travel on every content frame.
+
+    The delivery protocol (Stage 2) is carried alongside without renaming any
+    existing key, so an old client keeps working: ``id`` mirrors ``msg_id``,
+    ``turn`` mirrors ``request_id``, ``attempt`` is the message attempt and
+    ``final`` is false on every content frame. ``seq`` is assigned later, in
+    send order (``_stamp_frame_sequence``): TTS payloads are prepared
+    concurrently, so stamping a sequence here would number them by synthesis
+    completion, not by delivery.
+    """
+    if not tracker:
+        return payload
+    request_id = getattr(tracker, "request_id", "") or ""
+    if request_id:
+        payload["request_id"] = request_id
+        payload["turn"] = request_id
+    msg_id = getattr(tracker, "msg_id", "") or ""
+    if msg_id:
+        payload["msg_id"] = msg_id
+        payload["id"] = msg_id
+        payload["attempt"] = int(getattr(tracker, "msg_attempt", 1) or 1)
+        payload["final"] = False
+    return payload
+
+
+def _stamp_frame_sequence(payload: Dict, tracker) -> Dict:
+    """Number a content frame in DELIVERY order and clear its ``final`` flag.
+
+    Called from the single ordered sender, immediately before the frame is
+    handed to the transport, so ``seq`` is the order the client actually sees.
+    A payload belonging to another message (or a tracker-less context) is left
+    untouched: it is not part of this message's sequence.
+    """
+    if not tracker:
+        return payload
+    msg_id = getattr(tracker, "msg_id", "") or ""
+    if not msg_id or payload.get("msg_id") != msg_id:
+        return payload
+    seq = int(getattr(tracker, "msg_seq", 0) or 0)
+    payload["seq"] = seq
+    payload["final"] = False
+    tracker.msg_seq = seq + 1
+    return payload
+
+
+def final_frame_metadata(tracker) -> Dict:
+    """Metadata for the CLOSING frame of one message (``ai-final``).
+
+    ``seq`` continues the content sequence and ``segments`` states how many
+    content frames this attempt actually handed to the transport, so the
+    client can tell a complete message from a truncated one. Returned empty
+    for a tracker-less turn: no identity, no protocol fields.
+    """
+    if not tracker:
+        return {}
+    msg_id = getattr(tracker, "msg_id", "") or ""
+    if not msg_id:
+        return {}
+    segments = int(getattr(tracker, "msg_seq", 0) or 0)
+    return {
+        "id": msg_id,
+        "msg_id": msg_id,
+        "attempt": int(getattr(tracker, "msg_attempt", 1) or 1),
+        "seq": segments,
+        "segments": segments,
+        "final": True,
+    }
 
 
 def _elevenlabs_semaphore() -> asyncio.Semaphore:
@@ -52,6 +126,10 @@ class TTSTaskManager:
         # Counter for maintaining order
         self._sequence_counter = 0
         self._next_sequence_to_send = 0
+        # Set when a pre-send history guard refuses a frame. No later frame
+        # of this turn may leave the process: the transcript would otherwise
+        # contain a gap that no durable row can describe.
+        self._content_blocked = False
 
     async def speak(
         self,
@@ -63,6 +141,11 @@ class TTSTaskManager:
         websocket_send: WebSocketSend,
         synthesize_audio: bool = True,
         emotion_tag: Optional[str] = None,
+        history_text: str = "",
+        before_content_send: Optional[Callable[[str], Awaitable[bool]]] = None,
+        after_content_send: Optional[
+            Callable[[str, bool], Awaitable[None]]
+        ] = None,
     ) -> None:
         """
         Queue a TTS task while maintaining order of delivery.
@@ -83,7 +166,22 @@ class TTSTaskManager:
                 when the engine is ElevenLabs with tags enabled; display
                 text, history and translation input are never touched.
                 Stateless per call, so no emotion can leak across sentences.
+            history_text: Canonical display text carried by this frame. The
+                optional guard writes this delta to the AI history row BEFORE
+                the ordered sender hands the frame to the transport.
+            before_content_send: Async guard invoked immediately before the
+                sender sends this frame. Returning False stops the frame and
+                every later frame of the turn.
+            after_content_send: Async confirmation invoked after the
+                transport accepts/refuses this frame. A refusal rolls the
+                provisional history prefix back to the last accepted frame.
         """
+        if self._content_blocked:
+            logger.warning(
+                "TTS content blocked: history was not durable before an "
+                "earlier frame; dropping this segment"
+            )
+            return
         if emotion_tag and synthesize_audio and self._emotion_tags_allowed(tts_engine):
             from ..voice_emotion import tag_tts_text
 
@@ -100,7 +198,14 @@ class TTSTaskManager:
                     self._process_payload_queue(websocket_send)
                 )
 
-            await self._send_silent_payload(display_text, actions, current_sequence)
+            await self._send_silent_payload(
+                display_text,
+                actions,
+                current_sequence,
+                history_text=history_text,
+                before_content_send=before_content_send,
+                after_content_send=after_content_send,
+            )
             return
 
         logger.debug(
@@ -129,6 +234,9 @@ class TTSTaskManager:
                 tts_engine=tts_engine,
                 sequence_number=current_sequence,
                 synthesize_audio=synthesize_audio,
+                history_text=history_text,
+                before_content_send=before_content_send,
+                after_content_send=after_content_send,
             )
         )
         self.task_list.append(task)
@@ -143,22 +251,122 @@ class TTSTaskManager:
         except Exception:
             return False
 
+    async def _discard_pending_payloads(
+        self,
+        buffered_payloads: Dict[int, Tuple],
+    ) -> None:
+        """Release queue accounting after delivery is abandoned.
+
+        ``asyncio.Queue.join()`` is used by the turn finalizer; every item
+        taken with ``get()`` must get exactly one ``task_done()`` even when a
+        guard or a dead socket stops the sender early. Otherwise the turn
+        waits forever on a queue that will never drain.
+        """
+        for _ in buffered_payloads:
+            self._payload_queue.task_done()
+        buffered_payloads.clear()
+        while True:
+            try:
+                self._payload_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            else:
+                self._payload_queue.task_done()
+
+    @staticmethod
+    async def _notify_content_result(
+        callback: Optional[Callable[[str, bool], Awaitable[None]]],
+        history_text: str,
+        accepted: bool,
+    ) -> None:
+        if callback is None:
+            return
+        try:
+            await callback(history_text, accepted)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Content-send confirmation failed (accepted={})", accepted
+            )
+
     async def _process_payload_queue(self, websocket_send: WebSocketSend) -> None:
         """
         Process and send payloads in correct order.
         Runs continuously until all payloads are processed.
+
+        Each queued item may carry ``(payload, sequence, history_text,
+        before_send, after_send)``. The two-tuple form remains supported for
+        callers/tests that only exercise ordering.
         """
-        buffered_payloads: Dict[int, Dict] = {}
+        buffered_payloads: Dict[int, Tuple] = {}
 
         while True:
             try:
-                # Get payload from queue
-                payload, sequence_number = await self._payload_queue.get()
-                buffered_payloads[sequence_number] = payload
+                item = await self._payload_queue.get()
+                if isinstance(item, tuple) and len(item) == 5:
+                    (
+                        payload,
+                        sequence_number,
+                        history_text,
+                        before_content_send,
+                        after_content_send,
+                    ) = item
+                else:
+                    payload, sequence_number = item
+                    history_text = ""
+                    before_content_send = None
+                    after_content_send = None
+                buffered_payloads[sequence_number] = (
+                    payload,
+                    history_text or "",
+                    before_content_send,
+                    after_content_send,
+                )
 
                 # Send payloads in order
                 while self._next_sequence_to_send in buffered_payloads:
-                    next_payload = buffered_payloads.pop(self._next_sequence_to_send)
+                    (
+                        next_payload,
+                        frame_history_text,
+                        before_send,
+                        after_send,
+                    ) = buffered_payloads.pop(self._next_sequence_to_send)
+
+                    if self._content_blocked:
+                        self._payload_queue.task_done()
+                        await self._discard_pending_payloads(buffered_payloads)
+                        return
+
+                    # Stage 4.1: the canonical AI row must be durable before
+                    # this content frame can leave the process. The guard
+                    # writes the accumulated prefix (this delta included) and
+                    # returns False if the row is not safely on disk.
+                    if before_send is not None and frame_history_text:
+                        try:
+                            allowed = await before_send(frame_history_text)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            logger.exception(
+                                "Pre-send history guard failed; content blocked"
+                            )
+                            allowed = False
+                        if not allowed:
+                            self._content_blocked = True
+                            self._payload_queue.task_done()
+                            await self._discard_pending_payloads(
+                                buffered_payloads
+                            )
+                            return
+
+                    # Delivery-order sequence: this is the one place that
+                    # knows the order frames actually leave the process.
+                    from ..request_latency import get_latency_tracker
+
+                    next_payload = _stamp_frame_sequence(
+                        next_payload, get_latency_tracker()
+                    )
                     try:
                         await websocket_send(json.dumps(next_payload))
                     except asyncio.CancelledError:
@@ -167,12 +375,20 @@ class TTSTaskManager:
                         # Dead socket mid-turn: the text is already
                         # accumulated by the caller, so abandon delivery and
                         # let the turn persist instead of dying here.
+                        await self._notify_content_result(
+                            after_send, frame_history_text, False
+                        )
                         logger.debug(
                             "TTS payload send skipped (connection unavailable): "
                             "type={}",
                             type(error).__name__,
                         )
+                        self._payload_queue.task_done()
+                        await self._discard_pending_payloads(buffered_payloads)
                         return
+                    await self._notify_content_result(
+                        after_send, frame_history_text, True
+                    )
                     self._next_sequence_to_send += 1
 
                 self._payload_queue.task_done()
@@ -185,6 +401,11 @@ class TTSTaskManager:
         display_text: DisplayText,
         actions: Optional[Actions],
         sequence_number: int,
+        history_text: str = "",
+        before_content_send: Optional[Callable[[str], Awaitable[bool]]] = None,
+        after_content_send: Optional[
+            Callable[[str, bool], Awaitable[None]]
+        ] = None,
     ) -> None:
         """Queue a silent audio payload"""
         from ..request_latency import get_latency_tracker
@@ -194,10 +415,18 @@ class TTSTaskManager:
             display_text=display_text,
             actions=actions,
         )
-        tracker = get_latency_tracker()
-        if tracker:
-            audio_payload["request_id"] = tracker.request_id
-        await self._payload_queue.put((audio_payload, sequence_number))
+        _stamp_turn_identity(audio_payload, get_latency_tracker())
+        if self._content_blocked:
+            return
+        await self._payload_queue.put(
+            (
+                audio_payload,
+                sequence_number,
+                history_text,
+                before_content_send,
+                after_content_send,
+            )
+        )
 
     async def _process_tts(
         self,
@@ -208,6 +437,11 @@ class TTSTaskManager:
         tts_engine: TTSInterface,
         sequence_number: int,
         synthesize_audio: bool = True,
+        history_text: str = "",
+        before_content_send: Optional[Callable[[str], Awaitable[bool]]] = None,
+        after_content_send: Optional[
+            Callable[[str, bool], Awaitable[None]]
+        ] = None,
     ) -> None:
         """Process TTS generation and queue the result for ordered delivery"""
         from ..request_latency import get_latency_tracker
@@ -230,10 +464,19 @@ class TTSTaskManager:
                 display_text=display_text,
                 actions=actions,
             )
-            if tracker:
-                payload["request_id"] = tracker.request_id
-            # Queue the payload with its sequence number
-            await self._payload_queue.put((payload, sequence_number))
+            _stamp_turn_identity(payload, tracker)
+            # Queue the payload with its sequence number and the pre-send
+            # history guard for THIS frame.
+            if not self._content_blocked:
+                await self._payload_queue.put(
+                    (
+                        payload,
+                        sequence_number,
+                        history_text,
+                        before_content_send,
+                        after_content_send,
+                    )
+                )
 
         except Exception as e:
             logger.error(f"Error preparing audio payload: {e}")
@@ -243,9 +486,17 @@ class TTSTaskManager:
                 display_text=display_text,
                 actions=actions,
             )
-            if tracker:
-                payload["request_id"] = tracker.request_id
-            await self._payload_queue.put((payload, sequence_number))
+            _stamp_turn_identity(payload, tracker)
+            if not self._content_blocked:
+                await self._payload_queue.put(
+                    (
+                        payload,
+                        sequence_number,
+                        history_text,
+                        before_content_send,
+                        after_content_send,
+                    )
+                )
 
         finally:
             if audio_file_path:
@@ -280,5 +531,6 @@ class TTSTaskManager:
             self._sender_task.cancel()
         self._sequence_counter = 0
         self._next_sequence_to_send = 0
+        self._content_blocked = False
         # Create a new queue to clear any pending items
         self._payload_queue = asyncio.Queue()

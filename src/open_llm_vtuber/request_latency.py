@@ -298,6 +298,19 @@ class RequestLatencyTracker:
         + "-"
         + uuid.uuid4().hex[:6]
     )
+    # Stable identity of the assistant message this turn produces. Unlike
+    # ``request_id`` (one per attempt), it is reused verbatim by a retry and
+    # is what the persisted history row and the live bubble are keyed on.
+    # Empty only for trackers built outside a conversation turn (tests).
+    msg_id: str = ""
+    # Delivery attempt of that message (1 for the first send, +1 per retry of
+    # the SAME msg_id). Owned by ``message_delivery.begin_attempt``; every
+    # frame of the attempt carries it, and a client ACK must name it.
+    msg_attempt: int = 1
+    # Frames of this message handed to the transport so far. Assigned in send
+    # order by the ordered TTS sender, so it is the frame's ``seq`` and the
+    # final frame's ``segments`` total (see tts_manager).
+    msg_seq: int = 0
     client_user_send_ms: Optional[float] = None
     client_websocket_send_ms: Optional[float] = None
     request_origin: str = "user"
@@ -313,6 +326,10 @@ class RequestLatencyTracker:
     tts_synthesis_ms: float = 0.0
     tts_wait_ms: float = 0.0
     playback_wait_ms: float = 0.0
+    # Last frontend playback report for this turn. `timeout` means no
+    # completion arrived; `unknown` means a legacy client sent no outcome.
+    playback_outcome: Optional[str] = None
+    playback_failed_segments: int = 0
     history_save_ms: float = 0.0
     metadata_save_ms: float = 0.0
     character_state_save_ms: float = 0.0
@@ -712,6 +729,8 @@ class RequestLatencyTracker:
             "tts_wait_ms": round(self.tts_wait_ms, 2),
             "tts_blocking_ms": round(tts_blocking, 2),
             "playback_wait_ms": round(self.playback_wait_ms, 2),
+            "playback_outcome": self.playback_outcome,
+            "playback_failed_segments": self.playback_failed_segments,
             "tts_total_ms": round(tts_total, 2),
             "audio_blocking_ms": round(audio_blocking, 2),
             "history_save_ms": round(self.history_save_ms, 2),

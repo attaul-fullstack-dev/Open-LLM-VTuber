@@ -23,6 +23,7 @@ from .chat_history_manager import (
     get_metadata,
     delete_history,
     get_history_list,
+    resumable_continuations,
     update_metadate,
 )
 from .attachment_memory import delete_attachment_memories_for_session
@@ -36,7 +37,16 @@ from .world_state import load_and_reconcile_world_state, utcnow
 from .character_state import recover_stale_claims, set_character_timezone
 from .claim_identity import claim_owner as process_claim_owner
 from .conversations.single_conversation import process_single_conversation
-from .conversations.conversation_utils import EMOJI_LIST
+from .conversations.conversation_utils import EMOJI_LIST, send_canonical_final
+from .message_delivery import (
+    STATUS_DELIVERED,
+    DeliverySummary,
+    apply_ack,
+    claim_retry,
+    release_retry_claim,
+    unsettled_messages,
+)
+from . import conversation_handoff
 from .autonomous_decision import OUTCOME_GOAL_BEHAVIOR
 from .proactive_gate import (
     ProactiveBudgetState,
@@ -172,6 +182,122 @@ def create_locked_send_text(websocket: WebSocket):
     return locked_send_text
 
 
+#: Outbound frame types that carry the assistant's words. Everything else
+#: (``control``, ``latency-event``, ``tool_call_status``, ``error``,
+#: ``history-auto-titled`` ...) is turn bookkeeping and must never be mistaken
+#: for a reminder that reached the user.
+_CONTENT_FRAME_TYPES = frozenset({"audio", "full-text", "text", "subtitle"})
+
+
+def _frame_assistant_text(frame: Any) -> str:
+    """Display text carried by one frame ("" when it carries none)."""
+    if not isinstance(frame, dict):
+        return ""
+    display = frame.get("display_text")
+    if isinstance(display, dict):
+        text = display.get("text")
+        if isinstance(text, str):
+            return text
+    return ""
+
+
+def _frame_carries_assistant_content(frame: Any) -> bool:
+    """True only for one outbound frame that actually carries Mili's words."""
+    if not isinstance(frame, dict) or frame.get("type") not in _CONTENT_FRAME_TYPES:
+        return False
+    if _frame_assistant_text(frame).strip():
+        return True
+    for key in ("text", "transcript"):
+        value = frame.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+    return bool(frame.get("audio"))
+
+
+def _carries_assistant_content(payload: Any) -> bool:
+    """True only for one outbound frame that actually carries Mili's words."""
+    if not isinstance(payload, str):
+        return False
+    try:
+        frame = json.loads(payload)
+    except (TypeError, ValueError):
+        return False
+    return _frame_carries_assistant_content(frame)
+
+
+class _ProactiveDeliveryProbe:
+    """Observe whether any assistant content left this process this turn.
+
+    The websocket transport has no delivery acknowledgment: ``send_text``
+    returning means the frame was handed to the ASGI server, not that the
+    client rendered it. The probe therefore records only what is observable --
+    that at least one content frame was accepted by the transport -- and the
+    dispatcher treats that as "may already have reached the user".
+
+    A turn cancelled or failed before the first content frame reports
+    ``delivered is False``, so an attempt that never spoke is still retryable
+    instead of being lost. Bookkeeping frames never count, which keeps a
+    cancel during prompt build / TTS warm-up out of the delivery path.
+
+    ``refused`` is the opposite evidence and matters because the TTS sender
+    swallows transport errors (``TTSTaskManager._process_payload_queue``
+    returns on a dead socket) while the turn still accumulates its text: a
+    truthy response does NOT prove anything was handed off. A refused content
+    frame means the transport actively declined that payload, so a turn that
+    produced text with no confirmed frame and at least one refusal must stay
+    retryable rather than be completed silently.
+
+    ``delivered_text`` is the concatenation of the display text of the accepted
+    content frames: the exact words this attempt may claim in the transcript.
+    It exists because history was previously written from the GENERATED text,
+    which recorded sentences the transport had refused -- and, for a reminder
+    that stayed pending and was retried, duplicated the reminder on reconnect.
+    """
+
+    def __init__(self, send: Callable[[str], Any]):
+        self._send = send
+        self.frames = 0
+        self.content_frames = 0
+        self.refused_content = 0
+        self.delivered_text = ""
+
+    @property
+    def delivered(self) -> bool:
+        return self.content_frames > 0
+
+    @property
+    def refused(self) -> bool:
+        return self.refused_content > 0
+
+    async def __call__(self, payload: str) -> None:
+        # Parse once: audio frames are large, so the probe must not decode the
+        # same payload twice just to classify it and read its text.
+        frame = None
+        if isinstance(payload, str):
+            try:
+                frame = json.loads(payload)
+            except (TypeError, ValueError):
+                frame = None
+        carries_content = _frame_carries_assistant_content(frame)
+        try:
+            result = await self._send(payload)
+        except asyncio.CancelledError:
+            # An in-flight send has no observable outcome; counting it either
+            # way would invent evidence. Let the caller's cancellation path
+            # decide from the frames that did complete.
+            raise
+        except Exception:
+            self.frames += 1
+            if carries_content:
+                self.refused_content += 1
+            raise
+        self.frames += 1
+        if carries_content:
+            self.content_frames += 1
+            self.delivered_text += _frame_assistant_text(frame)
+        return result
+
+
 class WebSocketHandler:
     """Handles WebSocket connections and message routing"""
 
@@ -182,6 +308,17 @@ class WebSocketHandler:
     # instantly: one paced retry per window, so a broken provider cannot turn
     # the reminder lane into an unbounded retry loop.
     REMINDER_RETRY_DELAY_SECONDS = 60.0
+    # One reminder claim is the only cross-process exclusivity: the state lock
+    # serialises whole transactions, but two server processes can still take
+    # the same row over once ``claim_until`` has passed. The lease therefore
+    # has to outlive the provider turn, and a heartbeat renews it while the
+    # turn is still streaming (see ``_renew_reminder_claim``).
+    REMINDER_CLAIM_LEASE_SECONDS = 600
+    REMINDER_CLAIM_RENEW_SECONDS = 120.0
+    # Stage 3 recovery: one ``client-hello`` may trigger at most this many
+    # redeliveries, in order, so a reconnect cannot turn into a burst of
+    # frames (and audio) the client has to absorb at once.
+    MAX_REDELIVERIES_PER_HELLO = 10
 
     def __init__(self, default_context_cache: ServiceContext):
         """Initialize the WebSocket handler with default context"""
@@ -216,6 +353,11 @@ class WebSocketHandler:
         # ``_goal_evidence_trigger`` and consumed only once the V2 gate
         # allows the turn, so a suppressed turn cannot silently drop a goal.
         self._pending_goal_evidence: Dict[str, tuple] = {}
+        # Which connections announced the delivery protocol (``client-hello``)
+        # and under which stable client instance. A connection that never
+        # announced itself keeps the legacy behaviour: no summary, no
+        # scheduled redelivery, and its receipts still settle by owner only.
+        self.client_protocols: Dict[str, Dict[str, object]] = {}
 
         # Message handlers mapping
         self._message_handlers = self._init_message_handlers()
@@ -238,6 +380,14 @@ class WebSocketHandler:
         if registry is None:
             registry = {}
             self.__dict__["_history_subscribers"] = registry
+        return registry
+
+    def _protocol_registry(self) -> Dict[str, Dict[str, object]]:
+        """client_uid -> announced protocol facts, created on demand."""
+        registry = self.__dict__.get("client_protocols")
+        if registry is None:
+            registry = {}
+            self.__dict__["client_protocols"] = registry
         return registry
 
     def _pending_goal_evidence_registry(self) -> Dict[str, tuple]:
@@ -647,6 +797,154 @@ class WebSocketHandler:
         for row_id in ids:
             per_row[row_id] = retry_at
 
+    def _settle_reminder_claims(
+        self,
+        agent: Any,
+        client_uid: str,
+        claim_owner: str,
+        claimed_ids: List[str],
+        *,
+        delivered: bool,
+        reason: str,
+    ) -> None:
+        """Settle one dispatch attempt's reminder claims. Never raises.
+
+        ``delivered`` means the reminder may already have reached the client:
+        at least one assistant-content frame accepted by the transport, or a
+        completed turn with text whose transport never refused a content
+        frame (see ``_reminder_delivery_evidence``). When it is False nothing
+        was sent, so the row is released for a paced retry and NO receipt is
+        written -- a turn that never produced words is never recorded as
+        delivered.
+
+        The durable receipt is written BEFORE the completion write: a failed
+        completion, a lease expiry or a restart then reconciles the row to
+        ``done`` from the receipt instead of sending the reminder again.
+        """
+        if not claimed_ids:
+            return
+        if delivered:
+            record_delivery = getattr(agent, "record_reminder_delivery", None)
+            if callable(record_delivery):
+                try:
+                    durable = bool(record_delivery(claim_owner, claimed_ids))
+                except Exception:
+                    durable = False
+                if not durable:
+                    logger.warning(
+                        "Reminder delivery receipt not durable: reason={} "
+                        "count={}; a failed completion write can resend this "
+                        "reminder",
+                        reason,
+                        len(claimed_ids),
+                    )
+            else:
+                logger.warning(
+                    "Reminder delivered without a durable receipt: reason={} "
+                    "agent lacks record_reminder_delivery (count={})",
+                    reason,
+                    len(claimed_ids),
+                )
+        settle_name = (
+            "complete_claimed_future_intentions"
+            if delivered
+            else "release_claimed_future_intentions"
+        )
+        settle = getattr(agent, settle_name, None)
+        if callable(settle):
+            try:
+                settled = settle(claim_owner, claimed_ids)
+                logger.info(
+                    "Future intention claims settled: outcome={} reason={} count={}",
+                    "completed" if delivered else "released",
+                    reason,
+                    int(settled or 0),
+                )
+            except Exception as error:
+                logger.debug(
+                    "Future intention settlement skipped: reason={} type={}",
+                    reason,
+                    type(error).__name__,
+                )
+        if delivered:
+            self._clear_reminder_retries(client_uid, claimed_ids)
+        else:
+            # Released for a later retry, but only this row is backed off so
+            # another due reminder can go next.
+            self._defer_reminder_retries(client_uid, claimed_ids)
+
+    @staticmethod
+    def _reminder_delivery_evidence(
+        probe: Optional[_ProactiveDeliveryProbe], response: str
+    ) -> bool:
+        """Best available evidence that a reminder may have reached the client.
+
+        Three observable facts matter, and none of them is an ACK:
+
+        * a content frame was accepted by the transport -> the words left this
+          process, even if the turn later raised, returned "", was cancelled
+          or its history write failed;
+        * the turn completed with text and the transport never refused a
+          content frame -> the existing delivery boundary, kept so a normal
+          successful turn is not reopened for retry merely because the TTS
+          sender had not flushed its last queued payload yet;
+        * the turn completed with text but a content send was refused (dead
+          socket) -> nothing reached the client, so the reminder must remain
+          retryable instead of being completed silently.
+        """
+        if probe is not None and probe.delivered:
+            return True
+        if response and not (probe is not None and probe.refused):
+            return True
+        return False
+
+    @staticmethod
+    def _reminder_delivery_reason(
+        probe: Optional[_ProactiveDeliveryProbe], response: str
+    ) -> str:
+        if probe is not None and probe.delivered:
+            return "content_frame_accepted"
+        if response and probe is not None and probe.refused:
+            return "transport_refused_content"
+        if response:
+            return "turn_completed"
+        return "no_response"
+
+    async def _renew_reminder_claim(
+        self,
+        agent: Any,
+        owner: str,
+        intention_ids: List[str],
+        lease_seconds: float,
+        interval: float,
+    ) -> None:
+        """Keep this attempt's claim alive while the provider turn streams.
+
+        Cross-process exclusivity for a reminder is its ``claim_until`` on
+        disk. A turn longer than the lease would otherwise let a second server
+        process (same data directory) take the still-in-flight row and deliver
+        it again. Renewal stops as soon as the row is no longer ours -- done,
+        released, or taken over -- so it can never resurrect a finished row.
+        Fail-soft: any renewal problem ends the heartbeat and leaves the
+        original lease in place.
+        """
+        renew = getattr(agent, "renew_claimed_future_intentions", None)
+        if not callable(renew):
+            return
+        while True:
+            await asyncio.sleep(max(0.01, float(interval)))
+            try:
+                renewed = renew(owner, intention_ids, int(lease_seconds))
+            except TypeError:
+                try:
+                    renewed = renew(owner, intention_ids)
+                except Exception:
+                    return
+            except Exception:
+                return
+            if not renewed:
+                return
+
     def _clear_reminder_retries(self, client_uid: str, row_ids: List[str]) -> None:
         """Forget backoff for rows that were just claimed/completed."""
         store = self._reminder_row_retry_store()
@@ -900,12 +1198,19 @@ class WebSocketHandler:
         claimed_reminders: List[Dict[str, Any]] = []
         claimed_ids: List[str] = []
         agent = None
+        # What actually left this process for the attempt in flight, and
+        # whether its claims were already settled (so a late exception cannot
+        # settle the same claim twice).
+        delivery_probe: Optional[_ProactiveDeliveryProbe] = None
+        claims_settled = False
         try:
             while self._proactive_conditions_allow(client_uid, history_uid):
                 claim_owner = ""
                 claimed_reminders = []
                 claimed_ids = []
                 agent = None
+                delivery_probe = None
+                claims_settled = False
                 context = self.client_contexts.get(client_uid)
                 # Sleep until whichever comes first: the idle eligibility tick
                 # or the next reminder's due time. A due reminder must not wait
@@ -938,8 +1243,21 @@ class WebSocketHandler:
                         not machine.config.enabled
                         or state.proactive_generation_in_progress
                     ):
+                        # The due lane made the top-of-loop sleep 0, so leaving
+                        # without a wait would spin this loop at 100% CPU for
+                        # as long as the scheduler is disabled or a turn is
+                        # still in flight. Wait one tick instead.
+                        await asyncio.sleep(1.0)
                         continue
                 elif not machine.is_eligible(state):
+                    # A due plan (or an already-due row that cannot use the
+                    # reminder lane) also makes the top sleep 0. Without this
+                    # wait the loop would re-enter immediately until the idle
+                    # window opens; with a disabled scheduler the idle window
+                    # never opens at all.
+                    await asyncio.sleep(
+                        min(5.0, max(0.5, machine.seconds_until_eligible(state)))
+                    )
                     continue
 
                 websocket = self.client_connections[client_uid]
@@ -1014,6 +1332,7 @@ class WebSocketHandler:
                                 claimed_reminders = claim(
                                     claim_owner,
                                     utcnow(),
+                                    lease_seconds=self.REMINDER_CLAIM_LEASE_SECONDS,
                                     exclude_ids=excluded_ids,
                                 )
                             except TypeError:
@@ -1177,63 +1496,80 @@ class WebSocketHandler:
                         decision.intent,
                         decision.reason,
                     )
-                response = await process_single_conversation(
-                    context=context,
-                    websocket_send=websocket.send_text,
-                    client_uid=client_uid,
-                    user_input="",
-                    images=None,
-                    session_emoji=str(np.random.choice(EMOJI_LIST)),
-                    metadata={
-                        "request_origin": "proactive",
-                        "proactive_followup": followup_context.as_dict(),
-                        "proactive_intent": intent_context.as_dict(),
-                        "proactive_due_reminders": [
-                            str(
-                                row.get("delivery_text")
-                                or row.get("text", "")
-                            )
-                            for row in claimed_reminders
-                            if str(
-                                row.get("delivery_text") or row.get("text", "")
-                            ).strip()
-                        ],
-                    },
-                )
-                state.proactive_generation_in_progress = False
-                # Delivery success is the same boundary the proactive state
-                # machine already trusts: a truthy response string returned
-                # without an exception. Only then may the reminder become
-                # done; an empty/failed turn releases it for a later retry.
+                # Only REMINDER rows are delivered as scheduled reminders. A
+                # due future plan may be claimed so it is consumed exactly
+                # once, but it must never be presented to the model as text to
+                # say "right now" -- that would turn the user's own plan into
+                # a reminder Mili claims to have scheduled.
+                due_reminder_texts = [
+                    str(row.get("delivery_text") or row.get("text", "")).strip()
+                    for row in claimed_reminders
+                    if (row.get("kind") or "reminder") == "reminder"
+                ]
+                due_reminder_texts = [text for text in due_reminder_texts if text]
+                # Cross-process exclusivity comes from the on-disk lease, not
+                # from this process's lock, so renew it for as long as the
+                # turn is actually running.
+                heartbeat = None
                 if claimed_ids:
-                    settle_name = (
-                        "complete_claimed_future_intentions"
-                        if response
-                        else "release_claimed_future_intentions"
+                    heartbeat = asyncio.create_task(
+                        self._renew_reminder_claim(
+                            agent,
+                            claim_owner,
+                            claimed_ids,
+                            self.REMINDER_CLAIM_LEASE_SECONDS,
+                            self.REMINDER_CLAIM_RENEW_SECONDS,
+                        )
                     )
-                    settle = getattr(agent, settle_name, None)
-                    if callable(settle):
-                        try:
-                            settled = settle(claim_owner, claimed_ids)
-                            logger.info(
-                                "Future intention claims settled: outcome={} count={}",
-                                "completed" if response else "released",
-                                int(settled or 0),
-                            )
-                        except Exception as error:
-                            logger.debug(
-                                "Future intention settlement skipped: type={}",
-                                type(error).__name__,
-                            )
-                    if response:
-                        self._clear_reminder_retries(client_uid, claimed_ids)
-                    else:
-                        # Released for a later retry, but only this row is
-                        # backed off so another due reminder can go next.
-                        self._defer_reminder_retries(client_uid, claimed_ids)
+                    heartbeat.add_done_callback(
+                        lambda task: task.cancelled() or task.exception()
+                    )
+                # Wrap this turn's transport call so a cancel that lands after
+                # the reminder frames went out is not mistaken for "nothing
+                # was delivered". Only content frames count (see the probe).
+                delivery_probe = _ProactiveDeliveryProbe(websocket.send_text)
+                try:
+                    response = await process_single_conversation(
+                        context=context,
+                        websocket_send=delivery_probe,
+                        client_uid=client_uid,
+                        user_input="",
+                        images=None,
+                        session_emoji=str(np.random.choice(EMOJI_LIST)),
+                        metadata={
+                            "request_origin": "proactive",
+                            "proactive_followup": followup_context.as_dict(),
+                            "proactive_intent": intent_context.as_dict(),
+                            "proactive_due_reminders": due_reminder_texts,
+                        },
+                    )
+                finally:
+                    if heartbeat is not None:
+                        heartbeat.cancel()
+                state.proactive_generation_in_progress = False
+                # Settle from delivery evidence, never from the provider's own
+                # verdict: a typed provider error, a swallowed TTS failure or
+                # a provider exception can empty the response string (or leave
+                # it intact) after sentences already reached the transport,
+                # and the transport can also refuse every frame while the
+                # turn still returns text. See ``_reminder_delivery_evidence``.
+                self._settle_reminder_claims(
+                    agent,
+                    client_uid,
+                    claim_owner,
+                    claimed_ids,
+                    delivered=self._reminder_delivery_evidence(
+                        delivery_probe, response
+                    ),
+                    reason=self._reminder_delivery_reason(delivery_probe, response),
+                )
+                claims_settled = True
                 if response and revision == state.activity_revision:
                     machine.record_proactive_sent(
-                        state, response_text=response, intent=decision.intent
+                        state,
+                        response_text=response,
+                        intent=decision.intent,
+                        count_as_ignored=not due_reminder,
                     )
                 elif revision != state.activity_revision:
                     # User activity arrived after generation had meaningfully
@@ -1262,39 +1598,57 @@ class WebSocketHandler:
                         )
         except asyncio.CancelledError:
             state.proactive_generation_in_progress = False
-            # A cancelled provider call produced no deliverable response.
-            # Release only this attempt's still-owned rows (the owner+id guard
-            # makes a completed/taken-over row a no-op) and back off only those
-            # rows, so the reminder is retryable instead of waiting the lease.
-            if agent is not None and claimed_ids:
-                release = getattr(agent, "release_claimed_future_intentions", None)
-                if callable(release):
-                    try:
-                        release(claim_owner, claimed_ids)
-                    except Exception:
-                        pass
-                self._defer_reminder_retries(client_uid, claimed_ids)
+            # A cancel is not automatically "nothing was delivered": a user
+            # interrupt (``_handle_interrupt`` -> ``task.cancel()``) can stop
+            # the turn AFTER the reminder frames already went out. Settle from
+            # the observed transport handoff so a message the user may have
+            # seen is not repeated, while a cancel before the first content
+            # frame still releases the row for a later retry.
+            if agent is not None and claimed_ids and not claims_settled:
+                self._settle_reminder_claims(
+                    agent,
+                    client_uid,
+                    claim_owner,
+                    claimed_ids,
+                    delivered=bool(delivery_probe and delivery_probe.delivered),
+                    reason=(
+                        "cancelled_after_delivery"
+                        if delivery_probe and delivery_probe.delivered
+                        else "cancelled_before_delivery"
+                    ),
+                )
+                claims_settled = True
             raise
         except Exception as error:
             state.proactive_generation_in_progress = False
-            # An exception means no deliverable response was returned; release
-            # this attempt's claim so the reminder stays retryable instead of
-            # being lost as a premature "done".
-            if agent is not None and claimed_ids:
-                release = getattr(agent, "release_claimed_future_intentions", None)
-                if callable(release):
-                    try:
-                        release(claim_owner, claimed_ids)
-                    except Exception:
-                        pass
+            # An exception is NOT automatically "nothing was delivered": the
+            # turn raises AFTER its sentences may already have been handed to
+            # the transport (e.g. the AI-history write or turn finalisation
+            # failing after the reply was spoken). Settle from the same
+            # evidence as a cancel: anything already accepted by the transport
+            # must not be resent, while a failure before the first content
+            # frame keeps the row retryable.
+            if agent is not None and claimed_ids and not claims_settled:
+                failed_after_delivery = bool(
+                    delivery_probe and delivery_probe.delivered
+                )
+                self._settle_reminder_claims(
+                    agent,
+                    client_uid,
+                    claim_owner,
+                    claimed_ids,
+                    delivered=failed_after_delivery,
+                    reason=(
+                        "failed_after_delivery"
+                        if failed_after_delivery
+                        else "failed_before_delivery"
+                    ),
+                )
+                claims_settled = True
             logger.warning(
                 "Proactive generation failed safely: type={}",
                 type(error).__name__,
             )
-            if claimed_ids:
-                # Back off only the failed rows; other due reminders remain
-                # eligible instead of being gated by one broken row.
-                self._defer_reminder_retries(client_uid, claimed_ids)
         finally:
             if self.current_conversation_tasks.get(client_uid) is current_task:
                 self.current_conversation_tasks.pop(client_uid, None)
@@ -1329,6 +1683,8 @@ class WebSocketHandler:
             "delete-attachment-memory": self._handle_delete_attachment_memory,
             "clear-attachment-memories": self._handle_clear_attachment_memories,
             "interrupt-signal": self._handle_interrupt,
+            "message-ack": self._handle_message_ack,
+            "client-hello": self._handle_client_hello,
             "mic-audio-data": self._handle_audio_data,
             "mic-audio-end": self._handle_conversation_trigger,
             "raw-audio-data": self._handle_raw_audio_data,
@@ -1574,6 +1930,7 @@ class WebSocketHandler:
         # Clean up other client data
         self.client_connections.pop(client_uid, None)
         self.client_contexts.pop(client_uid, None)
+        self._protocol_registry().pop(client_uid, None)
         self.received_data_buffers.pop(client_uid, None)
         self._proactive_states.pop(client_uid, None)
         self._proactive_machines.pop(client_uid, None)
@@ -1639,6 +1996,7 @@ class WebSocketHandler:
         await self._cancel_proactive_timer(client_uid)
         self.client_connections.pop(client_uid, None)
         self.client_contexts.pop(client_uid, None)
+        self._protocol_registry().pop(client_uid, None)
         self.received_data_buffers.pop(client_uid, None)
         self.chat_group_manager.client_group_map.pop(client_uid, None)
         self._proactive_states.pop(client_uid, None)
@@ -1689,6 +2047,358 @@ class WebSocketHandler:
                 )
             )
 
+    async def _handle_client_hello(
+        self, websocket: WebSocket, client_uid: str, data: WSMessage
+    ) -> None:
+        """A client announces the delivery protocol and asks what it still owes.
+
+        Not a chat trigger: it starts no turn, reads no user input and never
+        touches history.
+
+        The answer is scoped to THIS connection -- its server-issued
+        ``client_uid`` and conf_uid -- and only deliveries it owns (or, right
+        after a reconnect, deliveries of the same client instance whose owner
+        is no longer connected). ``client_ref`` is a bearer correlation token
+        supplied by the client, NOT an authentication credential: this server
+        has no user login layer. It is only used to recognise a reconnecting
+        tab while the old owner is offline. Messages that are already settled
+        are absent from both the summary and the redelivery, so a reconnect
+        never replays what the client already took.
+
+        A client that never sends ``client-hello`` (an older build) is not
+        affected at all: nothing here runs, and the receipt path from Stage 2
+        still works if it happens to send one.
+        """
+        context = self.client_contexts.get(client_uid)
+        if context is None:
+            logger.debug("client-hello ignored: unknown client (post-cleanup?)")
+            return
+        conf_uid = getattr(context.character_config, "conf_uid", "") or ""
+        if not conf_uid:
+            logger.warning("client-hello ignored: client has no conf_uid")
+            return
+
+        raw_ref = data.get("client_ref")
+        client_ref = raw_ref.strip()[:64] if isinstance(raw_ref, str) else ""
+        raw_history = data.get("history_uid")
+        history_uid = raw_history.strip() if isinstance(raw_history, str) else ""
+        # Receipts are only scheduled for a client that says it sends them;
+        # sending redeliveries to a legacy client would repeat forever because
+        # nothing could ever settle them. Require the JSON boolean, not a
+        # truthy string: "false" must not enable a protocol the client does
+        # not actually implement.
+        ack_supported = data.get("ack") is True
+
+        self._protocol_registry()[client_uid] = {
+            "ack": ack_supported,
+            "client_ref": client_ref,
+            "history_uid": history_uid,
+        }
+        if client_ref:
+            # Read by the turn path when it opens a delivery record, so the
+            # next connection of this same client instance can be recognised.
+            try:
+                setattr(context, "delivery_client_ref", client_ref)
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+        active = frozenset(self.client_contexts)
+        summary = unsettled_messages(
+            conf_uid,
+            owner=client_uid,
+            client_ref=client_ref,
+            active_owners=active,
+            history_uid=history_uid,
+            limit=self.MAX_REDELIVERIES_PER_HELLO * 2,
+        )
+        unsettled = [
+            {
+                "msg_id": str(record.get("msg_id") or ""),
+                "turn_id": str(record.get("turn_id") or ""),
+                "attempt": int(record.get("attempt") or 0),
+                "status": str(record.get("status") or ""),
+                "history_uid": str(record.get("history_uid") or ""),
+                "retry_count": int(record.get("retry_count") or 0),
+                # False for a message the client already took frames of: it is
+                # still unsettled, but a resend would replay what it has (its
+                # history resync carries the authoritative text instead).
+                "resendable": bool(record.get("resendable")),
+            }
+            for record in summary.messages
+        ]
+        try:
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "delivery-summary",
+                        "protocol": 1,
+                        # False means the state could not be read: UNKNOWN, not
+                        # "nothing pending".
+                        "ok": summary.ok,
+                        "redelivery": ack_supported,
+                        "unsettled": unsettled,
+                    }
+                )
+            )
+        except Exception as error:
+            logger.warning("delivery-summary not sent: type={}", type(error).__name__)
+            return
+
+        if not summary.ok or not ack_supported:
+            # Unknown state, or a client that cannot confirm a resend.
+            return
+
+        await self._redeliver_unsettled(
+            websocket,
+            client_uid,
+            conf_uid,
+            client_ref=client_ref,
+            records=summary.messages,
+        )
+
+    async def _redeliver_unsettled(
+        self,
+        websocket: WebSocket,
+        client_uid: str,
+        conf_uid: str,
+        *,
+        client_ref: str,
+        records: List[Dict[str, Any]],
+    ) -> int:
+        """Resend the unsettled messages of one reconnected client, bounded.
+
+        Text-only on purpose: the canonical persisted text is re-sent as the
+        closing frame of the SAME ``msg_id`` under a NEW attempt. Nothing here
+        re-synthesises or re-plays audio, and the client upserts the bubble it
+        already has (dedupe by ``msg_id``), so a reconnect adds no bubble and
+        no transcript row.
+
+        Each resend needs an atomic claim lease, so two workers can never send
+        the same message at the same time; a message that was already settled,
+        exhausted its retry budget, or whose text is missing is skipped rather
+        than guessed at.
+
+        This is still at-least-once: the lease expires, and a message the
+        client never acknowledges stays retryable. Exactly-once is not claimed.
+        """
+        active = frozenset(self.client_contexts)
+        sent = 0
+        for record in records:
+            if sent >= self.MAX_REDELIVERIES_PER_HELLO:
+                break
+            msg_id = str(record.get("msg_id") or "")
+            message_history = str(record.get("history_uid") or "")
+            if not msg_id:
+                continue
+            if not record.get("resendable"):
+                # The client already took frames of this message; its resync
+                # covers the text and a resend would replay audio it has.
+                continue
+            # Look the text up BEFORE claiming: a message with no persisted
+            # text cannot be redelivered at all, and spending one of its
+            # limited retries on an impossible send would be dishonest.
+            text = self._canonical_message_text(conf_uid, message_history, msg_id)
+            if not text:
+                logger.warning(
+                    "DELIVERY_REDELIVERY_UNRESOLVED msg_id={} "
+                    "history_uid={} (no persisted text)",
+                    msg_id,
+                    message_history,
+                )
+                continue
+            if not message_history or not str(record.get("turn_id") or ""):
+                logger.warning(
+                    "DELIVERY_REDELIVERY_UNRESOLVED msg_id={} (missing identity)",
+                    msg_id,
+                )
+                continue
+            claimed = claim_retry(
+                conf_uid,
+                msg_id,
+                owner=client_uid,
+                client_ref=client_ref,
+                active_owners=active,
+                history_uid=message_history,
+            )
+            if claimed is None:
+                # Settled meanwhile, leased by another worker, exhausted, or no
+                # longer ours. Silence is the correct outcome.
+                logger.debug(
+                    "DELIVERY_REDELIVERY_SKIPPED msg_id={} (not claimable)",
+                    msg_id,
+                )
+                continue
+            turn_id = str(claimed.get("turn_id") or "")
+            accepted = await send_canonical_final(
+                websocket.send_text,
+                history_uid=message_history,
+                request_id=turn_id,
+                text=text,
+                msg_id=msg_id,
+                final_metadata={
+                    "attempt": int(claimed.get("attempt") or 1),
+                    "seq": 0,
+                    "segments": 0,
+                    "final": True,
+                    # Diagnostic only: lets the client UI/logs tell a
+                    # recovery resend from the live turn's closing frame.
+                    "redelivered": True,
+                },
+            )
+            if not accepted:
+                # The transport refused the frame (typically the socket died
+                # again). Do not pretend this was a redelivery, and do not
+                # charge the bounded retry budget for a frame that never left:
+                # release the claim so the next reconnect can try again.
+                released = release_retry_claim(
+                    conf_uid,
+                    msg_id,
+                    owner=client_uid,
+                    attempt=claimed.get("attempt"),
+                )
+                logger.warning(
+                    "DELIVERY_REDELIVERY_SEND_FAILED msg_id={} attempt={} "
+                    "(transport refused; not counted as sent, released={})",
+                    msg_id,
+                    claimed.get("attempt"),
+                    released,
+                )
+                break
+            sent += 1
+            # Yield between frames so a reconnect burst cannot starve the
+            # receive loop (receipts of earlier frames are processed first).
+            await asyncio.sleep(0)
+        if sent:
+            logger.info("DELIVERY_REDELIVERED count={} client_uid={}", sent, client_uid)
+        return sent
+
+    @staticmethod
+    def _canonical_message_text(conf_uid: str, history_uid: str, msg_id: str) -> str:
+        """Persisted text of one logical AI message, or "" when unavailable."""
+        if not conf_uid or not history_uid or not msg_id:
+            return ""
+        try:
+            for row in get_history(conf_uid, history_uid):
+                if row.get("msg_id") == msg_id and row.get("role") == "ai":
+                    content = row.get("content")
+                    return content if isinstance(content, str) else ""
+        except Exception as error:
+            logger.warning("Delivery text lookup failed: type={}", type(error).__name__)
+        return ""
+
+    async def _handle_message_ack(
+        self, websocket: WebSocket, client_uid: str, data: WSMessage
+    ) -> None:
+        """Handle a client receipt for one frame of a logical message.
+
+        Routed here (never into the chat/trigger path): an ACK is not user
+        input and must not start, continue or cancel a turn. The receipt is
+        matched against the ACTIVE attempt of the message (msg_id + turn_id +
+        attempt) and only the client that OWNS the delivery may settle it, so
+        one connection can never complete another connection's message.
+
+        A receipt that does not match is a normal race (duplicate frame, stale
+        attempt after a retry, a message this store does not know) and changes
+        nothing. Only a store that could not be read or written is reported
+        back --- as a failure frame, never as success.
+        """
+        context = self.client_contexts.get(client_uid)
+        if context is None:
+            logger.debug("message-ack ignored: unknown client (post-cleanup?)")
+            return
+        conf_uid = getattr(context.character_config, "conf_uid", "") or ""
+        if not conf_uid:
+            logger.warning("message-ack ignored: client has no conf_uid")
+            return
+
+        msg_id = data.get("msg_id")
+        turn_id = data.get("turn_id") or data.get("turn") or data.get("request_id")
+        protocol = self._protocol_registry().get(client_uid) or {}
+        outcome = apply_ack(
+            conf_uid,
+            msg_id,
+            turn_id=turn_id or "",
+            attempt=data.get("attempt"),
+            status=data.get("status"),
+            seq=data.get("seq"),
+            # Pass the raw value: a string like "false" must be rejected as
+            # malformed, not coerced to True and allowed to settle a message.
+            final=data.get("final", False),
+            reason=data.get("reason") or "",
+            owner=client_uid,
+            # A receipt may also come from the SAME client instance after a
+            # reconnect (new client_uid) -- but only while the old owner is
+            # offline, so no live connection can settle another's message.
+            client_ref=str(protocol.get("client_ref") or ""),
+            active_owners=frozenset(self.client_contexts),
+        )
+        if outcome.persisted:
+            logger.debug(
+                "MESSAGE_ACK msg_id={} turn_id={} attempt={} reason={} applied={}",
+                msg_id,
+                turn_id,
+                outcome.attempt,
+                outcome.reason,
+                outcome.applied,
+            )
+            # The receipt that settles a message can be the event that clears
+            # the last hand-off blocker (see _on_delivery_settled).
+            if outcome.applied and isinstance(outcome.state, dict):
+                if outcome.state.get("status") == STATUS_DELIVERED:
+                    self._on_delivery_settled(
+                        client_uid,
+                        str(outcome.state.get("history_uid") or ""),
+                    )
+            return
+
+        logger.error(
+            "MESSAGE_ACK_NOT_RECORDED msg_id={} turn_id={} attempt={} reason={}",
+            msg_id,
+            turn_id,
+            outcome.attempt,
+            outcome.reason,
+        )
+        # Echo the receipt so a client that already removed it from its
+        # outbox (a reconnect flush) can put it back. The fields are taken
+        # from the already-validated ACK; nothing new is invented here.
+        ack_echo = {
+            "type": "message-ack",
+            "msg_id": msg_id if isinstance(msg_id, str) else "",
+            "turn_id": str(turn_id or ""),
+            "attempt": outcome.attempt,
+            "status": data.get("status")
+            if isinstance(data.get("status"), str)
+            else "",
+            "final": data.get("final") if isinstance(data.get("final"), bool) else False,
+        }
+        seq_echo = data.get("seq")
+        if isinstance(seq_echo, float) and seq_echo.is_integer():
+            seq_echo = int(seq_echo)
+        if isinstance(seq_echo, int) and not isinstance(seq_echo, bool):
+            ack_echo["seq"] = seq_echo
+        if isinstance(data.get("reason"), str) and data.get("reason"):
+            ack_echo["reason"] = data.get("reason")[:200]
+        try:
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "message-ack-result",
+                        "success": False,
+                        "error": "ack-not-recorded",
+                        "reason": outcome.reason,
+                        "msg_id": ack_echo["msg_id"],
+                        "turn_id": ack_echo["turn_id"],
+                        "attempt": outcome.attempt,
+                        "ack": ack_echo,
+                    }
+                )
+            )
+        except Exception as error:
+            logger.warning(
+                "message-ack failure report skipped: type={}",
+                type(error).__name__,
+            )
+
     async def _handle_interrupt(
         self, websocket: WebSocket, client_uid: str, data: WSMessage
     ) -> None:
@@ -1722,12 +2432,67 @@ class WebSocketHandler:
     async def _handle_history_list_request(
         self, websocket: WebSocket, client_uid: str, data: WSMessage
     ) -> None:
-        """Handle request for chat history list"""
+        """Handle request for chat history list
+
+        The empty-session cleanup must never touch a history a client is on.
+        A conversation that was just created (or switched to) holds only its
+        metadata row until the first message, so a request arriving from a
+        second tab, or from a reconnect, used to delete it -- after which the
+        first message re-created the file without its metadata row, losing the
+        sidebar title and the relationship defaults for that conversation.
+        """
         context = self.client_contexts[client_uid]
-        histories = get_history_list(context.character_config.conf_uid)
-        await websocket.send_text(
-            json.dumps({"type": "history-list", "histories": histories})
+        active = {
+            str(getattr(item, "history_uid", "") or "")
+            for item in self.client_contexts.values()
+        }
+        # A turn detached by a disconnect is still writing into its history,
+        # even though no live context names it any more.
+        active.update(str(uid) for uid in self._detached_registry())
+        active.discard("")
+        histories = get_history_list(
+            context.character_config.conf_uid, protect_uids=active
         )
+        # A hand-off whose target the client never reached (browser closed,
+        # server restarted before the first message) is not a conversation: it
+        # has no rows and must not be offered as an empty chat. It is still the
+        # right session to continue, so its uid is reported apart -- ``histories``
+        # stays exactly what the sidebar renders, and only a tab that already
+        # remembers one of these uids may adopt it (client contract).
+        resumable = resumable_continuations(context.character_config.conf_uid)
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "type": "history-list",
+                    "histories": histories,
+                    "resumable_sessions": resumable,
+                }
+            )
+        )
+
+    @staticmethod
+    def _history_data_payload(conf_uid: str, history_uid: str) -> dict:
+        """The one shape of a ``history-data`` snapshot, continuation included.
+
+        A session that continues another one also carries a bounded, read-only
+        preview of the transcript it continues from (``continued_from``,
+        ``continued_at``, ``context_messages``, ``context_total``). Without it
+        a reconnect would present a long, continuing conversation as a brand-new
+        empty chat. The preview is a slice of the SOURCE file's own rows: it is
+        never copied into this transcript and nothing is written here.
+        """
+        messages = [
+            msg for msg in get_history(conf_uid, history_uid) if msg["role"] != "system"
+        ]
+        payload: dict = {
+            "type": "history-data",
+            "history_uid": history_uid,
+            "messages": messages,
+        }
+        continuation = conversation_handoff.continuation_view(conf_uid, history_uid)
+        if continuation:
+            payload.update(continuation)
+        return payload
 
     async def _handle_fetch_history(
         self, websocket: WebSocket, client_uid: str, data: dict
@@ -1749,21 +2514,12 @@ class WebSocketHandler:
             user_timezone=context.user_timezone,
         )
 
-        messages = [
-            msg
-            for msg in get_history(
-                context.character_config.conf_uid,
-                history_uid,
-            )
-            if msg["role"] != "system"
-        ]
         await websocket.send_text(
             json.dumps(
-                {
-                    "type": "history-data",
-                    "history_uid": history_uid,
-                    "messages": messages,
-                }
+                self._history_data_payload(
+                    context.character_config.conf_uid,
+                    history_uid,
+                )
             )
         )
         self._subscriber_registry()[client_uid] = history_uid
@@ -1815,69 +2571,67 @@ class WebSocketHandler:
         loop.create_task(self._deliver_history_to_subscriber(history_uid))
 
     async def _deliver_history_to_subscriber(self, history_uid: str) -> None:
-        """Push an authoritative transcript to whoever is viewing it now.
+        """Push an authoritative transcript to everyone viewing it now.
 
         Used when a turn detached by a disconnect finishes: the response it
         persisted must reach the reconnected socket, otherwise the UI keeps
         showing the half-finished conversation until a manual reload.
+
+        Every live tab bound to this history is a viewer (one session can be
+        open in more than one tab). Delivering only to the first one left the
+        others stale; each gets the same snapshot once and reconciles by
+        msg_id, so this adds no duplicate bubble.
         """
-        # _history_subscribers maps client_uid -> history_uid; find the live
-        # socket currently viewing this history.
-        client_uid = next(
-            (
-                uid
-                for uid, bound in self._subscriber_registry().items()
-                if bound == history_uid
-            ),
-            None,
-        )
-        websocket = self.client_connections.get(client_uid) if client_uid else None
-        if websocket is None:
-            return
-        context = self.client_contexts.get(client_uid)
-        if context is None:
-            return
-        try:
-            messages = [
-                msg
-                for msg in get_history(context.character_config.conf_uid, history_uid)
-                if msg["role"] != "system"
-            ]
-            await websocket.send_text(
-                json.dumps(
-                    {
-                        "type": "history-data",
-                        "history_uid": history_uid,
-                        "messages": messages,
-                    }
-                )
-            )
-            logger.info(
-                "TURN_RESYNCED history_uid={} client_uid={}",
-                history_uid,
-                client_uid,
-            )
-            # Close the lifecycle a fetch-time chain-start may have opened:
-            # the detached turn is done, so the viewer must return to idle.
-            # Skipped when the viewer already runs a newer live turn — that
-            # turn owns thinking now and will close it with its own chain-end.
-            live = self.current_conversation_tasks.get(client_uid or "")
-            if live is None or live.done():
+        # _history_subscribers maps client_uid -> history_uid.
+        subscribers = [
+            uid
+            for uid, bound in self._subscriber_registry().items()
+            if bound == history_uid
+        ]
+        for client_uid in subscribers:
+            websocket = self.client_connections.get(client_uid)
+            if websocket is None:
+                continue
+            context = self.client_contexts.get(client_uid)
+            if context is None:
+                continue
+            try:
                 await websocket.send_text(
                     json.dumps(
-                        {
-                            "type": "control",
-                            "text": "conversation-chain-end",
-                            "history_uid": history_uid,
-                        }
+                        self._history_data_payload(
+                            context.character_config.conf_uid,
+                            history_uid,
+                        )
                     )
                 )
-        except Exception as error:
-            logger.warning(
-                "Detached turn resync skipped: history_uid={} type={}",
-                history_uid,
-                type(error).__name__,
-            )
+                logger.info(
+                    "TURN_RESYNCED history_uid={} client_uid={}",
+                    history_uid,
+                    client_uid,
+                )
+                # Close the lifecycle a fetch-time chain-start may have opened:
+                # the detached turn is done, so the viewer must return to idle.
+                # Skipped when the viewer already runs a newer live turn — that
+                # turn owns thinking now and will close it with its own chain-end.
+                live = self.current_conversation_tasks.get(client_uid)
+                if live is None or live.done():
+                    await websocket.send_text(
+                        json.dumps(
+                            {
+                                "type": "control",
+                                "text": "conversation-chain-end",
+                                "history_uid": history_uid,
+                            }
+                        )
+                    )
+            except Exception as error:
+                logger.warning(
+                    "Detached turn resync skipped: history_uid={} client_uid={} "
+                    "type={}",
+                    history_uid,
+                    client_uid,
+                    type(error).__name__,
+                )
 
     async def _handle_create_history(
         self, websocket: WebSocket, client_uid: str, data: WSMessage
@@ -2539,6 +3293,7 @@ class WebSocketHandler:
             current_conversation_tasks=self.current_conversation_tasks,
             detached_turns=self._detached_registry(),
             broadcast_to_group=self.broadcast_to_group,
+            on_turn_complete=self._on_turn_completed,
         )
         if msg_type in {"text-input", "mic-audio-end"}:
             context = self.client_contexts.get(client_uid)
@@ -2550,6 +3305,220 @@ class WebSocketHandler:
                     context.history_uid,
                     user_activity=False,
                 )
+
+    # ------------------------------------------------------------------
+    # Cross-transcript hand-off (Stage 4.7/4.8). Off unless the operator opts
+    # in (MILI_HANDOFF_AUTO): the backend and the client's continued-view
+    # contract are covered by tests, but splitting a live conversation is a
+    # user-visible decision, so it never happens by default.
+    # ------------------------------------------------------------------
+
+    def _on_delivery_settled(self, client_uid: str, history_uid: str) -> None:
+        """A receipt settled a message: the transcript may now be cut.
+
+        The turn-completion hook runs the moment the turn ends -- normally
+        BEFORE this client's receipt for the turn's own closing frame has been
+        processed. The evaluation then correctly defers (an unsettled message
+        must not be left behind in the transcript we leave), and without this
+        follow-up it would defer on every turn forever: each turn's own
+        message is always the one still in flight at its end.
+
+        The receipt is the event that clears that blocker, so it re-runs the
+        same evaluation. Event-driven on purpose (no timers, no polling), and
+        a no-op unless the operator enabled automatic hand-off.
+        """
+        try:
+            if not conversation_handoff.auto_enabled():
+                return
+            if not client_uid or not history_uid:
+                return
+            context = self.client_contexts.get(client_uid)
+            if context is None:
+                return
+            if str(getattr(context, "history_uid", "") or "") != str(history_uid):
+                return
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:  # pragma: no cover - no loop to schedule on
+                return
+            loop.create_task(
+                self._consider_handoff(client_uid, history_uid),
+                name=f"session-handoff-settled-{client_uid}",
+            )
+        except Exception as error:
+            logger.debug(
+                "Hand-off re-evaluation skipped: type={}", type(error).__name__
+            )
+
+    def _on_turn_completed(
+        self, client_uid: str, history_uid: str, task: asyncio.Task
+    ) -> None:
+        """A turn finished: consider continuing a long conversation elsewhere.
+
+        Runs as a done-callback, so it must never raise. Only a FINALIZED turn
+        is a boundary a conversation may be cut at: a cancelled or failed turn
+        still owns its persistence/rollback.
+        """
+        try:
+            if not conversation_handoff.auto_enabled():
+                return
+            if task.cancelled() or task.exception() is not None:
+                return
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:  # pragma: no cover - no loop to schedule on
+                return
+            loop.create_task(
+                self._consider_handoff(client_uid, history_uid),
+                name=f"session-handoff-{client_uid}",
+            )
+        except Exception as error:
+            logger.debug(
+                "Hand-off scheduling skipped: type={}", type(error).__name__
+            )
+
+    async def _consider_handoff(self, client_uid: str, history_uid: str) -> None:
+        """Evaluate the hand-off contract against real server state, then move.
+
+        Every input is authoritative: the live turn registry, the detached
+        turn registry, the delivery store, the group manager, the connection
+        table, the transcript itself. Nothing is written unless the decision
+        allows it.
+        """
+        try:
+            context = self.client_contexts.get(client_uid)
+            if context is None:
+                return
+            if str(getattr(context, "history_uid", "") or "") != str(history_uid):
+                # The connection already moved on (new conversation, restored
+                # history, disconnect raced): not our boundary to cut.
+                return
+            conf_uid = str(getattr(context.character_config, "conf_uid", "") or "")
+            if not conf_uid or not history_uid:
+                return
+            group = self.chat_group_manager.get_client_group(client_uid)
+            # A history is shared state: every live tab on it is a writer for
+            # the same transcript. The cut must wait for ALL of them, not just
+            # the connection that happened to trigger this evaluation.
+            history_clients = [
+                uid
+                for uid, ctx in self.client_contexts.items()
+                if str(getattr(ctx, "history_uid", "") or "") == history_uid
+            ]
+            other_turns: list[Optional[asyncio.Task]] = []
+            other_deliveries: list[DeliverySummary] = []
+            for uid in history_clients:
+                if uid == client_uid:
+                    # Covered by active_turn / delivery below (this request's
+                    # own state), so it is not duplicated here.
+                    continue
+                other_turns.append(self.current_conversation_tasks.get(uid))
+                try:
+                    other_deliveries.append(
+                        unsettled_messages(
+                            conf_uid,
+                            owner=uid,
+                            active_owners=frozenset(self.client_contexts),
+                            history_uid=history_uid,
+                            limit=-1,
+                        )
+                    )
+                except Exception:
+                    # Unknown is not settled: block rather than cut under a
+                    # message that could still be redelivered into the source.
+                    other_deliveries.append(DeliverySummary(False, []))
+            decision = conversation_handoff.evaluate(
+                rows=conversation_handoff.message_count(conf_uid, history_uid),
+                active_turn=self.current_conversation_tasks.get(client_uid),
+                active_turns=tuple(other_turns),
+                detached_turn=self._detached_registry().get(history_uid),
+                delivery=unsettled_messages(
+                    conf_uid,
+                    owner=client_uid,
+                    active_owners=frozenset(self.client_contexts),
+                    history_uid=history_uid,
+                    limit=-1,
+                ),
+                deliveries=tuple(other_deliveries),
+                connected=client_uid in self.client_connections,
+                group_members=tuple(group.members) if group is not None else (),
+                summary_through=conversation_handoff.summary_boundary(
+                    conf_uid, history_uid
+                ),
+            )
+            if not decision.allowed:
+                if decision.reached_threshold:
+                    logger.info(
+                        "SESSION_HANDOFF_DEFERRED reason={} rows={} history_uid={}",
+                        decision.reason(),
+                        decision.rows,
+                        history_uid,
+                    )
+                return
+            new_uid = conversation_handoff.perform_handoff(
+                conf_uid, history_uid, context
+            )
+            if not new_uid:
+                return
+            # One continuation for the source: every other tab already on that
+            # source joins the SAME target. Switching is synchronous, so no
+            # other evaluation can create a sibling between these switches.
+            moved: list[str] = []
+            for uid in history_clients:
+                if uid == client_uid:
+                    continue
+                other_context = self.client_contexts.get(uid)
+                if other_context is None:
+                    continue
+                if (
+                    str(getattr(other_context, "history_uid", "") or "")
+                    != history_uid
+                ):
+                    continue
+                if not conversation_handoff.switch_context(other_context, new_uid):
+                    logger.warning(
+                        "SESSION_HANDOFF_SKIPPED client={} reason=switch-failed",
+                        uid,
+                    )
+                    continue
+                moved.append(uid)
+            await self._announce_handoff(client_uid, history_uid, new_uid)
+            for uid in moved:
+                await self._announce_handoff(uid, history_uid, new_uid)
+        except Exception as error:
+            logger.warning(
+                "Hand-off evaluation skipped: type={}", type(error).__name__
+            )
+
+    async def _announce_handoff(
+        self, client_uid: str, source_uid: str, new_uid: str
+    ) -> None:
+        """Re-arm one moved tab and tell it about the shared continuation."""
+        try:
+            await self._cancel_proactive_timer(client_uid)
+            await self._activate_proactive_for_history(client_uid, new_uid)
+            self._subscriber_registry()[client_uid] = new_uid
+            websocket = self.client_connections.get(client_uid)
+            if websocket is None:
+                return
+            # Same event the explicit "new conversation" path sends, so an
+            # existing client needs no new handler; `continued_from` is
+            # additive information (an older client ignores it).
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "new-history-created",
+                        "history_uid": new_uid,
+                        "continued_from": source_uid,
+                    }
+                )
+            )
+        except Exception as error:
+            logger.warning(
+                "SESSION_HANDOFF_NOTICE_SKIPPED client={} type={}",
+                client_uid,
+                type(error).__name__,
+            )
 
     async def _handle_fetch_world_state(
         self, websocket: WebSocket, client_uid: str, data: WSMessage

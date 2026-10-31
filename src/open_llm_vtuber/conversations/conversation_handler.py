@@ -29,8 +29,17 @@ async def handle_conversation_trigger(
     current_conversation_tasks: Dict[str, Optional[asyncio.Task]],
     broadcast_to_group: Callable,
     detached_turns: Optional[Dict[str, asyncio.Task]] = None,
+    on_turn_complete: Optional[Callable[[str, str, asyncio.Task], None]] = None,
 ) -> None:
-    """Handle triggers that start a conversation"""
+    """Handle triggers that start a conversation
+
+    ``on_turn_complete`` (optional) is notified as a done-callback AFTER an
+    individual turn task finishes: ``(client_uid, history_uid, task)``. It is
+    the only point where a conversation boundary exists, so work that may not
+    run mid-turn (the cross-transcript hand-off) hangs off it. Nothing here
+    changes what the turn does; a missing callback leaves the old behaviour
+    byte-for-byte intact.
+    """
     metadata = None
 
     if msg_type == "ai-speak-signal":
@@ -148,42 +157,50 @@ async def handle_conversation_trigger(
         # targets the same history, wait for the orphan first: two turns
         # must never persist into one transcript concurrently.
         # Same-client replacement above already cancelled, so anything
-        # awaited here belongs to a dead connection.
-        orphan_candidates = []
+        # awaited here belongs to a dead connection or to ANOTHER tab viewing
+        # the same session. A history is shared state: the second tab queues
+        # behind the first instead of interleaving two writers.
+        preceding_turns: list[asyncio.Task] = []
+        seen_turns: set[int] = set()
         if turn_history_uid and detached_turns is not None:
             orphan = detached_turns.get(turn_history_uid)
             if orphan is not None and not orphan.done():
-                orphan_candidates.append(orphan)
+                preceding_turns.append(orphan)
+                seen_turns.add(id(orphan))
         for other_key, other_task in list(current_conversation_tasks.items()):
             if (
                 other_key != client_uid
                 and other_task is not None
                 and not other_task.done()
-                and getattr(other_task, "_olv_detached", False)
-                and getattr(other_task, "_olv_history_uid", "") == turn_history_uid
                 and turn_history_uid
+                and getattr(other_task, "_olv_history_uid", "")
+                == turn_history_uid
             ):
-                orphan_candidates.append(other_task)
-        for orphan_task in orphan_candidates:
+                if id(other_task) in seen_turns:
+                    continue
+                preceding_turns.append(other_task)
+                seen_turns.add(id(other_task))
+        for preceding_task in preceding_turns:
             logger.info(
-                "Queued behind detached in-flight turn on the same history "
-                "(orphan={})",
-                id(orphan_task),
+                "Queued behind an in-flight turn on the same history "
+                "(task={} detached={})",
+                id(preceding_task),
+                bool(getattr(preceding_task, "_olv_detached", False)),
             )
 
         async def _run_turn():
-            # The orphan wait happens INSIDE the turn task on purpose. If it
-            # ran before the task existed, a disconnect during the wait would
-            # abandon the trigger and silently drop the user's message. Here
-            # the task is already owned by current_conversation_tasks, so
+            # The preceding-turn wait happens INSIDE the turn task on purpose.
+            # If it ran before the task existed, a disconnect during the wait
+            # would abandon the trigger and silently drop the user's message.
+            # Here the task is already owned by current_conversation_tasks, so
             # handle_disconnect can detach it like any other in-flight turn.
-            if orphan_candidates:
+            if preceding_turns:
                 # Accepted but queued: tell the UI immediately so it shows
                 # thinking instead of sitting idle with no feedback until the
-                # orphan drains. Best-effort (dead socket fails silently).
-                # Deliberately NOT a chain-start: nothing is cleared and no
-                # new bubble starts; the real chain-start still opens the
-                # turn when process_single_conversation begins.
+                # earlier turn drains. Best-effort (dead socket fails
+                # silently). Deliberately NOT a chain-start: nothing is
+                # cleared and no new bubble starts; the real chain-start still
+                # opens the turn when process_single_conversation begins.
                 try:
                     await safe_send(
                         websocket.send_text,
@@ -197,23 +214,23 @@ async def handle_conversation_trigger(
                     )
                 except Exception:
                     pass
-            for orphan_task in orphan_candidates:
+            for preceding_task in preceding_turns:
                 logger.info(
-                    "Waiting for detached in-flight turn on the same history "
+                    "Waiting for an in-flight turn on the same history "
                     "before starting the new trigger"
                 )
                 try:
-                    await asyncio.shield(orphan_task)
+                    await asyncio.shield(preceding_task)
                 except asyncio.CancelledError:
-                    # Our own cancellation must propagate; the orphan itself
-                    # may legitimately have been cancelled, so re-check.
-                    if orphan_task.cancelled():
+                    # Our own cancellation must propagate; the preceding
+                    # turn itself may legitimately have been cancelled.
+                    if preceding_task.cancelled():
                         continue
                     raise
                 except Exception as error:
-                    # A dead orphan never blocks the new turn.
+                    # A dead turn never blocks the new one.
                     logger.debug(
-                        "Detached turn finished with: type={}",
+                        "Preceding turn finished with: type={}",
                         type(error).__name__,
                     )
             # Every send in this turn is best-effort. A turn can outlive its
@@ -240,6 +257,33 @@ async def handle_conversation_trigger(
         new_task._olv_history_uid = turn_history_uid
         new_task._olv_detached = False
         current_conversation_tasks[client_uid] = new_task
+        if on_turn_complete is not None:
+            # Done-callback, not an inline call: it runs exactly when this turn
+            # is over (cancelled ones included, so the callback must check).
+            new_task.add_done_callback(
+                lambda finished, uid=client_uid, history=turn_history_uid: _notify_turn_complete(
+                    on_turn_complete, uid, history, finished
+                )
+            )
+
+
+def _notify_turn_complete(
+    callback: Callable[[str, str, asyncio.Task], None],
+    client_uid: str,
+    history_uid: str,
+    task: asyncio.Task,
+) -> None:
+    """Run one turn-completion notification; a failure must never escape.
+
+    Done-callbacks run after the turn already finished, so raising here could
+    only surface as an unhandled callback error -- never as a turn failure.
+    """
+    try:
+        callback(client_uid, history_uid, task)
+    except Exception as error:
+        logger.warning(
+            "Turn-complete notification skipped: type={}", type(error).__name__
+        )
 
 
 async def handle_individual_interrupt(

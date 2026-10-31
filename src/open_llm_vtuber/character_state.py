@@ -11,6 +11,7 @@ vector index, no embeddings, no autonomous memory agent.
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import threading
@@ -50,13 +51,133 @@ _RELATIONSHIP_RANK: Dict[str, int] = {
     "married": 4,
 }
 
-_state_locks: Dict[str, threading.RLock] = {}
+try:  # POSIX advisory locks; Windows falls back to in-process only.
+    import fcntl
+except ImportError:  # pragma: no cover - Windows-only fallback
+    fcntl = None  # type: ignore[assignment]
+
+
+def _open_state_lock_file(path: str):
+    """Open the cross-process lock file; None when unavailable (fail-soft).
+
+    A missing OS lock degrades to the in-process lock only. That is the
+    pre-existing behaviour, so availability never regresses; the residual
+    risk is documented in ``reminder_delivery`` and the test report.
+    """
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as error:
+        logger.warning(
+            "Cross-process state lock unavailable: type={}",
+            type(error).__name__,
+        )
+        return None
+    if fcntl is None:
+        return descriptor
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+    except OSError as error:  # pragma: no cover - unusual OS failure
+        logger.warning(
+            "Cross-process state lock not acquired: type={}",
+            type(error).__name__,
+        )
+    return descriptor
+
+
+class _CrossProcessStateLock:
+    """Re-entrant state lock: in-process RLock + advisory OS file lock.
+
+    ``character_state`` is a JSON store shared by every server process that
+    points at the same data directory. The in-process RLock only serialises
+    threads; ``flock`` on a dedicated ``<state>.lock`` file serialises whole
+    read-modify-write transactions across processes sharing that directory.
+    The lock file is separate from the state file because every save replaces
+    the state file atomically (a lock on the old inode would protect nothing).
+
+    Re-entrant by depth: nested ``with`` blocks (capture -> save) take the OS
+    lock once and release it when the outermost block exits. ``flock`` is
+    released by the kernel when the process dies, so a crash cannot wedge the
+    store permanently. A process that hangs while holding it does block other
+    writers; state transactions are local and short-lived by design.
+    """
+
+    def __init__(self, filepath: str):
+        self._filepath = filepath
+        self._lock_path = f"{filepath}.lock"
+        self._thread_lock = threading.RLock()
+        self._depth = 0
+        self._fd = None
+
+    def __enter__(self):
+        self._thread_lock.acquire()
+        try:
+            if self._depth == 0:
+                self._fd = _open_state_lock_file(self._lock_path)
+            self._depth += 1
+            return self
+        except BaseException:
+            self._thread_lock.release()
+            raise
+
+    def __exit__(self, exc_type, exc, traceback):
+        try:
+            self._depth -= 1
+            if self._depth == 0 and self._fd is not None:
+                descriptor = self._fd
+                self._fd = None
+                try:
+                    if fcntl is not None:
+                        try:
+                            fcntl.flock(descriptor, fcntl.LOCK_UN)
+                        except OSError:  # pragma: no cover
+                            pass
+                finally:
+                    try:
+                        os.close(descriptor)
+                    except OSError:  # pragma: no cover
+                        pass
+        finally:
+            self._thread_lock.release()
+        return False
+
+
+_state_locks: Dict[str, _CrossProcessStateLock] = {}
 _state_locks_guard = threading.Lock()
 
 
-def _get_state_lock(filepath: str) -> threading.RLock:
+def _get_state_lock(filepath: str) -> _CrossProcessStateLock:
+    key = os.path.abspath(filepath)
     with _state_locks_guard:
-        return _state_locks.setdefault(filepath, threading.RLock())
+        return _state_locks.setdefault(key, _CrossProcessStateLock(key))
+
+
+def character_state_lock(conf_uid: str) -> _CrossProcessStateLock:
+    """Cross-process transaction scope for writers outside this module.
+
+    Enter this before loading state and hold it until the save. Callers that
+    mutate a snapshot loaded earlier must re-read inside the scope, otherwise
+    they can still overwrite a claim written by another process.
+    """
+    return _get_state_lock(get_character_state_path(conf_uid))
+
+
+def _state_transaction(func):
+    """Serialise a whole character-state read-modify-write transaction.
+
+    The lock is the cross-process lock above, so two server processes sharing
+    the same data directory cannot load the same snapshot, modify it, and
+    overwrite each other -- which is how a claim could otherwise be erased
+    between claim and delivery. Re-entrant: decorated functions may call each
+    other and ``save_character_state`` without deadlocking.
+    """
+
+    @functools.wraps(func)
+    def wrapper(conf_uid, *args, **kwargs):
+        with _get_state_lock(get_character_state_path(conf_uid)):
+            return func(conf_uid, *args, **kwargs)
+
+    return wrapper
 
 
 def _write_state_atomic(filepath: str, data: Dict[str, Any]) -> None:
@@ -457,6 +578,7 @@ def save_character_state(conf_uid: str, state: CharacterState) -> bool:
         return False
 
 
+@_state_transaction
 def migrate_relationship_if_needed(
     conf_uid: str, state: CharacterState
 ) -> CharacterState:
@@ -537,6 +659,7 @@ def migrate_relationship_if_needed(
     return state
 
 
+@_state_transaction
 def set_character_relationship(
     conf_uid: str,
     status: RelationshipStatus,
@@ -555,6 +678,7 @@ def set_character_relationship(
     return state
 
 
+@_state_transaction
 def set_character_timezone(
     conf_uid: str, tz: Optional[str]
 ) -> Optional[CharacterState]:
@@ -642,6 +766,7 @@ def _memory_is_same_fact(existing: str, incoming: str) -> bool:
     return left <= right or right <= left
 
 
+@_state_transaction
 def add_character_memory(
     conf_uid: str,
     text: str,
@@ -679,6 +804,7 @@ def add_character_memory(
     return state
 
 
+@_state_transaction
 def record_interaction_preference(
     conf_uid: str,
     user_text: str,
@@ -723,12 +849,14 @@ def record_interaction_preference(
         return None
 
 
+@_state_transaction
 def remove_character_memory(conf_uid: str, text: str) -> Optional[CharacterState]:
     """Remove stored facts overlapping the given text; None on write failure."""
     state, _removed = remove_character_memory_count(conf_uid, text)
     return state
 
 
+@_state_transaction
 def remove_character_memory_count(
     conf_uid: str, text: str, *, exact: bool = False
 ) -> tuple[Optional[CharacterState], int]:
@@ -771,6 +899,7 @@ def remove_character_memory_count(
     return state, removed
 
 
+@_state_transaction
 def reset_character_memory(conf_uid: str) -> Optional[CharacterState]:
     """Clear all long-term memory for a character; None on write failure."""
     state = load_character_state(conf_uid)
@@ -782,6 +911,7 @@ def reset_character_memory(conf_uid: str) -> Optional[CharacterState]:
     return state
 
 
+@_state_transaction
 def reset_character_state(conf_uid: str) -> Optional[CharacterState]:
     """Reset relationship to stranger and clear character-level state.
 
@@ -978,6 +1108,7 @@ def record_future_intention(
     return _persist_detected_intention(conf_uid, detected)
 
 
+@_state_transaction
 def complete_future_intention(conf_uid: str, intention_id: str) -> bool:
     """Mark one reminder request done; False when missing or unwritable."""
     try:
@@ -993,6 +1124,7 @@ def complete_future_intention(conf_uid: str, intention_id: str) -> bool:
         return False
 
 
+@_state_transaction
 def cancel_stored_future_intention(conf_uid: str, intention_id: str) -> bool:
     """Cancel one pending reminder request; False when missing/unwritable.
 
@@ -1013,6 +1145,7 @@ def cancel_stored_future_intention(conf_uid: str, intention_id: str) -> bool:
         return False
 
 
+@_state_transaction
 def retract_interaction_preference(
     conf_uid: str, preference_id: str
 ) -> tuple[Optional[CharacterState], int]:
@@ -1087,20 +1220,61 @@ def claim_due_future_intentions(
     reminder text still renders in the proactive prompt; ``status`` becomes
     ``done`` only after ``complete_claimed_future_intentions``. ``exclude_ids``
     lets the dispatcher skip rows that are in a per-row retry window.
+
+    Before claiming, rows that already have a durable delivery receipt are
+    reconciled to ``done`` instead of being claimed: the message was already
+    delivered, and only the completion write (or the process) failed. This is
+    what makes a failed completion or a crash after delivery non-duplicating.
     """
     try:
         from .future_intentions import claim_due_intentions as _claim
+        from .future_intentions import complete_delivered_intentions
+        from .reminder_delivery import delivered_ids
 
         filepath = get_character_state_path(conf_uid)
         with _get_state_lock(filepath):
+            # Read the append-only journal INSIDE the transaction: a receipt
+            # appended before this point is always seen together with the
+            # state it protects. A receipt appended while this transaction is
+            # already running can only belong to a row still claimed by its
+            # own delivery attempt; the lease blocks a second claim, and the
+            # next claim reconciles it after the completion (or its failure).
+            delivered = delivered_ids(conf_uid)
             state = load_character_state(conf_uid)
+            if delivered:
+                reconciled_rows, reconciled = complete_delivered_intentions(
+                    state.future_intentions, delivered
+                )
+                if reconciled:
+                    state.future_intentions = reconciled_rows
+                    if not save_character_state(conf_uid, state):
+                        # Never claim a row the journal proves was delivered.
+                        # The receipt keeps blocking the duplicate until the
+                        # reconciliation write can succeed.
+                        logger.warning(
+                            "Delivered reminder reconciliation not persisted: "
+                            "count={}",
+                            reconciled,
+                        )
+                        return []
+                    logger.info(
+                        "Delivered reminder reconciled to done: count={}",
+                        reconciled,
+                    )
+            excluded = set(delivered)
+            for value in (
+                [exclude_ids] if isinstance(exclude_ids, str) else (exclude_ids or [])
+            ):
+                text = str(value or "").strip()
+                if text:
+                    excluded.add(text)
             rows, claimed = _claim(
                 state.future_intentions,
                 now=now,
                 owner=owner,
                 lease_seconds=lease_seconds,
                 max_claims=max_claims,
-                exclude_ids=exclude_ids,
+                exclude_ids=excluded,
             )
             if not claimed:
                 return []
@@ -1230,6 +1404,50 @@ def release_claimed_future_intentions(
         return 0
 
 
+@_state_transaction
+def renew_claimed_future_intentions(
+    conf_uid: str,
+    *,
+    owner: str,
+    intention_ids: List[str],
+    lease_seconds: int = 600,
+    now: Optional[datetime] = None,
+) -> int:
+    """Extend ``owner``'s live reminder claims; returns the renewed count.
+
+    Called by a dispatcher heartbeat while its provider turn is still running.
+    The lease is what stops another server process from claiming the same row;
+    without renewal a turn longer than ``lease_seconds`` would be taken over
+    and delivered twice while the first stream is still open.
+
+    Fail-soft: a read/write problem returns 0, which the caller treats as "the
+    lease was not renewed" (it keeps trying on the next heartbeat tick).
+    """
+    try:
+        from .future_intentions import renew_intention_claims as _renew
+
+        state = load_character_state(conf_uid)
+        rows, renewed = _renew(
+            state.future_intentions,
+            owner=owner,
+            intention_ids=intention_ids,
+            now=now,
+            lease_seconds=lease_seconds,
+        )
+        if not renewed:
+            return 0
+        state.future_intentions = rows
+        if not save_character_state(conf_uid, state):
+            return 0
+        return renewed
+    except Exception as error:
+        logger.debug(
+            "Future intention lease renewal failed: type={}", type(error).__name__
+        )
+        return 0
+
+
+@_state_transaction
 def consume_due_future_intentions(
     conf_uid: str,
     *,
