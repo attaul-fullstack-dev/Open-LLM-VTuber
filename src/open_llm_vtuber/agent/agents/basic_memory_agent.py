@@ -7,6 +7,7 @@ from typing import (
     Literal,
     Union,
     Optional,
+    Sequence,
 )
 import asyncio
 from datetime import datetime, timezone
@@ -38,6 +39,7 @@ from ...character_state import (
     activate_goal,
     add_character_memory as persist_character_memory,
     build_character_memory_context,
+    character_state_lock,
     complete_goal,
     ensure_seed_goals,
     get_character_state_path,
@@ -621,7 +623,12 @@ class BasicMemoryAgent(AgentInterface):
         """Expose the character-level relationship state for backend/tests."""
         return self._relationship_state.status
 
-    def _relationship_system_prompt(self, base_prompt: str) -> str:
+    def _relationship_system_prompt(
+        self,
+        base_prompt: str,
+        *,
+        exclude_intention_texts: Optional[Sequence[str]] = None,
+    ) -> str:
         # Adopt any sibling-connection write to the character state (facts,
         # preferences, intentions) before rendering this turn. Cheap stat
         # gate: a re-read happens only when the file actually changed.
@@ -748,6 +755,7 @@ class BasicMemoryAgent(AgentInterface):
             intention_context = build_future_intention_context(
                 getattr(self._character_state, "future_intentions", None),
                 tz=self._user_timezone,
+                exclude_texts=exclude_intention_texts,
             )
         except Exception as error:
             logger.warning(
@@ -988,25 +996,34 @@ class BasicMemoryAgent(AgentInterface):
             state = getattr(self, "_character_state", None)
             if state is None:
                 return False
-            existing = list(getattr(state, "goals", None) or [])
-            seeded = ensure_seed_goals(existing)
-            if len(seeded) == len(existing) and all(
-                str(item.get("id", "")) == str(other.get("id", ""))
-                and str(item.get("status", "")) == str(other.get("status", ""))
-                for item, other in zip(seeded, existing)
-            ):
-                # Already present; still normalise into the live object so the
-                # in-memory view matches what is on disk.
+            conf_uid = self._character_conf_uid
+            # Cross-process transaction: read inside the lock so a claim or
+            # transition written by another process since this snapshot was
+            # loaded is not rolled back by the save below.
+            with character_state_lock(conf_uid):
+                try:
+                    fresh = load_character_state(conf_uid)
+                except Exception:
+                    fresh = state
+                existing = list(getattr(fresh, "goals", None) or [])
+                seeded = ensure_seed_goals(existing)
+                already_seeded = len(seeded) == len(existing) and all(
+                    str(item.get("id", "")) == str(other.get("id", ""))
+                    and str(item.get("status", "")) == str(other.get("status", ""))
+                    for item, other in zip(seeded, existing)
+                )
+                fresh.goals = seeded
+                # Normalise the live view too, so it matches what is on disk.
                 state.goals = seeded
-                return False
-            state.goals = seeded
-            saved = save_character_state(self._character_conf_uid, state)
-            logger.info(
-                "Goal seeds: goals={} seeded=True persisted={}",
-                goal_status_counts(seeded),
-                bool(saved),
-            )
-            return bool(saved)
+                if already_seeded:
+                    return False
+                saved = save_character_state(conf_uid, fresh)
+                logger.info(
+                    "Goal seeds: goals={} seeded=True persisted={}",
+                    goal_status_counts(seeded),
+                    bool(saved),
+                )
+                return bool(saved)
         except Exception as error:
             logger.debug("Goal seeding skipped: type={}", type(error).__name__)
             return False
@@ -1035,31 +1052,38 @@ class BasicMemoryAgent(AgentInterface):
             state = getattr(self, "_character_state", None)
             if state is None:
                 return False
-            goals = list(getattr(state, "goals", None) or [])
             target = str(status or "").strip().lower()
-            if target == "active":
-                updated, changed = activate_goal(goals, goal_id)
-            elif target == "done":
-                updated, changed = complete_goal(goals, goal_id)
-            else:
+            if target not in ("active", "done"):
                 logger.debug(
                     "Goal transition rejected: goal_id={} status={}",
                     goal_id,
                     target,
                 )
                 return False
-            if not changed:
-                return False
-            state.goals = updated
-            saved = save_character_state(self._character_conf_uid, state)
-            logger.info(
-                "Goal transition: goal_id={} status={} persisted={} counts={}",
-                goal_id,
-                target,
-                bool(saved),
-                goal_status_counts(updated),
-            )
-            return bool(saved)
+            conf_uid = self._character_conf_uid
+            with character_state_lock(conf_uid):
+                try:
+                    fresh = load_character_state(conf_uid)
+                except Exception:
+                    fresh = state
+                goals = list(getattr(fresh, "goals", None) or [])
+                if target == "active":
+                    updated, changed = activate_goal(goals, goal_id)
+                else:
+                    updated, changed = complete_goal(goals, goal_id)
+                if not changed:
+                    return False
+                fresh.goals = updated
+                saved = save_character_state(conf_uid, fresh)
+                state.goals = updated
+                logger.info(
+                    "Goal transition: goal_id={} status={} persisted={} counts={}",
+                    goal_id,
+                    target,
+                    bool(saved),
+                    goal_status_counts(updated),
+                )
+                return bool(saved)
         except Exception as error:
             logger.debug("Goal transition failed: type={}", type(error).__name__)
             return False
@@ -1070,13 +1094,22 @@ class BasicMemoryAgent(AgentInterface):
             state = getattr(self, "_character_state", None)
             if state is None:
                 return False
-            updated, changed = record_goal_evidence(
-                list(getattr(state, "goals", None) or []), goal_id, evidence_id
-            )
-            if not changed:
-                return False
-            state.goals = updated
-            return bool(save_character_state(self._character_conf_uid, state))
+            conf_uid = self._character_conf_uid
+            with character_state_lock(conf_uid):
+                try:
+                    fresh = load_character_state(conf_uid)
+                except Exception:
+                    fresh = state
+                updated, changed = record_goal_evidence(
+                    list(getattr(fresh, "goals", None) or []), goal_id, evidence_id
+                )
+                if not changed:
+                    state.goals = updated
+                    return False
+                fresh.goals = updated
+                saved = bool(save_character_state(conf_uid, fresh))
+                state.goals = updated
+                return saved
         except Exception as error:
             logger.debug("Goal evidence anchor failed: type={}", type(error).__name__)
             return False
@@ -1099,23 +1132,28 @@ class BasicMemoryAgent(AgentInterface):
             state = getattr(self, "_character_state", None)
             if state is None:
                 return False
-            try:
-                fresh = load_character_state(self._character_conf_uid)
-            except Exception:
-                fresh = None
-            goals_source = getattr(fresh, "goals", None) if fresh is not None else None
-            if goals_source is None:
-                goals_source = getattr(state, "goals", None)
-            updated, changed = record_goal_evidence(
-                list(goals_source or []), goal_id, evidence_id
-            )
-            if not changed:
-                return False
-            state.goals = updated
-            target = fresh if fresh is not None else state
-            if fresh is not None:
-                fresh.goals = updated
-            return bool(save_character_state(self._character_conf_uid, target))
+            conf_uid = self._character_conf_uid
+            with character_state_lock(conf_uid):
+                try:
+                    fresh = load_character_state(conf_uid)
+                except Exception:
+                    fresh = None
+                goals_source = (
+                    getattr(fresh, "goals", None) if fresh is not None else None
+                )
+                if goals_source is None:
+                    goals_source = getattr(state, "goals", None)
+                updated, changed = record_goal_evidence(
+                    list(goals_source or []), goal_id, evidence_id
+                )
+                if not changed:
+                    state.goals = updated
+                    return False
+                state.goals = updated
+                target = fresh if fresh is not None else state
+                if fresh is not None:
+                    fresh.goals = updated
+                return bool(save_character_state(conf_uid, target))
         except Exception as error:
             logger.debug(
                 "Goal evidence anchor (fresh) failed: type={}",
@@ -1609,6 +1647,62 @@ class BasicMemoryAgent(AgentInterface):
             except Exception:
                 pass
             return int(count)
+        except Exception:
+            return 0
+
+    def record_reminder_delivery(
+        self, owner: str, intention_ids: List[str]
+    ) -> bool:
+        """Durably record that these reminders were just delivered.
+
+        Called at the delivery boundary, BEFORE the completion write. Once the
+        receipt is durable, a failed completion, a lease expiry or a restart
+        reconciles the row to done instead of sending the same reminder again.
+        Fail-soft: False means the receipt is not durable, so the caller must
+        still attempt the normal completion write (and accept the residual
+        duplicate window documented in ``reminder_delivery``).
+        """
+        try:
+            from ...reminder_delivery import record_delivery
+
+            if not self._character_conf_uid:
+                return False
+            return bool(
+                record_delivery(
+                    self._character_conf_uid,
+                    intention_ids,
+                    owner=owner,
+                )
+            )
+        except Exception:
+            return False
+
+    def renew_claimed_future_intentions(
+        self, owner: str, intention_ids: List[str], lease_seconds: int = 600
+    ) -> int:
+        """Extend this attempt's lease while its turn is still in flight.
+
+        Claim exclusivity across processes is the lease, not the in-process
+        lock: a second server process may only take a row over after
+        ``claim_until``. A long provider/TTS turn can outlive the default
+        lease, so the dispatcher renews it while streaming instead of letting
+        the row look abandoned mid-delivery.
+        """
+        try:
+            from ...character_state import (
+                renew_claimed_future_intentions as _renew,
+            )
+
+            if not self._character_conf_uid:
+                return 0
+            return int(
+                _renew(
+                    self._character_conf_uid,
+                    owner=owner,
+                    intention_ids=intention_ids,
+                    lease_seconds=lease_seconds,
+                )
+            )
         except Exception:
             return 0
 
@@ -3391,7 +3485,10 @@ class BasicMemoryAgent(AgentInterface):
 
             current_system_prompt = "\n\n".join(
                 [
-                    self._relationship_system_prompt(self._system),
+                    self._relationship_system_prompt(
+                        self._system,
+                        exclude_intention_texts=due_reminders,
+                    ),
                     "Internal instruction for this turn only:\n"
                     + proactive_instruction,
                 ]

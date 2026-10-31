@@ -1277,10 +1277,19 @@ class ProactiveStateMachine:
         *,
         response_text: Optional[str] = None,
         intent: Optional[str] = None,
+        count_as_ignored: bool = True,
     ) -> None:
+        """Record one delivered proactive turn.
+
+        ``count_as_ignored=False`` keeps a due-reminder delivery out of the
+        ignored-initiative pressure: a scheduled obligation is not small talk
+        the user ignored, so it must not escalate the slow-down gap or make
+        the next spontaneous turn look like an unanswered follow-up.
+        """
         now = self._monotonic()
         state.last_proactive_monotonic = now
-        state.consecutive_ignored_proactive += 1
+        if count_as_ignored:
+            state.consecutive_ignored_proactive += 1
         state.proactive_generation_in_progress = False
         state.last_proactive_text = response_text or None
         state.last_proactive_expected_response = message_expects_response(response_text)

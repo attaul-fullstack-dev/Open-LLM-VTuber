@@ -24,6 +24,7 @@ from unittest.mock import AsyncMock, patch
 
 from src.open_llm_vtuber.character_state import (
     capture_reminder,
+    claim_due_future_intentions,
     load_character_state,
     save_character_state,
 )
@@ -31,6 +32,7 @@ from src.open_llm_vtuber.chat_history_manager import create_new_history, store_m
 from src.open_llm_vtuber.agent.agents.basic_memory_agent import BasicMemoryAgent
 from src.open_llm_vtuber.config_manager import TTSPreprocessorConfig
 from src.open_llm_vtuber.future_intentions import next_due_at, pending_intentions
+from src.open_llm_vtuber.reminder_delivery import delivered_ids
 from src.open_llm_vtuber.proactive_chat import (
     ProactiveChatConfig,
     ProactiveIntentSignals,
@@ -281,6 +283,205 @@ class SchedulerRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[0]["proactive_due_reminders"], ["TES PENGINGAT BERHASIL"])
         row = load_character_state(self.conf_uid).future_intentions[0]
         self.assertEqual(row["status"], "done")
+        # A delivered obligation must not look like an ignored initiative.
+        self.assertEqual(state.consecutive_ignored_proactive, 0)
+
+    async def test_delivery_receipt_is_written_before_completion(self):
+        row = self._seed(due_delta=-60)
+        machine = self._machine()
+        state = machine.new_state(self.history_uid)
+        calls = []
+        done = asyncio.Event()
+
+        async def fake_turn(**kwargs):
+            calls.append(kwargs["metadata"])
+            # Simulate the completion write failing right after delivery.
+            self.agent.complete_claimed_future_intentions = (
+                lambda *args, **kwargs: 0
+            )
+            done.set()
+            return "TES PENGINGAT BERHASIL"
+
+        with patch(
+            "src.open_llm_vtuber.websocket_handler.process_single_conversation",
+            new=fake_turn,
+        ):
+            timer = asyncio.create_task(
+                self.handler._run_proactive_timer(
+                    "client", self.history_uid, state, machine
+                )
+            )
+            await asyncio.wait_for(done.wait(), 5)
+            await asyncio.sleep(0.05)
+            timer.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await timer
+
+        # Exactly one provider turn, and the delivery fact is durable.
+        self.assertEqual(len(calls), 1)
+        self.assertIn(row["id"], delivered_ids(self.conf_uid))
+
+        # Completion failed, but a restart/retry must reconcile, not resend.
+        later = datetime.now(timezone.utc) + timedelta(seconds=700)
+        self.assertEqual(
+            claim_due_future_intentions(
+                self.conf_uid, owner="owner-restarted", now=later
+            ),
+            [],
+        )
+        stored = load_character_state(self.conf_uid).future_intentions[0]
+        self.assertEqual(stored["status"], "done")
+        self.assertNotIn("claimed_by", stored)
+
+    async def test_dispatcher_records_receipt_before_completion(self):
+        row = self._seed(due_delta=-60)
+        machine = self._machine()
+        state = machine.new_state(self.history_uid)
+        order = []
+        done = asyncio.Event()
+
+        original_receipt = self.agent.record_reminder_delivery
+        original_complete = self.agent.complete_claimed_future_intentions
+
+        def record_receipt(owner, intention_ids):
+            order.append(("receipt", list(intention_ids)))
+            return original_receipt(owner, intention_ids)
+
+        def complete(owner, intention_ids):
+            order.append(("complete", list(intention_ids)))
+            return original_complete(owner, intention_ids)
+
+        self.agent.record_reminder_delivery = record_receipt
+        self.agent.complete_claimed_future_intentions = complete
+
+        async def fake_turn(**kwargs):
+            done.set()
+            return "TES PENGINGAT BERHASIL"
+
+        with patch(
+            "src.open_llm_vtuber.websocket_handler.process_single_conversation",
+            new=fake_turn,
+        ):
+            timer = asyncio.create_task(
+                self.handler._run_proactive_timer(
+                    "client", self.history_uid, state, machine
+                )
+            )
+            await asyncio.wait_for(done.wait(), 5)
+            await asyncio.sleep(0.05)
+            timer.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await timer
+
+        # The actual dispatcher path writes the durable receipt first, with
+        # exactly the claimed id, and only then writes completion.
+        self.assertEqual([name for name, _ids in order], ["receipt", "complete"])
+        self.assertEqual(order[0][1], [row["id"]])
+        self.assertIn(row["id"], delivered_ids(self.conf_uid))
+        self.assertEqual(
+            load_character_state(self.conf_uid).future_intentions[0]["status"],
+            "done",
+        )
+
+    async def test_live_turn_renews_claim_so_another_process_cannot_take_over(self):
+        """The real dispatcher keeps the on-disk lease alive while streaming."""
+        row = self._seed(due_delta=-60)
+        # Short lease, fast heartbeat: the claim must outlive the original
+        # lease for as long as the provider turn is actually running.
+        self.handler.REMINDER_CLAIM_LEASE_SECONDS = 1
+        self.handler.REMINDER_CLAIM_RENEW_SECONDS = 0.1
+        machine = self._machine()
+        state = machine.new_state(self.history_uid)
+        foreign = []
+        done = asyncio.Event()
+
+        async def fake_turn(**kwargs):
+            await asyncio.sleep(1.5)
+            # Another server process sharing this data directory tries to
+            # claim the reminder while this turn is still in flight. Without
+            # the heartbeat its one-second lease would already be expired.
+            foreign.append(
+                claim_due_future_intentions(
+                    self.conf_uid,
+                    owner="other-process",
+                    now=datetime.now(timezone.utc),
+                )
+            )
+            done.set()
+            return "TES PENGINGAT BERHASIL"
+
+        with patch(
+            "src.open_llm_vtuber.websocket_handler.process_single_conversation",
+            new=fake_turn,
+        ):
+            timer = asyncio.create_task(
+                self.handler._run_proactive_timer(
+                    "client", self.history_uid, state, machine
+                )
+            )
+            await asyncio.wait_for(done.wait(), 10)
+            await asyncio.sleep(0.1)
+            timer.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await timer
+
+        self.assertEqual([ids for ids in foreign], [[]])
+        self.assertIn(row["id"], delivered_ids(self.conf_uid))
+        stored = load_character_state(self.conf_uid).future_intentions[0]
+        self.assertEqual(stored["status"], "done")
+
+    async def test_expired_lease_without_heartbeat_allows_takeover(self):
+        """Control case for the documented cross-process duplicate window."""
+        row = self._seed(due_delta=-60)
+        self.handler.REMINDER_CLAIM_LEASE_SECONDS = 1
+        # No renewal during the turn: this is what a stalled sender looks like.
+        self.handler.REMINDER_CLAIM_RENEW_SECONDS = 1000.0
+        machine = self._machine()
+        state = machine.new_state(self.history_uid)
+        foreign = []
+        done = asyncio.Event()
+
+        async def fake_turn(**kwargs):
+            await asyncio.sleep(1.5)
+            foreign.append(
+                claim_due_future_intentions(
+                    self.conf_uid,
+                    owner="other-process",
+                    now=datetime.now(timezone.utc),
+                )
+            )
+            done.set()
+            return "TES PENGINGAT BERHASIL"
+
+        with patch(
+            "src.open_llm_vtuber.websocket_handler.process_single_conversation",
+            new=fake_turn,
+        ):
+            timer = asyncio.create_task(
+                self.handler._run_proactive_timer(
+                    "client", self.history_uid, state, machine
+                )
+            )
+            await asyncio.wait_for(done.wait(), 10)
+            await asyncio.sleep(0.1)
+            timer.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await timer
+
+        # Documented: an expired lease is takeover territory, so a second live
+        # process could deliver the same reminder. The durable receipt still
+        # prevents any further resend after this turn.
+        self.assertEqual([[item["id"] for item in ids] for ids in foreign], [[row["id"]]])
+        self.assertIn(row["id"], delivered_ids(self.conf_uid))
+        later = datetime.now(timezone.utc) + timedelta(seconds=900)
+        self.assertEqual(
+            claim_due_future_intentions(
+                self.conf_uid, owner="owner-later", now=later
+            ),
+            [],
+        )
+        stored = load_character_state(self.conf_uid).future_intentions[0]
+        self.assertEqual(stored["status"], "done")
 
     async def test_not_due_reminder_is_not_dispatched(self):
         self._seed(due_delta=+600)
@@ -334,6 +535,9 @@ class SchedulerRuntimeTest(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await timer
 
+        # No delivered message, so no durable receipt was written: the same
+        # reminder stays retryable by any process.
+        self.assertEqual(delivered_ids(self.conf_uid), set())
         # Not completed, not lost, and not retried in a hot loop.
         row = load_character_state(self.conf_uid).future_intentions[0]
         self.assertEqual(row["status"], "pending")
@@ -343,6 +547,67 @@ class SchedulerRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(
             row_id, self.handler._reminder_row_retry_not_before["client"]
         )
+
+    async def test_failed_delivery_is_retried_by_a_later_dispatch(self):
+        """No receipt on failure: the same reminder is re-sendable, then done."""
+        row = self._seed(due_delta=-60)
+        calls = []
+        first_done = asyncio.Event()
+        second_done = asyncio.Event()
+
+        async def fake_turn(**kwargs):
+            calls.append(kwargs["metadata"]["proactive_due_reminders"])
+            if len(calls) == 2:
+                second_done.set()
+                return "TES PENGINGAT BERHASIL"
+            first_done.set()
+            return ""
+
+        with patch(
+            "src.open_llm_vtuber.websocket_handler.process_single_conversation",
+            new=fake_turn,
+        ):
+            timer = asyncio.create_task(
+                self.handler._run_proactive_timer(
+                    "client",
+                    self.history_uid,
+                    self._machine().new_state(self.history_uid),
+                    self._machine(),
+                )
+            )
+            await asyncio.wait_for(first_done.wait(), 5)
+            await asyncio.sleep(0.05)
+            timer.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await timer
+
+            # The failed row was released and carries no receipt, so a later
+            # dispatch (or another process) may retry it immediately.
+            self.assertEqual(delivered_ids(self.conf_uid), set())
+            self.handler._reminder_row_retry_not_before.clear()
+            retry_timer = asyncio.create_task(
+                self.handler._run_proactive_timer(
+                    "client",
+                    self.history_uid,
+                    self._machine().new_state(self.history_uid),
+                    self._machine(),
+                )
+            )
+            await asyncio.wait_for(second_done.wait(), 5)
+            await asyncio.sleep(0.05)
+            retry_timer.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await retry_timer
+
+        self.assertEqual(
+            calls, [
+                ["TES PENGINGAT BERHASIL"],
+                ["TES PENGINGAT BERHASIL"],
+            ]
+        )
+        self.assertIn(row["id"], delivered_ids(self.conf_uid))
+        stored = load_character_state(self.conf_uid).future_intentions[0]
+        self.assertEqual(stored["status"], "done")
 
     async def test_wake_time_targets_due_at(self):
         state = self._machine().new_state(self.history_uid)
@@ -457,6 +722,161 @@ class SchedulerRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(
             self.handler._due_reminder_lane(self.handler.client_contexts["client"])
         )
+
+    async def test_undated_intention_is_listed_but_never_scheduled(self):
+        state = load_character_state(self.conf_uid)
+        row = {
+            "id": uuid.uuid4().hex,
+            "text": "ingetin aku minum obat",
+            "due_at": None,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "status": "pending",
+            "source": "conversation",
+            "kind": "reminder",
+            "tz": JKT,
+        }
+        state.future_intentions = [row]
+        self.assertTrue(save_character_state(self.conf_uid, state))
+        self.agent._character_state = load_character_state(self.conf_uid)
+
+        # Visible in the Memory Manager (no date rendered for due_at=None).
+        overview = self.agent.list_memory_overview()
+        self.assertEqual([item["id"] for item in overview["intentions"]], [row["id"]])
+        self.assertIsNone(overview["intentions"][0]["due_at"])
+
+        # Never due, never a wake-up target, never claimable, never dispatched.
+        self.assertFalse(self.agent.has_due_reminder())
+        self.assertFalse(self.agent.has_due_future_intention())
+        self.assertIsNone(next_due_at(self.agent._character_state.future_intentions))
+        self.assertEqual(self.agent.claim_due_future_intentions("owner-a"), [])
+        self.assertFalse(
+            self.handler._due_reminder_lane(self.handler.client_contexts["client"])
+        )
+
+    async def test_due_plan_is_claimed_but_never_framed_as_a_reminder(self):
+        base = datetime.now(timezone.utc)
+        plan_id = uuid.uuid4().hex
+        state = load_character_state(self.conf_uid)
+        state.future_intentions = [
+            {
+                "id": plan_id,
+                "text": "besok aku ada ujian",
+                "due_at": (base - timedelta(seconds=30)).isoformat(),
+                "created_at": base.isoformat(),
+                "status": "pending",
+                "source": "conversation",
+                "kind": "plan",
+                "tz": JKT,
+            }
+        ]
+        self.assertTrue(save_character_state(self.conf_uid, state))
+        self.agent._character_state = load_character_state(self.conf_uid)
+
+        handler = self.handler
+        handler._budget_state = lambda _uid, _conf: ProactiveBudgetState()
+        handler._proactive_gate_config = ProactiveGateConfig(
+            quiet_hours_start_hour=0,
+            quiet_hours_end_hour=0,
+            minimum_proactive_gap_seconds=0,
+        )
+        machine = self._machine()
+        runtime = machine.new_state(self.history_uid)
+        runtime.next_proactive_eligible_at = 0.0
+        calls = []
+        done = asyncio.Event()
+
+        async def fake_turn(**kwargs):
+            calls.append(kwargs["metadata"])
+            done.set()
+            return "Semangat ujiannya ya."
+
+        with patch(
+            "src.open_llm_vtuber.websocket_handler.process_single_conversation",
+            new=fake_turn,
+        ):
+            timer = asyncio.create_task(
+                handler._run_proactive_timer(
+                    "client", self.history_uid, runtime, machine
+                )
+            )
+            await asyncio.wait_for(done.wait(), 5)
+            await asyncio.sleep(0.05)
+            timer.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await timer
+
+        self.assertEqual(len(calls), 1)
+        # The plan is consumed exactly once, but it is NOT delivered as a
+        # scheduled reminder to say "right now".
+        self.assertEqual(calls[0]["proactive_due_reminders"], [])
+        stored = load_character_state(self.conf_uid).future_intentions[0]
+        self.assertEqual(stored["status"], "done")
+
+    async def test_blocked_due_reminder_does_not_spin(self):
+        self._seed(due_delta=-60)
+        machine = self._machine()
+        state = machine.new_state(self.history_uid)
+        # Stale/in-flight guard: the due lane cannot dispatch this iteration.
+        state.proactive_generation_in_progress = True
+        probes = []
+        original = self.handler._due_reminder_lane
+        self.handler._due_reminder_lane = lambda context, now=None: (
+            probes.append(1) or original(context, now=now)
+        )
+
+        timer = asyncio.create_task(
+            self.handler._run_proactive_timer(
+                "client", self.history_uid, state, machine
+            )
+        )
+        await asyncio.sleep(0.25)
+        timer.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await timer
+
+        self.assertGreaterEqual(len(probes), 1)
+        self.assertLessEqual(len(probes), 5)
+        row = load_character_state(self.conf_uid).future_intentions[0]
+        self.assertEqual(row["status"], "pending")
+
+    async def test_due_plan_waiting_for_idle_does_not_spin(self):
+        plan_id = uuid.uuid4().hex
+        base = datetime.now(timezone.utc)
+        state = load_character_state(self.conf_uid)
+        state.future_intentions = [
+            {
+                "id": plan_id,
+                "text": "besok aku ada ujian",
+                "due_at": (base - timedelta(seconds=30)).isoformat(),
+                "created_at": base.isoformat(),
+                "status": "pending",
+                "source": "conversation",
+                "kind": "plan",
+                "tz": JKT,
+            }
+        ]
+        self.assertTrue(save_character_state(self.conf_uid, state))
+        self.agent._character_state = load_character_state(self.conf_uid)
+        machine = self._machine()
+        runtime = machine.new_state(self.history_uid)  # not idle-eligible yet
+        probes = []
+        original = self.handler._due_reminder_lane
+        self.handler._due_reminder_lane = lambda context, now=None: (
+            probes.append(1) or original(context, now=now)
+        )
+
+        timer = asyncio.create_task(
+            self.handler._run_proactive_timer(
+                "client", self.history_uid, runtime, machine
+            )
+        )
+        await asyncio.sleep(0.25)
+        timer.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await timer
+
+        self.assertGreaterEqual(len(probes), 1)
+        self.assertLessEqual(len(probes), 5)
 
     async def test_reconnect_sees_overdue_reminder(self):
         row = self._seed(due_delta=-3600)

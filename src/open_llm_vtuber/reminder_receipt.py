@@ -64,12 +64,19 @@ def build_reminder_receipt_block(
         due = _local_due(row, tz)
         payload = _collapse(row.get("delivery_text"))
         detail = f' Reminder text: "{payload[: _MAX_RECEIPT_TEXT]}".' if payload else ""
-        when = f" due {due}" if due else " without a resolved due time"
+        if due:
+            return (
+                "Backend reminder receipt (verified, authoritative for this turn): "
+                f"a reminder IS stored right now due {due}.{detail} You may confirm it "
+                "is scheduled and that you will deliver it at that time. Never "
+                "claim any other reminder as stored."
+            )
         return (
             "Backend reminder receipt (verified, authoritative for this turn): "
-            f"a reminder IS stored right now{when}.{detail} You may confirm it "
-            "is scheduled and that you will deliver it at that time. Never "
-            "claim any other reminder as stored."
+            f"a reminder IS stored right now, but NO valid due time was resolved.{detail} "
+            "It will NOT be delivered automatically. Do NOT claim it is scheduled "
+            "or promise a delivery time; ask the user for a specific time if they "
+            "want proactive delivery. Never claim any other reminder as stored."
         )
     if status == "clarify":
         return (

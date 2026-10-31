@@ -217,6 +217,23 @@ class ProactiveTimingTests(unittest.TestCase):
         self.assertGreaterEqual(backoff, 45)
         self.assertLessEqual(backoff, 60)
 
+    def test_reminder_delivery_does_not_count_as_ignored(self):
+        state = self.machine.new_state("chat-a")
+        self.clock.advance(10)
+        self.machine.record_proactive_sent(
+            state,
+            response_text="Waktunya minum obat ya.",
+            count_as_ignored=False,
+        )
+        # A scheduled obligation is delivered, not an ignored initiative.
+        self.assertEqual(state.consecutive_ignored_proactive, 0)
+        self.assertIsNotNone(state.last_proactive_monotonic)
+        self.assertTrue(state.last_proactive_text)
+        self.assertFalse(state.proactive_generation_in_progress)
+        # Spontaneous sends keep counting exactly as before.
+        self.machine.record_proactive_sent(state, response_text="Halo?")
+        self.assertEqual(state.consecutive_ignored_proactive, 1)
+
     def test_initial_proactive_min_max_unchanged(self):
         # The first proactive after user inactivity must remain exactly 45--90s.
         values = iter([45, 90])

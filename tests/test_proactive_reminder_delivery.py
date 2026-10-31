@@ -287,6 +287,49 @@ class ReminderDeliveryTests(unittest.TestCase):
             [],
         )
 
+    def test_completion_save_failure_without_receipt_reopens_after_lease(self):
+        """DOCUMENTED RESIDUAL WINDOW (no delivery receipt exists here).
+
+        A real successful delivery now writes a durable receipt before the
+        completion write (see ``test_reminder_delivery_receipt``), which blocks
+        the resend. This test deliberately skips that receipt and pins the
+        remaining at-least-once window: if the process dies between streaming
+        the message and appending the receipt, the row is claimable again
+        after the lease, so exactly-once delivery is NOT claimed.
+        """
+        row = self._seed()
+        claimed = claim_due_future_intentions(
+            self.conf_uid, owner="owner-a", now=self.now
+        )
+        self.assertEqual([item["id"] for item in claimed], [row["id"]])
+        with patch(
+            "src.open_llm_vtuber.character_state.save_character_state",
+            return_value=False,
+        ):
+            completed = complete_claimed_future_intentions(
+                self.conf_uid, owner="owner-a", intention_ids=[row["id"]]
+            )
+        self.assertEqual(completed, 0)
+        stored = self._row(row["id"])
+        self.assertEqual(stored["status"], STATUS_PENDING)
+        self.assertEqual(stored["claimed_by"], "owner-a")
+        # Inside the lease another owner gets nothing.
+        self.assertEqual(
+            claim_due_future_intentions(
+                self.conf_uid,
+                owner="owner-b",
+                now=self.now + timedelta(seconds=60),
+            ),
+            [],
+        )
+        # After lease expiry the row is claimable again (duplicate risk).
+        again = claim_due_future_intentions(
+            self.conf_uid,
+            owner="owner-b",
+            now=self.now + timedelta(seconds=700),
+        )
+        self.assertEqual([item["id"] for item in again], [row["id"]])
+
     # C. Empty/failed delivery releases the claim so the reminder retries.
     def test_failed_delivery_releases_and_retries(self):
         row = self._seed()

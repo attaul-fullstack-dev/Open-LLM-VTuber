@@ -17,9 +17,14 @@ from src.open_llm_vtuber.character_state import (
     record_future_intention,
 )
 from src.open_llm_vtuber.future_intentions import (
+    KIND_PLAN,
+    KIND_REMINDER,
     add_future_intention,
     build_future_intention_context,
+    claim_due_intentions,
     detect_future_intention,
+    detect_future_plan,
+    detect_reminder_request,
     due_intentions,
     pending_intentions,
 )
@@ -66,6 +71,44 @@ class DetectionTest(unittest.TestCase):
         self.assertIsNotNone(found)
         self.assertNotIn("intimate", json.dumps(found.__dict__).lower())
         self.assertNotIn("sexual", json.dumps(found.__dict__).lower())
+
+    def test_user_reminding_mili_is_plan_not_reminder(self):
+        for text in (
+            "besok aku akan ingatkan kamu minum obat",
+            "nanti aku ingetin kamu ya",
+            "nanti aku ingetin kamu",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(
+                    detect_future_intention(text, now=NOW, tz=JKT)
+                )
+                detection = detect_reminder_request(text, [], now=NOW, tz=JKT)
+                self.assertEqual(detection.status, "none")
+                self.assertIsNone(detection.intention)
+                plan = detect_future_plan(text, now=NOW, tz=JKT)
+                self.assertIsNotNone(plan)
+                self.assertEqual(plan.kind, KIND_PLAN)
+
+    def test_user_requesting_mili_to_remind_is_reminder(self):
+        for text in (
+            "besok ingetin aku minum obat",
+            "nanti ingetin aku ya",
+        ):
+            with self.subTest(text=text):
+                found = detect_future_intention(text, now=NOW, tz=JKT)
+                self.assertIsNotNone(found)
+                self.assertEqual(found.kind, KIND_REMINDER)
+                self.assertIsNotNone(found.due_at)
+
+    def test_request_markers_keep_first_person_requests_valid(self):
+        for text in (
+            "besok aku minta tolong ingetin aku minum obat",
+            "besok aku mau kamu ingetin aku minum obat",
+        ):
+            with self.subTest(text=text):
+                found = detect_future_intention(text, now=NOW, tz=JKT)
+                self.assertIsNotNone(found)
+                self.assertEqual(found.kind, KIND_REMINDER)
 
 
 class DueParsingTest(unittest.TestCase):
@@ -330,6 +373,41 @@ class ProactiveWiringTest(unittest.TestCase):
         self.assertEqual(count, 1)
         self.agent._character_state = load_character_state(CONF)
         self.assertFalse(self.agent.has_due_future_intention(moment=later))
+
+
+class ClaimSelectionTest(unittest.TestCase):
+    """A due plan must never be claimed instead of the user's reminder."""
+
+    def _row(self, row_id, kind, minutes_ago):
+        return {
+            "id": row_id,
+            "text": row_id,
+            "due_at": (NOW - timedelta(minutes=minutes_ago)).isoformat(),
+            "created_at": NOW.isoformat(),
+            "status": "pending",
+            "source": "conversation",
+            "kind": kind,
+        }
+
+    def test_due_reminder_is_claimed_before_an_earlier_due_plan(self):
+        plan = self._row("plan", KIND_PLAN, 30)
+        reminder = self._row("reminder", KIND_REMINDER, 5)
+        rows, claimed = claim_due_intentions(
+            [plan, reminder], now=NOW, owner="owner-a", max_claims=1
+        )
+        self.assertEqual([row["id"] for row in claimed], ["reminder"])
+        stored = {row["id"]: row for row in rows}
+        self.assertNotIn("claimed_by", stored["plan"])
+        self.assertEqual(stored["reminder"]["claimed_by"], "owner-a")
+        self.assertEqual(stored["reminder"]["status"], "pending")
+
+    def test_undated_row_is_never_claimable(self):
+        row = self._row("undated", KIND_REMINDER, 0)
+        row["due_at"] = None
+        rows, claimed = claim_due_intentions([row], now=NOW, owner="owner-a")
+        self.assertEqual(claimed, [])
+        self.assertNotIn("claimed_by", rows[0])
+        self.assertEqual(rows[0]["status"], "pending")
 
 
 if __name__ == "__main__":

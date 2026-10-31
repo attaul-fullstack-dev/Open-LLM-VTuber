@@ -598,7 +598,7 @@ class BackendCompletionSignalDedupTests(unittest.TestCase):
             "src/open_llm_vtuber/conversations/conversation_utils.py"
         )
         self.assertEqual(
-            source.count('json.dumps({"type": "backend-synth-complete"})'),
+            source.count('"backend-synth-complete"'),
             1,
             "finalize_conversation_turn must be the ONLY backend-synth-complete "
             "emitter",

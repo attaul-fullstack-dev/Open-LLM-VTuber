@@ -30,7 +30,7 @@ import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 from zoneinfo import ZoneInfo
 
 from loguru import logger
@@ -152,6 +152,26 @@ _DELIVERY_VERB = re.compile(
     re.IGNORECASE,
 )
 
+# Direction guard: "aku akan ingatkan kamu" / "nanti aku bilang kaya tadi"
+# describes the USER as the actor, not a request for Mili. Requests that
+# contain "minta/tolong" or an addressee before the verb stay valid, and a
+# first-person object immediately after the verb ("ingetin aku bilang ...")
+# is not treated as the actor.
+_FIRST_PERSON_SUBJECT = re.compile(
+    r"\b(?:aku|gw|gue|gua|saya|ane)\b",
+    re.IGNORECASE,
+)
+_ACTOR_REQUEST_OR_ADDRESSEE = re.compile(
+    r"\b(?:minta|mohon|tolong|kamu|kau|lu|loe|kalian)\b",
+    re.IGNORECASE,
+)
+_OBJECT_VERB_SUFFIX = re.compile(
+    r"\b(?:ingetin|ingetkan|ingatkan|ingatkah|remind|"
+    r"bilang(?:in)?|ucapin|ucapkan|sampaikan|kirim|sebutin|sebutkan|"
+    r"ulangi|ulang|katakan)\s*$",
+    re.IGNORECASE,
+)
+
 # Context references: the payload lives in the previous conversation turn.
 # This is the narrow bridge between "bilang kaya tadi lagi ya" and the earlier
 # explicit reminder ("... dengan bilang 'TES PENGINGAT BERHASIL'").
@@ -183,6 +203,31 @@ _JAM = re.compile(
     r"(?:jam|pukul)?\s*(\d{1,2})(?:[:.](\d{2}))?",
     re.IGNORECASE,
 )
+
+
+def _first_person_is_actor(text: str, verb_pattern: re.Pattern) -> bool:
+    """True when a first-person subject is the actor of ``verb_pattern``.
+
+    The helper is intentionally conservative: a first-person object directly
+    after a reminder/delivery verb ("ingetin aku bilang ...") is skipped, and
+    a request marker or addressee between the subject and verb keeps the turn
+    as a request ("aku minta tolong ingetin aku", "aku mau kamu bilang ...").
+    """
+    for subject in _FIRST_PERSON_SUBJECT.finditer(text):
+        before = text[: subject.start()]
+        if _OBJECT_VERB_SUFFIX.search(before):
+            continue
+        tail = text[subject.end() :]
+        match = verb_pattern.search(tail)
+        if not match:
+            continue
+        prefix = tail[: match.start()]
+        if len(prefix) > 60 or re.search(r"[.!?]", prefix):
+            continue
+        if _ACTOR_REQUEST_OR_ADDRESSEE.search(prefix):
+            continue
+        return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -327,6 +372,10 @@ def detect_future_intention(
         return None
     if not _FUTURE_ANCHOR.search(text):
         return None
+    # "besok aku akan ingatkan kamu" is the user's own plan, not a request
+    # for Mili to remind the user.
+    if _first_person_is_actor(text, _REMINDER_VERB):
+        return None
     moment = _now_aware(now)
     zone = _resolve_tz(tz)
     return FutureIntention(
@@ -419,24 +468,38 @@ class ReminderDetection:
     reason: str = ""
 
 
-def _quoted(text: Any) -> Optional[str]:
+def _distinct(values: List[str]) -> List[str]:
+    """Case-insensitive dedup that keeps the original spelling/order."""
+    seen = set()
+    unique = []
+    for value in values:
+        key = value.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(value)
+    return unique
+
+
+def _quoted_all(text: Any) -> List[str]:
+    values = []
     for match in _QUOTED_PAYLOAD.finditer(str(text or "")):
         value = _normalize(match.group(1)).strip(" .,!?:;")
         if len(value) >= 2:
-            return value
-    return None
+            values.append(value)
+    return _distinct(values)
 
 
-def _say_payload(text: Any) -> Optional[str]:
-    """Extract an unquoted "bilang X" payload from a PRIOR turn."""
-    match = _SAY_PAYLOAD.search(str(text or ""))
-    if not match:
-        return None
-    value = _normalize(match.group(1))
-    value = _TRAILING_FILLER.sub("", value).strip(" .,!?:;'\"")
-    if len(value) < 2 or _CONTEXT_REFERENCE.search(value):
-        return None
-    return value
+def _say_payloads(text: Any) -> List[str]:
+    """Extract unquoted "bilang X" payload candidates from a PRIOR turn."""
+    values = []
+    for match in _SAY_PAYLOAD.finditer(str(text or "")):
+        value = _normalize(match.group(1))
+        value = _TRAILING_FILLER.sub("", value).strip(" .,!?:;'\"")
+        if len(value) < 2 or _CONTEXT_REFERENCE.search(value):
+            continue
+        values.append(value)
+    return _distinct(values)
 
 
 def resolve_referenced_payload(
@@ -445,24 +508,42 @@ def resolve_referenced_payload(
 ) -> Optional[str]:
     """Resolve WHAT to say for a referential reminder, or None if ambiguous.
 
-    Order: a quoted payload in this turn, then the most recent quoted payload
-    in the conversation, then an unquoted "bilang X" from an earlier turn.
-    Pure and deterministic; never invents content.
+    Order: a quoted payload in this turn, then the nearest earlier turn that
+    quotes anything, then an unquoted "bilang X" from an earlier turn.
+
+    Resolution is conservative by design. When the anchoring turn names more
+    than one distinct payload ("bilang 'A' atau 'B'"), the referent cannot be
+    known, so the result is None and the caller must ask instead of picking
+    one. The payload is never invented. Pure and deterministic.
     """
-    direct = _quoted(text)
+    direct = [
+        value
+        for value in _quoted_all(text)
+        if not _CONTEXT_REFERENCE.search(value)
+    ]
+    if len(direct) > 1:
+        return None
     if direct:
-        return direct
+        return direct[0]
     messages = list(recent_messages or [])[-8:]
     for message in reversed(messages):
         content = message.get("content") if isinstance(message, dict) else message
-        found = _quoted(content)
-        if found:
-            return found
+        found = [
+            value
+            for value in _quoted_all(content)
+            if not _CONTEXT_REFERENCE.search(value)
+        ]
+        if not found:
+            continue
+        # Stop at the nearest turn that quotes anything: "kaya tadi" points at
+        # that turn, and two different quotes inside it are not resolvable.
+        return found[0] if len(found) == 1 else None
     for message in reversed(messages):
         content = message.get("content") if isinstance(message, dict) else message
-        found = _say_payload(content)
-        if found:
-            return found
+        found = _say_payloads(content)
+        if not found:
+            continue
+        return found[0] if len(found) == 1 else None
     return None
 
 
@@ -494,6 +575,12 @@ def detect_contextual_reminder(
         return ReminderDetection("none")
     if not _DELIVERY_VERB.search(text) or not _CONTEXT_REFERENCE.search(text):
         return ReminderDetection("none")
+    # "nanti aku bilang kaya tadi" is the user speaking, not a request for
+    # Mili to deliver the referenced text.
+    if _first_person_is_actor(text, _REMINDER_VERB) or _first_person_is_actor(
+        text, _DELIVERY_VERB
+    ):
+        return ReminderDetection("none")
     moment = _now_aware(now)
     zone = _resolve_tz(tz)
     payload = resolve_referenced_payload(text, recent_messages)
@@ -518,10 +605,32 @@ def detect_reminder_request(
     now: Optional[datetime] = None,
     tz: Optional[str] = None,
 ) -> ReminderDetection:
-    """Read one turn for a reminder: explicit grammar first, then reference."""
+    """Read one turn for a reminder: explicit grammar first, then reference.
+
+    ``delivery_text`` is only set from content the user actually supplied.
+    One distinct quoted payload is concrete; two or more distinct quotes are
+    ambiguous ("bilang 'A' atau 'B'") and must clarify instead of silently
+    taking the first. Repeated identical quotes count as one payload.
+    """
     explicit = detect_future_intention(user_text, now=now, tz=tz)
     if explicit is not None:
-        payload = _quoted(user_text)
+        quoted = _quoted_all(user_text)
+        concrete = [
+            value
+            for value in quoted
+            if not _CONTEXT_REFERENCE.search(value)
+        ]
+        if len(concrete) > 1:
+            return ReminderDetection("clarify", reason="ambiguous_payload")
+        payload = concrete[0] if concrete else None
+        if quoted and not concrete:
+            # A quoted reference is not a concrete payload; resolving it
+            # would require guessing what the user meant.
+            return ReminderDetection("clarify", reason="unresolved_reference")
+        if not payload and _CONTEXT_REFERENCE.search(explicit.text):
+            payload = resolve_referenced_payload(explicit.text, recent_messages)
+            if not payload:
+                return ReminderDetection("clarify", reason="unresolved_reference")
         if payload and payload != explicit.text:
             explicit = FutureIntention(
                 text=explicit.text,
@@ -688,6 +797,10 @@ def claim_due_intentions(
     ``exclude_ids`` skips rows that are in their own retry window, allowing
     another due row to be attempted without marking the failed row done or
     dropping its pending status.
+
+    Due reminders are preferred over due future plans when ``max_claims``
+    limits the batch, so a plan can never starve the user's own reminder.
+    Rows without a parseable ``due_at`` are never claimable.
     """
     moment = _now_aware(now)
     claimant = _normalize(owner)
@@ -702,34 +815,97 @@ def claim_due_intentions(
     excluded.discard("")
     limit = None if max_claims is None else max(1, int(max_claims))
     lease_until = moment + timedelta(seconds=max(1, int(lease_seconds)))
+    parsed_rows = []
+    for item in stored or []:
+        parsed = normalize_stored_intention(item)
+        if parsed is not None:
+            parsed_rows.append(parsed)
+    eligible = []
+    for row in parsed_rows:
+        if row["status"] != STATUS_PENDING:
+            continue
+        stamp = _parse_iso(row.get("due_at"))
+        holder = _normalize(row.get("claimed_by", ""))
+        blocked = bool(holder) and holder != claimant and not _claim_expired(
+            row, moment
+        )
+        if row["id"] in excluded or stamp is None or stamp > moment or blocked:
+            continue
+        eligible.append(row)
+    # Reminders are user obligations and must never be starved by a due future
+    # plan: with ``max_claims=1`` the dispatcher would otherwise claim whichever
+    # row happens to sit first in storage. Undated rows are already excluded
+    # above (``stamp is None``), so they can never be claimed at all.
+    eligible.sort(
+        key=lambda row: (
+            0 if (row.get("kind") or KIND_REMINDER) == KIND_REMINDER else 1,
+            row.get("due_at") or "",
+            row.get("created_at") or "",
+            row["id"],
+        )
+    )
+    selected = [
+        row["id"] for row in (eligible if limit is None else eligible[:limit])
+    ]
     out = []
     claimed = []
-    for item in stored or []:
+    for parsed in parsed_rows:
+        if parsed["id"] in selected:
+            # Consume one selection slot so duplicate ids cannot over-claim.
+            selected.remove(parsed["id"])
+            claimed_row = dict(parsed)
+            claimed_row["claimed_by"] = claimant
+            claimed_row["claim_until"] = _utc_iso(lease_until)
+            claimed.append(claimed_row)
+            out.append(claimed_row)
+        else:
+            out.append(parsed)
+    return (out, claimed)
+
+
+def renew_intention_claims(
+    existing: Any,
+    *,
+    owner: str,
+    intention_ids: Any,
+    now: Optional[datetime] = None,
+    lease_seconds: int = 600,
+) -> tuple:
+    """Extend ``owner``'s live claims so another process cannot take over.
+
+    A provider turn can easily outlive the original lease (long stream, slow
+    TTS). Without renewal a second server process sharing the same state file
+    sees an expired lease, claims the still-in-flight reminder and sends it
+    again. Renewal only touches rows that are still ``pending`` and still
+    owned by ``owner``; it never completes, releases, or touches another row.
+
+    Pure ``(new_list, renewed_count)``.
+    """
+    claimant = _normalize(owner)
+    targets = {_normalize(value) for value in (intention_ids or [])}
+    targets.discard("")
+    if not claimant or not targets:
+        return (list(existing or []), 0)
+    moment = _now_aware(now)
+    until = _utc_iso(moment + timedelta(seconds=max(1, int(lease_seconds))))
+    out = []
+    renewed = 0
+    for item in existing or []:
         parsed = normalize_stored_intention(item)
         if parsed is None:
             continue
-        if parsed["status"] == STATUS_PENDING:
-            stamp = _parse_iso(parsed.get("due_at"))
-            holder = _normalize(parsed.get("claimed_by", ""))
-            blocked = (
-                bool(holder)
-                and holder != claimant
-                and not _claim_expired(parsed, moment)
-            )
-            if (
-                parsed["id"] not in excluded
-                and stamp is not None
-                and stamp <= moment
-                and not blocked
-                and (limit is None or len(claimed) < limit)
-            ):
-                claimed_row = dict(parsed)
-                claimed_row["claimed_by"] = claimant
-                claimed_row["claim_until"] = _utc_iso(lease_until)
-                claimed.append(claimed_row)
-                parsed = claimed_row
-        out.append(parsed)
-    return (out, claimed)
+        if (
+            parsed["status"] == STATUS_PENDING
+            and parsed["id"] in targets
+            and _normalize(parsed.get("claimed_by", "")) == claimant
+        ):
+            updated = dict(parsed)
+            updated["claim_until"] = until
+            out.append(updated)
+            renewed += 1
+        else:
+            out.append(parsed)
+    return (out, renewed)
 
 
 def release_intention_claims(
@@ -797,6 +973,45 @@ def complete_claimed_intentions(
             and parsed["id"] in targets
             and _normalize(parsed.get("claimed_by", "")) == claimant
         ):
+            updated = dict(parsed)
+            updated["status"] = STATUS_DONE
+            updated.pop("claimed_by", None)
+            updated.pop("claim_until", None)
+            out.append(updated)
+            completed += 1
+        else:
+            out.append(parsed)
+    return (out, completed)
+
+
+def complete_delivered_intentions(
+    existing: Any,
+    delivered_ids: Any,
+) -> tuple:
+    """Mark rows that already have a durable delivery receipt done (pure).
+
+    Used by the claim path when the completion write failed or the process
+    crashed after the message was delivered: the receipt proves the delivery,
+    so the still-pending row is reconciled to ``done`` instead of being
+    claimed and sent a second time. Only pending rows are touched. Returns
+    ``(new_list, completed_count)``. Pure: never mutates the input.
+    """
+    delivered = {
+        _normalize(value)
+        for value in (
+            [delivered_ids] if isinstance(delivered_ids, str) else (delivered_ids or [])
+        )
+    }
+    delivered.discard("")
+    if not delivered:
+        return (list(existing or []), 0)
+    out = []
+    completed = 0
+    for item in existing or []:
+        parsed = normalize_stored_intention(item)
+        if parsed is None:
+            continue
+        if parsed["status"] == STATUS_PENDING and parsed["id"] in delivered:
             updated = dict(parsed)
             updated["status"] = STATUS_DONE
             updated.pop("claimed_by", None)
@@ -932,6 +1147,7 @@ def build_future_intention_context(
     *,
     tz: Optional[str] = None,
     max_tokens: int = 240,
+    exclude_texts: Optional[Sequence[str]] = None,
 ) -> str:
     """Render pending intentions as a bounded prompt block (pure, no I/O).
 
@@ -944,10 +1160,29 @@ def build_future_intention_context(
     the persisted ``created_at`` (user timezone), so recall questions of the
     form "kemarin aku bilang ... apa?" ground to the right row. Rows without
     a parseable ``created_at`` render exactly as before (tag omitted).
+
+    ``exclude_texts`` drops rows already carried by another prompt lane. The
+    scheduler's delivery turn passes the texts it is about to send, so the
+    same reminder is never both "deliver this now" and "backend handles it"
+    in one prompt.
     """
     pending = pending_intentions(stored)
     if not pending:
         return ""
+    excluded = {
+        _normalize(value).lower()
+        for value in (exclude_texts or [])
+        if _normalize(value)
+    }
+    if excluded:
+        pending = [
+            item
+            for item in pending
+            if _normalize(item.get("text", "")).lower() not in excluded
+            and _normalize(item.get("delivery_text", "")).lower() not in excluded
+        ]
+        if not pending:
+            return ""
     try:
         from .agent.context_window import estimate_tokens
 
@@ -982,10 +1217,42 @@ def build_future_intention_context(
                 else:
                     line = "- [" + tag + ", no due time" + stated + "] " + item["text"]
             else:
-                line = "- [" + tag + ", no due time" + stated + "] " + item["text"]
+                line = (
+                    "- "
+                    + "["
+                    + tag
+                    + ", no due time"
+                    + stated
+                    + "]"
+                    + " "
+                    + item["text"]
+                )
+            now_utc = datetime.now(timezone.utc)
+            due_marker = (
+                due_raw
+                and _parse_iso(due_raw) is not None
+                and _parse_iso(due_raw) <= now_utc
+            )
+            is_reminder = (item.get("kind") or KIND_REMINDER) == KIND_REMINDER
+            if due_marker and is_reminder:
+                line += (
+                    " (backend scheduler owns delivery of this due reminder; "
+                    "do not treat it as already delivered or claim it was "
+                    "sent here)."
+                )
+            elif is_reminder:
+                line += " (stored reminder, not yet due)."
+            else:
+                line += " (upcoming user plan, for context only)."
             payload = _normalize(item.get("delivery_text", ""))
-            if payload and payload.lower() not in item["text"].lower():
-                line += ' -> deliver: "' + payload + '"'
+            if due_marker and is_reminder:
+                # hide the delivery_text payload from chat context entirely
+                pass
+            elif payload and payload.lower() not in item["text"].lower():
+                if is_reminder:
+                    line += ' -> stored delivery payload for when it is due: "' + payload + '"'
+                else:
+                    line += ' -> associated plan detail: "' + payload + '"'
             cost = estimate_tokens(line) + 4
             if used + cost > max_tokens:
                 break
@@ -994,8 +1261,9 @@ def build_future_intention_context(
         if not lines:
             return ""
         header = (
-            "Standing reminder requests and upcoming user plans (explicit or "
-            "directly stated; surface them when due, never invent new ones):"
+            "Standing user reminders and upcoming user plans (informational "
+            "context only; the backend scheduler owns actual reminder "
+            "delivery):"
         )
         return f"{header}\n" + "\n".join(lines)
     except Exception as error:
@@ -1017,6 +1285,7 @@ __all__ = [
     "add_future_intention",
     "build_future_intention_context",
     "cancel_future_intention",
+    "complete_delivered_intentions",
     "complete_future_intention",
     "detect_any_future_intention",
     "detect_contextual_reminder",

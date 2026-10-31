@@ -34,6 +34,7 @@ from src.open_llm_vtuber.character_state import (
 from src.open_llm_vtuber.future_intentions import (
     detect_contextual_reminder,
     detect_reminder_request,
+    due_intentions,
     next_due_at,
     pending_intentions,
 )
@@ -50,6 +51,13 @@ NOW = datetime(2026, 10, 21, 4, 40, tzinfo=timezone.utc)
 PRIOR_TURNS = [
     {"role": "user", "content": "Nanti jam 11.51 ingetin aku dengan bilang 'TES PENGINGAT BERHASIL'."},
     {"role": "assistant", "content": "Oke, nanti jam 11.51 aku bilang 'TES PENGINGAT BERHASIL' ya."},
+]
+
+# The turn that "kaya tadi" points at offers TWO different payloads, so the
+# referent cannot be known without guessing.
+AMBIGUOUS_TURNS = [
+    {"role": "user", "content": "ingetin aku besok jam 7 bilang 'minum obat' ya"},
+    {"role": "assistant", "content": "Oke, 'minum obat' atau 'minum vitamin'?"},
 ]
 
 
@@ -76,6 +84,123 @@ class DetectionTest(unittest.TestCase):
         self.assertEqual(detection.intention.delivery_text, "TES PENGINGAT BERHASIL")
         due = datetime.fromisoformat(detection.intention.due_at)
         self.assertEqual(due.astimezone(timezone.utc), datetime(2026, 10, 21, 4, 54, tzinfo=timezone.utc))
+
+    def test_explicit_request_with_reference_resolves_payload(self):
+        detection = detect_reminder_request(
+            "Nanti jam 11.54 ingetin aku bilang kaya tadi lagi ya.",
+            PRIOR_TURNS,
+            now=NOW,
+            tz=JKT,
+        )
+        self.assertEqual(detection.status, "captured")
+        self.assertIsNotNone(detection.intention)
+        self.assertEqual(detection.intention.delivery_text, "TES PENGINGAT BERHASIL")
+
+    def test_explicit_request_without_reference_context_needs_clarification(self):
+        detection = detect_reminder_request(
+            "Nanti jam 11.54 ingetin aku bilang kaya tadi lagi ya.",
+            [],
+            now=NOW,
+            tz=JKT,
+        )
+        self.assertEqual(detection.status, "clarify")
+        self.assertIsNone(detection.intention)
+
+    def test_ingetin_with_kayak_tadi_alone_needs_clarification(self):
+        # Exact audit example: explicit verb + reference, no resolvable payload.
+        detection = detect_reminder_request(
+            "Nanti jam 11.54 ingetin aku kayak tadi lagi ya.",
+            [],
+            now=NOW,
+            tz=JKT,
+        )
+        self.assertEqual(detection.status, "clarify")
+        self.assertEqual(detection.reason, "unresolved_reference")
+        self.assertIsNone(detection.intention)
+
+    def test_two_distinct_referenced_payloads_need_clarification(self):
+        detection = detect_contextual_reminder(
+            "nanti jam 9 bilang kaya tadi lagi ya",
+            AMBIGUOUS_TURNS,
+            now=NOW,
+            tz=JKT,
+        )
+        self.assertEqual(detection.status, "clarify")
+        self.assertIsNone(detection.intention)
+
+    def test_quoted_reference_is_never_used_as_the_payload(self):
+        # The nearest turn only quotes the reference phrase itself, so the
+        # resolver must skip it and use the actual earlier payload.
+        history = [
+            {"role": "user", "content": "ingetin aku besok jam 7 bilang 'minum obat' ya"},
+            {"role": "assistant", "content": "Oke, nanti aku bilang 'kaya tadi lagi' ya"},
+        ]
+        detection = detect_contextual_reminder(
+            "nanti jam 9 bilang kaya tadi lagi ya", history, now=NOW, tz=JKT
+        )
+        self.assertEqual(detection.status, "captured")
+        self.assertEqual(detection.intention.delivery_text, "minum obat")
+
+    def test_two_distinct_quoted_payloads_need_clarification(self):
+        # One turn naming two different payloads: never take the first quote.
+        detection = detect_reminder_request(
+            "Besok jam 7 ingetin aku bilang 'minum obat' atau 'minum vitamin' ya.",
+            now=NOW,
+            tz=JKT,
+        )
+        self.assertEqual(detection.status, "clarify")
+        self.assertEqual(detection.reason, "ambiguous_payload")
+        self.assertIsNone(detection.intention)
+
+    def test_two_distinct_quoted_payloads_need_clarification_via_reference(self):
+        detection = detect_contextual_reminder(
+            "nanti jam 9 bilang 'minum obat' atau 'minum vitamin' kaya tadi lagi ya",
+            PRIOR_TURNS,
+            now=NOW,
+            tz=JKT,
+        )
+        self.assertEqual(detection.status, "clarify")
+        self.assertIsNone(detection.intention)
+
+    def test_repeated_identical_quotes_count_as_one_payload(self):
+        detection = detect_reminder_request(
+            "Besok jam 7 ingetin aku bilang 'minum obat', 'minum obat' ya.",
+            now=NOW,
+            tz=JKT,
+        )
+        self.assertEqual(detection.status, "captured")
+        self.assertEqual(detection.intention.delivery_text, "minum obat")
+
+    def test_single_valid_quoted_payload_still_captures(self):
+        detection = detect_reminder_request(
+            "Besok jam 7 ingetin aku bilang 'minum obat' ya.",
+            now=NOW,
+            tz=JKT,
+        )
+        self.assertEqual(detection.status, "captured")
+        self.assertEqual(detection.intention.delivery_text, "minum obat")
+        self.assertIsNotNone(detection.intention.due_at)
+
+    def test_quoted_reference_is_not_treated_as_payload(self):
+        detection = detect_reminder_request(
+            "Nanti jam 11.54 ingetin aku bilang 'kaya tadi lagi' ya.",
+            PRIOR_TURNS,
+            now=NOW,
+            tz=JKT,
+        )
+        self.assertEqual(detection.status, "clarify")
+        self.assertIsNone(detection.intention)
+
+    def test_user_speaking_is_not_a_referential_reminder(self):
+        for text in (
+            "nanti jam 7 aku bilang kaya tadi lagi ya",
+            "nanti jam 7 aku akan bilang kaya tadi lagi ya",
+        ):
+            with self.subTest(text=text):
+                detection = detect_contextual_reminder(
+                    text, PRIOR_TURNS, now=NOW, tz=JKT
+                )
+                self.assertEqual(detection.status, "none")
 
     def test_referential_without_context_needs_clarification(self):
         detection = detect_contextual_reminder(
@@ -149,9 +274,63 @@ class PersistenceTest(unittest.TestCase):
         # Visible through the same reader the Memory Manager uses.
         self.assertEqual([item["id"] for item in pending_intentions(stored)], [row["id"]])
 
+    def test_user_reminding_mili_is_not_persisted_as_reminder(self):
+        # Speaker direction: the user is the actor, Mili is the addressee.
+        for text in (
+            "besok aku akan ingatkan kamu minum obat",
+            "nanti aku ingetin kamu ya",
+        ):
+            with self.subTest(text=text):
+                status, row = capture_reminder(CONF, text, now=NOW, tz=JKT)
+                self.assertEqual(status, "none")
+                self.assertIsNone(row)
+                self.assertEqual(load_character_state(CONF).future_intentions, [])
+
+    def test_ambiguous_quoted_payload_is_not_persisted(self):
+        status, row = capture_reminder(
+            CONF,
+            "Besok jam 7 ingetin aku bilang 'minum obat' atau 'minum vitamin' ya.",
+            now=NOW,
+            tz=JKT,
+        )
+        self.assertEqual(status, "clarify")
+        self.assertIsNone(row)
+        self.assertEqual(load_character_state(CONF).future_intentions, [])
+
+    def test_undated_reminder_is_stored_but_never_due_or_claimed(self):
+        status, row = capture_reminder(
+            CONF, "ingetin aku hari ini minum obat", now=NOW, tz=JKT
+        )
+        self.assertEqual(status, "captured")
+        self.assertIsNotNone(row)
+        self.assertIsNone(row["due_at"])
+        later = NOW + timedelta(days=3)
+        stored = load_character_state(CONF).future_intentions
+        # Recallable and visible, but never due, never schedulable, never
+        # claimable by the proactive dispatcher.
+        self.assertEqual([item["id"] for item in pending_intentions(stored)], [row["id"]])
+        self.assertEqual(due_intentions(stored, now=later), [])
+        self.assertIsNone(next_due_at(stored, now=later))
+        self.assertEqual(
+            claim_due_future_intentions(CONF, owner="owner-a", now=later), []
+        )
+        self.assertNotIn("claimed_by", load_character_state(CONF).future_intentions[0])
+
     def test_ambiguous_reference_is_not_persisted(self):
         status, row = capture_reminder(
             CONF, "Nanti jam 11.54 bilang kaya tadi lagi ya.", now=NOW, tz=JKT
+        )
+        self.assertEqual(status, "clarify")
+        self.assertIsNone(row)
+        self.assertEqual(load_character_state(CONF).future_intentions, [])
+
+    def test_reference_with_two_candidates_is_not_persisted(self):
+        status, row = capture_reminder(
+            CONF,
+            "nanti jam 9 ingetin aku bilang kaya tadi lagi ya",
+            now=NOW,
+            tz=JKT,
+            recent_messages=AMBIGUOUS_TURNS,
         )
         self.assertEqual(status, "clarify")
         self.assertIsNone(row)
@@ -363,6 +542,33 @@ class ReceiptTest(unittest.TestCase):
         self.assertIn("IS stored", block)
         self.assertIn("11:54", block)
         self.assertIn("TES PENGINGAT BERHASIL", block)
+
+    def test_captured_without_due_does_not_promise_delivery(self):
+        row = {
+            "text": "ingetin aku minum obat",
+            "due_at": None,
+            "delivery_text": "minum obat",
+        }
+        block = build_reminder_receipt_block("captured", row, tz=JKT)
+        self.assertIn("IS stored", block)
+        self.assertIn("NO valid due time", block)
+        self.assertIn("NOT be delivered automatically", block)
+        self.assertIn("Do NOT claim it is scheduled", block)
+        self.assertNotIn("due 20", block)
+        self.assertNotIn("deliver it at that time", block)
+
+    def test_unparseable_due_is_not_reported_as_scheduled(self):
+        row = {"text": "ingetin aku minum obat", "due_at": "besok pagi"}
+        block = build_reminder_receipt_block("captured", row, tz=JKT)
+        self.assertIn("NO valid due time", block)
+        self.assertNotIn("deliver it at that time", block)
+
+    def test_captured_with_due_allows_confirmation(self):
+        row = {"text": "ingetin aku minum obat", "due_at": "2026-10-21T04:54:00+00:00"}
+        block = build_reminder_receipt_block("captured", row, tz=JKT)
+        self.assertIn("due 2026-10-21 11:54", block)
+        self.assertIn("deliver it at that time", block)
+        self.assertNotIn("NO valid due time", block)
 
     def test_clarify_block_forbids_claiming_success(self):
         block = build_reminder_receipt_block("clarify")
