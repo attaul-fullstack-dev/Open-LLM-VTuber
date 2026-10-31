@@ -1734,8 +1734,14 @@ class WebSocketHandler:
 
             logger.info(f"Connection established for client {client_uid}")
 
+        except WebSocketDisconnect:
+            logger.info(
+                f"Client {client_uid} disconnected during connection initialization"
+            )
+            await self._cleanup_failed_connection(client_uid)
+            raise
         except Exception as e:
-            logger.error(
+            logger.exception(
                 f"Failed to initialize connection for client {client_uid}: {e}"
             )
             await self._cleanup_failed_connection(client_uid)
