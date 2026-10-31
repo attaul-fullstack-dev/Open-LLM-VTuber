@@ -35,6 +35,15 @@ from zoneinfo import ZoneInfo
 
 from loguru import logger
 
+from .time_provider import (
+    ensure_aware as _now_aware,
+    parse_iso as _parse_iso,
+    resolve_tz as _resolve_tz,
+    user_now,
+    utc_iso as _utc_iso,
+    utc_now,
+)
+
 STATUS_PENDING = "pending"
 STATUS_DONE = "done"
 STATUS_CANCELLED = "cancelled"
@@ -46,21 +55,114 @@ _MAX_INTENTION_CHARS = 220
 _MAX_PENDING = 20
 _MIN_PLAN_CHARS = 12
 
-# Reminder verbs: the user asks Mili to remind them.
+# Reminder verbs: the user asks Mili to remind them or take on a scheduled task.
 _REMINDER_VERB = re.compile(
-    r"\b(?:ingetin|ingetkan|ingatkan|ingatkah|jangan\s+lupa|jgn\s+lupa|"
-    r"reminder|remind|tolong\s+ingat|catat\s+buat\s+besok)\b",
+    r"\b(?:"
+    r"ingetin|ingetkan|ingatkan|ingatkah|jangan\s+lupa|jgn\s+lupa|"
+    r"reminder|remind|tolong\s+ingat|catat\s+buat\s+besok|"
+    r"bangunin|bangunkan|"
+    r"tanyakan|tanya|tanyain|tanya(?:kan)?\s+(?:ke\s+aku|sama\s+aku|apakah)|"
+    r"kabari|kabarin|kasih\s+tahu|kasih\s+tau|beritahu|beritahu\s+aku|"
+    r"cek|periksa|follow\s*up"
+    r")\b",
     re.IGNORECASE,
 )
 
-# Future anchors: when. Kept small and explicit; anything else stores with
-# due_at=None (pending, visible in context, never proactively due).
+# Indonesian & English number words for relative time intervals
+_NUMBER_WORDS = {
+    "setengah": 0.5,
+    "se": 1.0,
+    "satu": 1.0,
+    "dua": 2.0,
+    "tiga": 3.0,
+    "empat": 4.0,
+    "lima": 5.0,
+    "enam": 6.0,
+    "tujuh": 7.0,
+    "delapan": 8.0,
+    "sembilan": 9.0,
+    "sepuluh": 10.0,
+    "sebelas": 11.0,
+    "dua belas": 12.0,
+    "duabelas": 12.0,
+    "lima belas": 15.0,
+    "limabelas": 15.0,
+    "dua puluh": 20.0,
+    "duapuluh": 20.0,
+    "dua puluh lima": 25.0,
+    "tiga puluh": 30.0,
+    "tigapuluh": 30.0,
+    "empat puluh": 40.0,
+    "lima puluh": 50.0,
+}
+
+_RELATIVE_RE = re.compile(
+    r"(?:dalam\s+)?(?P<val>\d+(?:\.\d+)?|setengah|se|satu|dua|tiga|empat|lima|enam|tujuh|delapan|sembilan|sepuluh|sebelas|dua\s*belas|duabelas|lima\s*belas|limabelas|dua\s*puluh|duapuluh|tiga\s*puluh|tigapuluh|empat\s*puluh|lima\s*puluh)\s*(?P<unit>detik|menit|jam|hari|minggu|seconds?|minutes?|hours?|days?|weeks?)(?:\s+lagi)?",
+    re.IGNORECASE,
+)
+
+_SHORTHAND_RE = re.compile(
+    r"(?:dalam\s+)?(?P<short>setengah\s+jam|sejam|semenit|sehari|seminggu)(?:\s+lagi)?",
+    re.IGNORECASE,
+)
+
+
+def parse_relative_delta(text: str) -> Optional[timedelta]:
+    """Parse relative time intervals in Indonesian and English."""
+    m_short = _SHORTHAND_RE.search(text)
+    if m_short:
+        s = m_short.group("short").lower().replace(" ", "")
+        if s == "setengahjam":
+            return timedelta(minutes=30)
+        if s == "sejam":
+            return timedelta(hours=1)
+        if s == "semenit":
+            return timedelta(minutes=1)
+        if s == "sehari":
+            return timedelta(days=1)
+        if s == "seminggu":
+            return timedelta(days=7)
+    m = _RELATIVE_RE.search(text)
+    if m:
+        val_str = m.group("val").lower().strip()
+        unit = m.group("unit").lower().strip()
+        val = (
+            float(val_str)
+            if val_str.replace(".", "", 1).isdigit()
+            else _NUMBER_WORDS.get(val_str)
+        )
+        if val is not None:
+            if unit in ("detik", "second", "seconds"):
+                return timedelta(seconds=val)
+            if unit in ("menit", "minute", "minutes"):
+                return timedelta(minutes=val)
+            if unit in ("jam", "hour", "hours"):
+                return timedelta(hours=val)
+            if unit in ("hari", "day", "days"):
+                return timedelta(days=val)
+            if unit in ("minggu", "week", "weeks"):
+                return timedelta(days=val * 7)
+    return None
+
+
+# Future anchors: when. Kept explicit; relative intervals, specific times,
+# days of the week, or broad day words. Anything without a resolvable time
+# stores with due_at=None (triggers clarification receipt).
 _FUTURE_ANCHOR = re.compile(
-    r"\b(?:besok|lusa|nanti|sore\s+ini|malam\s+ini|hari\s+ini|"
+    r"\b(?:"
+    r"besok|lusa|nanti|sore\s+ini|malam\s+ini|hari\s+ini|pagi\s+ini|siang\s+ini|"
     r"minggu\s+depan|bulan\s+depan|tahun\s+depan|"
     r"tomorrow|tonight|next\s+week|next\s+month|"
+    r"hari\s+(?:senin|selasa|rabu|kamis|jumat|sabtu|minggu)|"
+    r"senin|selasa|rabu|kamis|jumat|sabtu|minggu|"
+    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
     r"jam\s*\d{1,2}(?:[:.]\d{2})?|pukul\s*\d{1,2}(?:[:.]\d{2})?|"
-    r"\b\d{1,2}[:.]\d{2}\b)\b",
+    r"\b\d{1,2}[:.]\d{2}\b|"
+    r"(?:dalam\s+)?(?:\d+|setengah|se|satu|dua|tiga|empat|lima|enam|tujuh|delapan|sembilan|sepuluh|sebelas|dua\s*belas|duabelas|lima\s*belas|limabelas|dua\s*puluh|duapuluh|tiga\s*puluh|tigapuluh)\s*(?:detik|menit|jam|hari|minggu)\s+lagi|"
+    r"dalam\s+(?:\d+|setengah|se|satu|dua|tiga|empat|lima|enam|tujuh|delapan|sembilan|sepuluh|sebelas|dua\s*belas|duabelas|lima\s*belas|limabelas|dua\s*puluh|duapuluh|tiga\s*puluh|tigapuluh)\s*(?:detik|menit|jam|hari|minggu)|"
+    r"(?:dalam\s+)?(?:setengah\s+jam|sejam|semenit|sehari|seminggu)(?:\s+lagi)?|"
+    r"pagi|siang|sore|malam"
+    r")\b",
     re.IGNORECASE,
 )
 
@@ -94,9 +196,43 @@ _PLAN_MAU = re.compile(r"\bmau\b", re.IGNORECASE)
 # Requests / vague desire clauses that must never be stored as plans.
 # Examples: "aku mau minta tolong anu", "mau yang enak enak", "mau itu lagi".
 _PLAN_MAU_REJECT = re.compile(
-    r"\bmau\s+(?:yang|itu|ini|anu|apa|sih|dong|deh|aja|saja|juga|lagi)\b|"
+    r"\bmau\s+(?:yang|itu|ini|anu|apa|sih|dong|deh|aja|saja|juga|lagi|yg)\b|"
     r"\bmau\s+(?:minta|mohon)\b|"
-    r"\bmau\s+(?:tolong|bantuan|dibantu)\b",
+    r"\bmau\s+(?:tolong|bantuan|dibantu)\b|"
+    r"\bmau\s+(?:kamu|lu|loe|anda)\b",
+    re.IGNORECASE,
+)
+
+# Reject casual banter, emotional outbursts, complaints, sexual/intimate talk,
+# roleplay framing, or teasing from being stored as plans.
+_CASUAL_BANTER_REJECT = re.compile(
+    r"\b(?:"
+    r"gak\s+sabar|tidak\s+sabar|penasaran|kangen|rindu|senang|sedih|takut|kecewa|marah|kesal|"
+    r"capek|lelah|bingung|pusing|mager|ngantuk|sange|nafsu|betah|santai|"
+    r"minta\s+jatah|peluk(?:an)?|cium(?:an)?|nenen|remes|desah|crot|basah|ngaceng|"
+    r"kontol|memek|pepek|itil|hantam|telanjang|binal|cabul|manjain|"
+    r"ronde\s+\d+|ronde\s+kedua|ronde\s+ketiga|ronde\s+keempat|lubang|"
+    r"kucing\s+yang\s+penurut|tendang\s+istri|"
+    r"asik\b|wah\b|aduh\b|haha\b|hehe\b|wkwk\b|lol\b|canda\b|bercanda\b"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Mandatory action verbs for natural plans. A true plan requires a concrete
+# future action/task, not just emotion or chatter.
+_PLAN_ACTION_VERBS = re.compile(
+    r"\b(?:"
+    r"belajar|mempelajari|nanya|bertanya|tanya|"
+    r"pergi|berangkat|datang|pulang|bikin|membuat|kerjakan|mengerjakan|"
+    r"selesai|menyelesaikan|ikut|mengikuti|ambil|mengambil|beli|membeli|"
+    r"pesan|memesan|masak|memasak|latihan|berlatih|nulis|menulis|"
+    r"baca|membaca|kerja|bekerja|kuliah|sekolah|olahraga|gym|workout|"
+    r"buka|membuka|daftar|mendaftar|cari|mencari|revisi|ngoding|coding|"
+    r"meeting|presentasi|jalan-jalan|liburan|pindah|istirahat|tidur|bangun|"
+    r"cek|periksa|mengecek|evaluasi|diskusi|telepon|hubungi|chat|kirim|unggah|upload|"
+    r"download|install|deploy|tes|testing|uji|"
+    r"ingat(?:kan)?|inget(?:in)?"
+    r")\b",
     re.IGNORECASE,
 )
 
@@ -166,9 +302,12 @@ _ACTOR_REQUEST_OR_ADDRESSEE = re.compile(
     re.IGNORECASE,
 )
 _OBJECT_VERB_SUFFIX = re.compile(
-    r"\b(?:ingetin|ingetkan|ingatkan|ingatkah|remind|"
+    r"\b(?:"
+    r"ingetin|ingetkan|ingatkan|ingatkah|remind|"
+    r"bangunin|bangunkan|tanyakan|tanya|tanyain|kabari|kabarin|beritahu|"
     r"bilang(?:in)?|ucapin|ucapkan|sampaikan|kirim|sebutin|sebutkan|"
-    r"ulangi|ulang|katakan)\s*$",
+    r"ulangi|ulang|katakan"
+    r")\s*$",
     re.IGNORECASE,
 )
 
@@ -254,26 +393,6 @@ _WEEKDAYS = {
 }
 
 
-def _now_aware(moment: Optional[datetime]) -> datetime:
-    now = moment if moment is not None else datetime.now(timezone.utc)
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
-    return now.astimezone(timezone.utc)
-
-
-def _utc_iso(moment: datetime) -> str:
-    return _now_aware(moment).isoformat(timespec="seconds")
-
-
-def _resolve_tz(tz: Optional[str]) -> ZoneInfo:
-    try:
-        if tz:
-            return ZoneInfo(str(tz))
-    except Exception:
-        pass
-    return ZoneInfo("UTC")
-
-
 def _normalize(text: Any) -> str:
     return " ".join(str(text or "").split()).strip()
 
@@ -283,38 +402,61 @@ def _parse_due_at(
 ) -> Optional[str]:
     """Resolve the future anchor into an absolute UTC instant.
 
-    Day words set the DATE (besok/lusa/weekday/minggu/bulan depan, all at
-    07:00 local unless an explicit jam overrides the time); a bare jam sets
-    today (tomorrow if passed); nanti/sore/malam ini mean +3h.
-    Anything unrecognized → None (stored, recallable, never proactively due).
+    - Relative intervals ('30 menit lagi', 'tiga jam lagi', 'dalam 15 menit')
+      add delta directly to moment.
+    - Specific day words ('besok', 'lusa', weekdays, etc.) set the date.
+      Time of day is set from explicit jam, or time-of-day word (pagi=07:00,
+      siang=12:00, sore=16:00, malam=19:00), defaulting to 07:00.
+    - Bare jam ('jam 11.51') sets today (tomorrow if passed).
+    - Bare 'nanti' without clock or interval returns None (system requests
+      clarification instead of guessing).
     """
     try:
         lowered = text.lower()
         local_now = moment.astimezone(tz)
 
+        # 1. Relative delta: highest priority for explicit intervals
+        delta = parse_relative_delta(text)
+        if delta is not None:
+            due_utc = moment + delta
+            return due_utc.astimezone(timezone.utc).isoformat(timespec="seconds")
+
         def _at(day: datetime, hour: int, minute: int = 0) -> str:
             due_local = day.replace(hour=hour, minute=minute, second=0, microsecond=0)
             return due_local.astimezone(timezone.utc).isoformat(timespec="seconds")
 
-        def _jam_or(h: int, m: int = 0) -> tuple:
+        def _jam_or(default_h: int = 7, default_m: int = 0) -> tuple:
             jam = _JAM.search(text)
             if jam:
                 try:
                     h = max(0, min(23, int(jam.group(1))))
                     m = max(0, min(59, int(jam.group(2) or 0)))
+                    return h, m
                 except (TypeError, ValueError):
                     pass
-            return h, m
+            if "pagi" in lowered:
+                return 7, 0
+            if "siang" in lowered:
+                return 12, 0
+            if "sore" in lowered:
+                return 16, 0
+            if "malam" in lowered or "tonight" in lowered:
+                return 19, 0
+            return default_h, default_m
 
+        # 2. Weekdays
         for name, weekday in _WEEKDAYS.items():
             if re.search(r"\b" + name + r"\b", lowered):
                 days_ahead = (weekday - local_now.weekday()) % 7
-                day = local_now + timedelta(days=days_ahead)
                 hour, minute = _jam_or(7)
-                due_local = day.replace(hour=hour, minute=minute, second=0, microsecond=0)
-                if due_local <= local_now:
-                    due_local = due_local + timedelta(days=7)
-                return due_local.astimezone(timezone.utc).isoformat(timespec="seconds")
+                if days_ahead == 0:
+                    cand_local = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                    if cand_local <= local_now:
+                        days_ahead = 7
+                day = local_now + timedelta(days=days_ahead)
+                return _at(day, hour, minute)
+
+        # 3. Relative days
         if "lusa" in lowered or "day after tomorrow" in lowered:
             day = local_now + timedelta(days=2)
             hour, minute = _jam_or(7)
@@ -331,6 +473,8 @@ def _parse_due_at(
             day = local_now + timedelta(days=30)
             hour, minute = _jam_or(7)
             return _at(day, hour, minute)
+
+        # 4. Explicit clock today (jam / pukul)
         jam = _JAM.search(text)
         if jam:
             hour, minute = _jam_or(7)
@@ -338,15 +482,23 @@ def _parse_due_at(
             if due_local <= local_now:
                 due_local = due_local + timedelta(days=1)
             return due_local.astimezone(timezone.utc).isoformat(timespec="seconds")
-        if (
-            "nanti" in lowered
-            or "sore ini" in lowered
-            or "malam ini" in lowered
-            or "tonight" in lowered
-        ):
-            return (moment + timedelta(hours=3)).isoformat(timespec="seconds")
-        return None
-    except Exception:
+
+        # 5. Broad time of day today (pagi ini, siang ini, sore ini, malam ini)
+        if "sore ini" in lowered:
+            if local_now.hour < 16:
+                return _at(local_now, 16, 0)
+        if "malam ini" in lowered or "tonight" in lowered:
+            if local_now.hour < 19:
+                return _at(local_now, 19, 0)
+        if "siang ini" in lowered:
+            if local_now.hour < 12:
+                return _at(local_now, 12, 0)
+        if "pagi ini" in lowered:
+            if local_now.hour < 7:
+                return _at(local_now, 7, 0)
+
+        # 6. Bare 'nanti' without clock or interval: do NOT guess 3 hours!
+        # Return None so reminder_receipt triggers a clarification question.
         return None
     except Exception:
         return None
@@ -413,6 +565,8 @@ def detect_future_plan(
     if _HABITUAL.search(text):
         return None
     if _ROLEPLAY_FRAME.search(text):
+        return None
+    if _CASUAL_BANTER_REJECT.search(text):
         return None
     if not _PLAN_SUBJECT.search(text):
         return None
@@ -724,13 +878,15 @@ def _parse_iso(value: Any) -> Optional[datetime]:
 def due_intentions(
     stored: Any,
     now: Optional[datetime] = None,
+    moment: Optional[datetime] = None,
 ) -> List[Dict[str, Any]]:
     """Pending intentions whose absolute ``due_at`` has passed."""
-    moment = _now_aware(now)
+    ref_time = now if now is not None else moment
+    effective_moment = _now_aware(ref_time)
     out = []
     for item in pending_intentions(stored):
         stamp = _parse_iso(item.get("due_at"))
-        if stamp is not None and stamp <= moment:
+        if stamp is not None and stamp <= effective_moment:
             out.append(item)
     return out
 

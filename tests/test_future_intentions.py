@@ -90,15 +90,24 @@ class DetectionTest(unittest.TestCase):
                 self.assertEqual(plan.kind, KIND_PLAN)
 
     def test_user_requesting_mili_to_remind_is_reminder(self):
-        for text in (
-            "besok ingetin aku minum obat",
-            "nanti ingetin aku ya",
-        ):
-            with self.subTest(text=text):
-                found = detect_future_intention(text, now=NOW, tz=JKT)
-                self.assertIsNotNone(found)
-                self.assertEqual(found.kind, KIND_REMINDER)
-                self.assertIsNotNone(found.due_at)
+        # Explicit time anchor resolves due_at
+        found = detect_future_intention("besok ingetin aku minum obat", now=NOW, tz=JKT)
+        self.assertIsNotNone(found)
+        self.assertEqual(found.kind, KIND_REMINDER)
+        self.assertIsNotNone(found.due_at)
+
+        # Relative time resolves due_at
+        found_rel = detect_future_intention("nanti 30 menit lagi ingetin aku ya", now=NOW, tz=JKT)
+        self.assertIsNotNone(found_rel)
+        self.assertEqual(found_rel.kind, KIND_REMINDER)
+        self.assertIsNotNone(found_rel.due_at)
+
+        # Bare 'nanti' without clock or interval is still KIND_REMINDER,
+        # but due_at is None so the system requests clarification instead of hardcoding 3 hours.
+        found_bare = detect_future_intention("nanti ingetin aku ya", now=NOW, tz=JKT)
+        self.assertIsNotNone(found_bare)
+        self.assertEqual(found_bare.kind, KIND_REMINDER)
+        self.assertIsNone(found_bare.due_at)
 
     def test_request_markers_keep_first_person_requests_valid(self):
         for text in (

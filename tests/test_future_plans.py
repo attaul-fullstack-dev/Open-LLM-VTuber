@@ -119,7 +119,8 @@ class CaptureTest(unittest.TestCase):
             ("aku mau belajar gitar", False),
             ("aku mau nanya hasil lab", False),
             ("aku akan mulai project baru", False),
-            ("nanti aku mau nanya hasil lab", True),
+            ("nanti aku mau nanya hasil lab", False),
+            ("nanti 2 jam lagi aku mau nanya hasil lab", True),
             ("Besok gw mau beli monitor baru yang besar.", True),
             ("Rencana gw mau belajar gitar tahun depan.", False),
         )

@@ -209,95 +209,33 @@ def _write_state_atomic(filepath: str, data: Dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Clock + parsing helpers (pure)
+# Canonical time provider delegation
 # ---------------------------------------------------------------------------
 
-
-def utcnow() -> datetime:
-    """Default real wall-clock (server-side UTC convention)."""
-    return datetime.now(timezone.utc)
-
-
-def _ensure_aware(value: datetime) -> datetime:
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value
+from .time_provider import (
+    ensure_aware as _ensure_aware,
+    format_temporal_anchor,
+    local_hour,
+    memory_age_label,
+    parse_iso,
+    relative_day_parts,
+    resolve_tz,
+    user_local_datetime,
+    user_now,
+    utc_iso as _to_iso,
+    utc_now,
+    utcnow,
+)
 
 
 def _parse_iso(value: Any, fallback: datetime) -> datetime:
-    try:
-        parsed = datetime.fromisoformat(str(value))
-    except (TypeError, ValueError):
-        return fallback
-    return _ensure_aware(parsed)
+    parsed = parse_iso(value, fallback=fallback)
+    return parsed if parsed is not None else fallback
 
 
 def _iso_or_none(value: Any) -> Optional[str]:
-    """Normalised UTC ISO string when ``value`` parses, else ``None``.
-
-    Used on load so a hand-edited or corrupted stamp can never enter
-    reconciliation. An unparseable ``activity_started_at`` used to be stored
-    verbatim, and ``_parse_iso`` then substituted the *current* moment as the
-    fallback, which made ``_activity_age_s`` return 0 on every call. That
-    permanently disables activity duration limits, the sleeping early exit
-    and stale-idle decisions, and the bad value was written straight back.
-    """
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    try:
-        parsed = datetime.fromisoformat(text)
-    except (TypeError, ValueError):
-        return None
-    return _to_iso(_ensure_aware(parsed))
-
-
-def _to_iso(value: datetime) -> str:
-    return _ensure_aware(value).isoformat(timespec="seconds")
-
-
-def resolve_tz(tz: Optional[str]) -> Optional[ZoneInfo]:
-    """Return a ZoneInfo for a user/session timezone name, or None.
-
-    ``None`` (or blank/invalid) means "no user timezone known" and callers
-    fall back to server-side UTC, preserving pre-timezone behavior.
-    Persistence always stays canonical UTC; only hour derivation converts.
-    Results (including misses) are cached so an unknown name warns once.
-    """
-    name = str(tz or "").strip()
-    if not name:
-        return None
-    if name in _TZ_CACHE:
-        return _TZ_CACHE[name]
-    try:
-        zone: Optional[ZoneInfo] = ZoneInfo(name)
-    except (ZoneInfoNotFoundError, ValueError):
-        zone = None
-        if name not in _TZ_WARNED:
-            _TZ_WARNED.add(name)
-            logger.warning(
-                "Unknown user timezone, falling back to UTC: tz={}", name[:64]
-            )
-    _TZ_CACHE[name] = zone
-    return zone
-
-
-def local_hour(moment: datetime, tz: Optional[str]) -> int:
-    """Wall-clock hour of ``moment`` in the user timezone (pure)."""
-    aware = _ensure_aware(moment)
-    zone = resolve_tz(tz)
-    if zone is None:
-        return aware.hour
-    try:
-        return aware.astimezone(zone).hour
-    except Exception as error:
-        logger.warning(
-            "Timezone conversion failed, using UTC hour: type={}",
-            type(error).__name__,
-        )
-        return aware.hour
+    parsed = parse_iso(value, fallback=None)
+    return _to_iso(parsed) if parsed is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -384,93 +322,9 @@ def derive_mood(activity: str, energy: int) -> str:
 
 
 # Temporal anchoring for the LLM context (pure display helpers).
-# These do NOT change transition/reconciliation logic; they only render
-# the existing UTC clock and stored timestamps in the user/session
-# timezone so relative words ("today", "yesterday") stay truthful.
 # ---------------------------------------------------------------------------
-
-
-def user_local_datetime(
-    moment: Optional[datetime] = None, tz: Optional[str] = None
-) -> datetime:
-    """Return ``moment`` (default real clock) in the user timezone (pure).
-
-    Falls back to UTC when ``tz`` is missing or invalid. Naive inputs are
-    read as UTC, matching the persistence convention.
-    """
-    aware = _ensure_aware(moment if moment is not None else utcnow())
-    zone = resolve_tz(tz)
-    return aware.astimezone(zone) if zone is not None else aware
-
-
-def format_temporal_anchor(
-    moment: Optional[datetime] = None, tz: Optional[str] = None
-) -> str:
-    """Compact "today + now" anchor for the system prompt (pure).
-
-    Gives the LLM a reliable current-date/weekday/clock-time/timezone
-    reference, rebuilt at every request from the runtime system clock, so
-    "what time is it" is answered from real time, never guessed or stale.
-    """
-    local = user_local_datetime(moment, tz)
-    date_str = f"{local:%B} {local.day}, {local.year}"
-    weekday = f"{local:%A}"
-    clock_str = f"{local:%H:%M}"
-    zone = resolve_tz(tz)
-    tz_label = tz if zone is not None else "UTC"
-    return (
-        f"Current date: {date_str} ({weekday})\n"
-        f"Current time: {clock_str}\n"
-        f"Timezone: {tz_label}"
-    )
-
-
-def relative_day_parts(
-    added_at: Any,
-    moment: Optional[datetime] = None,
-    tz: Optional[str] = None,
-) -> Optional[Tuple[str, str]]:
-    """(label, date) age of a stored ISO timestamp in the user timezone.
-
-    Pure. Day boundaries use user-local calendar dates. Returns None when
-    ``added_at`` is unparseable so callers render the original text as-is.
-    Future timestamps (clock skew) read as today, never negative.
-    """
-    try:
-        added = _ensure_aware(datetime.fromisoformat(str(added_at)))
-    except (TypeError, ValueError):
-        return None
-    local_now = user_local_datetime(moment, tz)
-    zone = resolve_tz(tz)
-    local_added = added.astimezone(zone) if zone is not None else added
-    delta_days = (local_now.date() - local_added.date()).days
-    if delta_days < 0:
-        delta_days = 0
-    if delta_days == 0:
-        label = "Today"
-    elif delta_days == 1:
-        label = "Yesterday"
-    else:
-        label = f"{delta_days} days ago"
-    date_str = f"{local_added:%b} {local_added.day}"
-    return label, date_str
-
-
-def memory_age_label(
-    added_at: Any,
-    moment: Optional[datetime] = None,
-    tz: Optional[str] = None,
-) -> str:
-    """Compact render-time age tag like ``[2 days ago | Sep 29]`` (pure).
-
-    Calculated at context-build time from the persisted timestamp; the
-    stored memory text is never rewritten. Empty string when unparseable.
-    """
-    parts = relative_day_parts(added_at, moment, tz)
-    if parts is None:
-        return ""
-    label, date_str = parts
-    return f"[{label} | {date_str}]"
+# Session recency and context formatting
+# ---------------------------------------------------------------------------
 
 
 def format_session_recency(
