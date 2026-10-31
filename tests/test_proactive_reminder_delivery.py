@@ -321,6 +321,60 @@ class ReminderDeliveryTests(unittest.TestCase):
             1,
         )
 
+    def test_release_and_completion_are_owner_guarded(self):
+        row = self._seed()
+        self.assertEqual(
+            len(
+                claim_due_future_intentions(
+                    self.conf_uid, owner="owner-a", now=self.now
+                )
+            ),
+            1,
+        )
+        # A different owner cannot release or complete this claim.
+        self.assertEqual(
+            release_claimed_future_intentions(
+                self.conf_uid, owner="owner-b", intention_ids=[row["id"]]
+            ),
+            0,
+        )
+        self.assertEqual(self._row(row["id"])["claimed_by"], "owner-a")
+        self.assertEqual(
+            complete_claimed_future_intentions(
+                self.conf_uid, owner="owner-b", intention_ids=[row["id"]]
+            ),
+            0,
+        )
+        self.assertEqual(self._row(row["id"])["status"], STATUS_PENDING)
+        self.assertEqual(
+            complete_claimed_future_intentions(
+                self.conf_uid, owner="owner-a", intention_ids=[row["id"]]
+            ),
+            1,
+        )
+        # A completed row is terminal; releasing it again is a no-op.
+        self.assertEqual(
+            release_claimed_future_intentions(
+                self.conf_uid, owner="owner-a", intention_ids=[row["id"]]
+            ),
+            0,
+        )
+        self.assertEqual(self._row(row["id"])["status"], STATUS_DONE)
+
+    def test_claim_excludes_a_backoff_row_and_claims_the_next_due(self):
+        first = self._seed(text="ingetin minum obat", due_delta=-3600)
+        second = self._seed(text="ingetin telepon ibu", due_delta=-1800)
+        claimed = claim_due_future_intentions(
+            self.conf_uid,
+            owner="owner-a",
+            now=self.now,
+            exclude_ids=[first["id"]],
+        )
+        self.assertEqual([item["id"] for item in claimed], [second["id"]])
+        self.assertEqual(self._row(first["id"])["status"], STATUS_PENDING)
+        self.assertNotIn("claimed_by", self._row(first["id"]))
+        self.assertEqual(self._row(second["id"])["claimed_by"], "owner-a")
+
     # D. Two live attempts: only one owner can claim/deliver.
     def test_concurrent_attempts_cannot_double_deliver(self):
         row = self._seed()

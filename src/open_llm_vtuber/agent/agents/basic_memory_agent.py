@@ -294,6 +294,11 @@ class BasicMemoryAgent(AgentInterface):
         # leak into an assistant-only turn. Rendered into the system prompt
         # by _relationship_system_prompt; empty means "no command".
         self._memory_receipt_block: str = ""
+        # Backend-verified reminder receipt for THIS turn only. Same contract
+        # as the memory receipt: the reminder is persisted BEFORE the response,
+        # and the model may only confirm it when this block says STORED.
+        # Cleared on proactive turns (assistant-only, no user request).
+        self._reminder_receipt_block: str = ""
         # Per-turn episodic retrieval selection (query, events), shared by the
         # prompt block and the Autonomous Decision Layer.
         self._episodic_selection_cache: Any = None
@@ -789,6 +794,11 @@ class BasicMemoryAgent(AgentInterface):
         receipt_block = getattr(self, "_memory_receipt_block", "") or ""
         if receipt_block:
             parts.append(receipt_block)
+        # Verified reminder receipt: placed last so it has the final word on
+        # "sudah aku jadwalkan" claims, exactly like the memory receipt.
+        reminder_block = getattr(self, "_reminder_receipt_block", "") or ""
+        if reminder_block:
+            parts.append(reminder_block)
         if world_line:
             parts.append(world_line)
         return "\n\n".join(parts)
@@ -820,6 +830,65 @@ class BasicMemoryAgent(AgentInterface):
         except Exception as error:
             logger.debug("Memory receipt skipped: type={}", type(error).__name__)
             self._memory_receipt_block = ""
+
+    def _refresh_reminder_receipt(self, user_text: str) -> None:
+        """Pre-turn reminder capture: detect, persist, verify.
+
+        Runs BEFORE the response is generated so the model reasons from a
+        verified write instead of promising a reminder it never stored. The
+        post-turn observer still runs; ``add_future_intention`` deduplicates by
+        normalized text, so the second attempt is a no-op. Fail-soft: any
+        problem renders a ``failed`` receipt (never a phantom success).
+        """
+        try:
+            from ...character_state import capture_reminder
+            from ...reminder_receipt import process_reminder_turn
+
+            conf_uid = self._character_conf_uid
+            if not conf_uid:
+                self._reminder_receipt_block = ""
+                return
+            recent = list(getattr(self, "_memory", None) or [])[-8:]
+            self._reminder_receipt_block = process_reminder_turn(
+                user_text,
+                capture_fn=lambda: capture_reminder(
+                    conf_uid,
+                    user_text,
+                    tz=getattr(self, "_user_timezone", None),
+                    recent_messages=recent,
+                ),
+                recent_messages=recent,
+                tz=getattr(self, "_user_timezone", None),
+            )
+        except Exception as error:
+            logger.debug(
+                "Reminder receipt skipped: type={}", type(error).__name__
+            )
+            self._reminder_receipt_block = ""
+
+    def next_future_intention_due(
+        self,
+        moment: Optional[datetime] = None,
+        exclude_ids: Optional[List[str]] = None,
+    ) -> Optional[datetime]:
+        """Earliest pending reminder instant (pure read; None when none).
+
+        The proactive timer uses it to sleep until the reminder instead of the
+        next idle window, so a due time is never missed just because no random
+        eligibility tick happens to land after it. Rows in their per-row retry
+        window can be excluded so another due row still gets a wake-up.
+        """
+        try:
+            self._refresh_character_state_if_changed()
+            from ...future_intentions import next_due_at
+
+            return next_due_at(
+                getattr(self._character_state, "future_intentions", None),
+                now=moment,
+                exclude_ids=exclude_ids,
+            )
+        except Exception:
+            return None
 
     def _sync_relationship_metadata(self, status: str, reason: str) -> None:
         """Mirror the character-level relationship into the active session file.
@@ -1426,6 +1495,27 @@ class BasicMemoryAgent(AgentInterface):
         except Exception:
             return False
 
+    def has_due_reminder(self, moment: Optional[datetime] = None) -> bool:
+        """True when a due row is specifically a REMINDER, not a future plan.
+
+        Only user-scheduled reminders earn the priority delivery lane; a due
+        future plan ("besok aku ada ujian") stays subject to the ordinary
+        spontaneous-conversation gate. Pure read, fail-soft.
+        """
+        try:
+            self._refresh_character_state_if_changed()
+            from ...future_intentions import KIND_REMINDER, due_intentions
+
+            return any(
+                (item.get("kind") or KIND_REMINDER) == KIND_REMINDER
+                for item in due_intentions(
+                    getattr(self._character_state, "future_intentions", None),
+                    now=moment,
+                )
+            )
+        except Exception:
+            return False
+
     def consume_due_future_intentions(self, moment: Optional[datetime] = None) -> int:
         """Mark all currently-due reminders done and persist. Returns count."""
         try:
@@ -1457,8 +1547,16 @@ class BasicMemoryAgent(AgentInterface):
         owner: str,
         moment: Optional[datetime] = None,
         lease_seconds: int = 600,
+        max_claims: Optional[int] = 1,
+        exclude_ids: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
-        """Claim due reminders for this proactive attempt; empty when taken."""
+        """Claim due reminders for this proactive attempt; empty when taken.
+
+        One dispatch claims at most one reminder by default, so the turn is
+        generated for that reminder alone and can only complete that row.
+        ``exclude_ids`` skips rows in their own retry window, allowing another
+        due reminder to be attempted while the failed row stays pending.
+        """
         try:
             from ...character_state import claim_due_future_intentions as _claim
             from ...character_state import load_character_state
@@ -1474,6 +1572,8 @@ class BasicMemoryAgent(AgentInterface):
                 owner=owner,
                 now=moment,
                 lease_seconds=lease_seconds,
+                max_claims=max_claims,
+                exclude_ids=exclude_ids,
             )
             try:
                 refreshed = load_character_state(self._character_conf_uid)
@@ -2200,6 +2300,7 @@ class BasicMemoryAgent(AgentInterface):
                 self._character_conf_uid,
                 user_text,
                 tz=getattr(self, "_user_timezone", None),
+                recent_messages=list(getattr(self, "_memory", None) or [])[-8:],
             )
             if stored is None:
                 return False
@@ -3151,6 +3252,9 @@ class BasicMemoryAgent(AgentInterface):
             # response is generated from the verified outcome, never from a
             # guess. Runs once per turn; tool-loop iterations below reuse it.
             self._refresh_memory_receipt(self._last_user_text(messages))
+            # Same order for reminders: persist BEFORE generation so a
+            # "sudah kujadwalkan" claim always follows a verified write.
+            self._refresh_reminder_receipt(self._last_user_text(messages))
             protected_start = max(0, len(messages) - 1)
             tools = None
             tool_mode = None
@@ -3267,6 +3371,7 @@ class BasicMemoryAgent(AgentInterface):
             # Assistant-only turn: no user command exists, so a receipt from
             # a previous user turn must never leak into this prompt.
             self._memory_receipt_block = ""
+            self._reminder_receipt_block = ""
 
             messages = self._memory.copy()
             try:

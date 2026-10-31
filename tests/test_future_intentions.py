@@ -292,8 +292,27 @@ class ProactiveWiringTest(unittest.TestCase):
         from src.open_llm_vtuber.proactive_gate import local_day_key, resolve_user_tz
 
         full.daily_count_date = local_day_key(later, resolve_user_tz(JKT))
+        # Reminder lane: a due obligation is not blocked by the spontaneous
+        # daily ceiling, but a dead session still is. Without the verified
+        # lane flag the ceiling keeps applying (plans/spontaneous turns).
+        self.assertTrue(
+            evaluate_gate(
+                full, cfg, trigger, now=later, tz=JKT, reminder_due=True
+            ).allowed
+        )
         self.assertFalse(
             evaluate_gate(full, cfg, trigger, now=later, tz=JKT).allowed
+        )
+        self.assertFalse(
+            evaluate_gate(
+                full,
+                cfg,
+                trigger,
+                now=later,
+                tz=JKT,
+                connection_valid=False,
+                reminder_due=True,
+            ).allowed
         )
 
     def test_consume_on_dispatch_dedups(self):

@@ -51,6 +51,7 @@ GATE_UNANSWERED = "unanswered_requires_meaningful"
 GATE_NO_REASON = "no_meaningful_reason"
 GATE_IDLE_BUDGET = "idle_budget_exhausted"
 GATE_CONNECTION = "connection_or_session"
+GATE_REMINDER = "reminder_due_lane"
 
 
 def _utcnow() -> datetime:
@@ -468,11 +469,20 @@ def evaluate_gate(
     tz: Optional[str] = None,
     connection_valid: bool = True,
     generation_in_progress: bool = False,
+    reminder_due: bool = False,
 ) -> GateDecision:
     """Single deterministic entry point, evaluated before any provider call.
 
     Check order is deliberate and fail-safe: the cheapest absolute vetoes run
     first, and every ambiguous condition resolves to *suppress*.
+
+    ``reminder_due`` opens the user-obligation lane: a reminder the user
+    explicitly scheduled has already come due, so the pacing rules that exist
+    to stop Mili from starting spontaneous small talk (idle budget, hourly
+    meaningful budget, minimum gap, backoff, dormancy, quiet hours and the
+    spontaneous daily ceiling) must not swallow it. Safety is preserved by the
+    connection checks below plus the dispatcher's claim/lease, which bounds a
+    reminder to a single delivery. Spontaneous turns never set this flag.
     """
     moment = _aware(now) if now is not None else _utcnow()
     zone = resolve_user_tz(tz)
@@ -498,6 +508,12 @@ def evaluate_gate(
             return decide(False, GATE_CONNECTION)
         if generation_in_progress:
             return decide(False, GATE_CONNECTION)
+
+        # A due reminder is an obligation, not a conversation initiative.
+        # Only the caller that verified a due REMINDER sets this flag; due
+        # future plans stay on the ordinary spontaneous path.
+        if reminder_due:
+            return decide(True, GATE_REMINDER)
 
         # LOW idle thoughts need an explicit hourly budget. When both idle
         # budgets are zero, a generic idle timer must never buy a model call.
@@ -606,6 +622,29 @@ def record_proactive_answered(
     return state
 
 
+def record_reminder_dispatch(
+    state: ProactiveBudgetState,
+    config: ProactiveGateConfig,
+    *,
+    now: Optional[datetime] = None,
+    tz: Optional[str] = None,
+) -> ProactiveBudgetState:
+    """Account for ONE due-reminder dispatch (user obligation lane).
+
+    Counts the call for observability (daily/total and the timestamp) but does
+    NOT raise the unanswered/backoff pressure that governs spontaneous small
+    talk: a scheduled delivery is not an ignored initiative, and it must not
+    silence Mili's ordinary proactive behaviour for the next few hours.
+    """
+    moment = _aware(now) if now is not None else _utcnow()
+    zone = resolve_user_tz(tz)
+    roll_counters(state, moment, zone)
+    state.last_proactive_at = _iso(moment)
+    state.daily_request_count = int(state.daily_request_count) + 1
+    state.total_proactive_count = int(state.total_proactive_count) + 1
+    return state
+
+
 def record_suppressed(
     state: ProactiveBudgetState,
     config: ProactiveGateConfig,
@@ -642,6 +681,7 @@ __all__ = [
     "GATE_NO_REASON",
     "GATE_OK",
     "GATE_QUIET_HOURS",
+    "GATE_REMINDER",
     "GATE_UNANSWERED",
     "PRIORITY_HIGH",
     "PRIORITY_LOW",
@@ -662,6 +702,7 @@ __all__ = [
     "local_hour_key",
     "record_proactive_answered",
     "record_proactive_dispatch",
+    "record_reminder_dispatch",
     "record_suppressed",
     "resolve_user_tz",
     "roll_counters",

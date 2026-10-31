@@ -87,12 +87,59 @@ class CaptureTest(unittest.TestCase):
             detect_any_future_intention("orang biasanya kerja besok", now=NOW, tz=JKT)
         )
 
+    def test_7b_generic_mau_is_not_a_plan(self):
+        cases = (
+            "hari ini aku lagi libur, mau yang enak enak",
+            "aku mau minta tolong anu",
+            "aku mau minta bantuan kamu",
+            "aku mau minta tolong dong",
+            "besok aku mau minta tolong anu",
+            "aku akan minta tolong anu",
+            "aku bakal minta bantuan kamu",
+            "aku mau yang manis",
+            "aku mau itu lagi",
+            "aku mau anu",
+            "aku mau apa ya",
+            "aku mau sesuatu",
+            "hari ini aku libur, mau santai aja",
+            "aku mau makan",
+            "aku mau tidur",
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                self.assertIsNone(detect_future_plan(text, now=NOW, tz=JKT))
+                self.assertIsNone(detect_any_future_intention(text, now=NOW, tz=JKT))
+
+    def test_7c_real_plans_still_detected(self):
+        cases = (
+            ("besok jam 9 aku ada ujian", True),
+            ("besok aku ada ujian", True),
+            ("Selasa aku bakal nanya lagi soal bug websocket", True),
+            ("aku mau mulai project baru", False),
+            ("aku mau belajar gitar", False),
+            ("aku mau nanya hasil lab", False),
+            ("aku akan mulai project baru", False),
+            ("nanti aku mau nanya hasil lab", True),
+            ("Besok gw mau beli monitor baru yang besar.", True),
+            ("Rencana gw mau belajar gitar tahun depan.", False),
+        )
+        for text, has_due in cases:
+            with self.subTest(text=text):
+                found = detect_future_plan(text, now=NOW, tz=JKT)
+                self.assertIsNotNone(found)
+                self.assertEqual(found.kind, KIND_PLAN)
+                if has_due:
+                    self.assertIsNotNone(found.due_at)
+                else:
+                    self.assertIsNone(found.due_at)
+
     def test_reminder_still_wins_over_plan(self):
         found = detect_any_future_intention(
             "tolong ingetin aku besok jam 7 berangkat", now=NOW, tz=JKT
         )
         self.assertIsNotNone(found)
         self.assertEqual(found.kind, KIND_REMINDER)
+        self.assertIsNotNone(found.due_at)
 
 
 class StorageTest(unittest.TestCase):
@@ -104,6 +151,27 @@ class StorageTest(unittest.TestCase):
     def tearDown(self):
         os.chdir(self._old)
         self._tmp.cleanup()
+
+    def test_7d_generic_mau_not_persisted(self):
+        for text in (
+            "hari ini aku lagi libur, mau yang enak enak",
+            "aku mau minta tolong anu",
+            "aku mau yang manis",
+            "aku mau minta bantuan kamu",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(
+                    record_future_intention(CONF, text, now=NOW, tz=JKT)
+                )
+        self.assertEqual(load_character_state(CONF).future_intentions, [])
+
+    def test_7e_undated_real_plan_persisted(self):
+        stored = record_future_intention(
+            CONF, "aku mau mulai project baru", now=NOW, tz=JKT
+        )
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored["kind"], KIND_PLAN)
+        self.assertIsNone(stored["due_at"])
 
     def test_8_duplicate_dedup(self):
         record_future_intention(CONF, "besok aku ada ujian", now=NOW, tz=JKT)
@@ -257,7 +325,19 @@ class ContextTest(unittest.TestCase):
             hourly_meaningful_count=0,
             hourly_count_hour=local_hour_key(later, zone),
         )
+        # A due reminder is an obligation: the spontaneous daily ceiling does
+        # not swallow it when the caller verified the reminder lane. Without
+        # that flag (plans, spontaneous turns) the ceiling still applies.
+        self.assertTrue(
+            evaluate_gate(
+                full, cfg, trigger, now=later, tz=JKT, reminder_due=True
+            ).allowed
+        )
         self.assertFalse(evaluate_gate(full, cfg, trigger, now=later, tz=JKT).allowed)
+        spontaneous = classify_trigger(unfinished_topic=True)
+        self.assertFalse(
+            evaluate_gate(full, cfg, spontaneous, now=later, tz=JKT).allowed
+        )
 
 
 if __name__ == "__main__":

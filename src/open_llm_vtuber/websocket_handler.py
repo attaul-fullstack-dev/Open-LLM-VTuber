@@ -1,4 +1,5 @@
 from typing import Dict, List, Optional, Callable, TypedDict, Any
+from datetime import datetime, timedelta
 from fastapi import WebSocket, WebSocketDisconnect
 import asyncio
 import json
@@ -32,7 +33,8 @@ from .conversations.conversation_handler import (
     handle_individual_interrupt,
 )
 from .world_state import load_and_reconcile_world_state, utcnow
-from .character_state import set_character_timezone
+from .character_state import recover_stale_claims, set_character_timezone
+from .claim_identity import claim_owner as process_claim_owner
 from .conversations.single_conversation import process_single_conversation
 from .conversations.conversation_utils import EMOJI_LIST
 from .autonomous_decision import OUTCOME_GOAL_BEHAVIOR
@@ -44,6 +46,7 @@ from .proactive_gate import (
     load_proactive_state,
     record_proactive_answered,
     record_proactive_dispatch,
+    record_reminder_dispatch,
     record_suppressed,
     save_proactive_state,
 )
@@ -172,6 +175,14 @@ def create_locked_send_text(websocket: WebSocket):
 class WebSocketHandler:
     """Handles WebSocket connections and message routing"""
 
+    # Upper bound for one proactive scheduler sleep. Keeps the timer responsive
+    # to a reminder due time (and to wall-clock jumps) without hot-spinning.
+    REMINDER_WAKE_CAP_SECONDS = 60.0
+    # After a failed reminder attempt the row is released for retry, but not
+    # instantly: one paced retry per window, so a broken provider cannot turn
+    # the reminder lane into an unbounded retry loop.
+    REMINDER_RETRY_DELAY_SECONDS = 60.0
+
     def __init__(self, default_context_cache: ServiceContext):
         """Initialize the WebSocket handler with default context"""
         self.client_connections: Dict[str, WebSocket] = {}
@@ -189,6 +200,10 @@ class WebSocketHandler:
         self.received_data_buffers: Dict[str, np.ndarray] = {}
         self._proactive_timer_tasks: Dict[str, asyncio.Task] = {}
         self._proactive_states: Dict[str, Dict[str, ProactiveRuntimeState]] = {}
+        # Earliest time each failed reminder row may be retried (UTC), keyed
+        # by client then row id. Per-row pacing means one failing reminder
+        # cannot gate every other due row for the whole client.
+        self._reminder_row_retry_not_before: Dict[str, Dict[str, datetime]] = {}
         # Proactive V2: persisted accounting (survives reconnect + restart) and
         # the deterministic gate config. The gate is evaluated BEFORE any
         # provider call, so a suppressed turn never reaches the LLM.
@@ -360,6 +375,37 @@ class WebSocketHandler:
         self._proactive_maintenance.discard(client_uid)
         await self._activate_proactive_for_history(client_uid, context.history_uid)
 
+    def _recover_stale_reminder_claims(self, context: Any) -> None:
+        """Clear reminder claims left by a dead process, once per character.
+
+        Lazy startup recovery: the proactive scheduler only starts when a
+        history becomes active, so this is the first moment a claim matters.
+        ``recover_stale_claims`` never touches a claim held by a live process
+        (including a second instance), so this is safe under the current
+        single-process deployment without a global startup sweep.
+        """
+        try:
+            conf_uid = getattr(
+                getattr(context, "character_config", None), "conf_uid", None
+            )
+            if not conf_uid:
+                return
+            recovered = getattr(self, "_claim_recovery_done", None)
+            if recovered is None:
+                recovered = set()
+                self._claim_recovery_done = recovered
+            if conf_uid in recovered:
+                return
+            result = recover_stale_claims(conf_uid)
+            # A failed read/write stays unmarked so the next activation retries
+            # instead of leaving the claim to the full lease.
+            if result is not None:
+                recovered.add(conf_uid)
+        except Exception as error:
+            logger.debug(
+                "Reminder claim recovery skipped: type={}", type(error).__name__
+            )
+
     async def _activate_proactive_for_history(
         self,
         client_uid: str,
@@ -374,6 +420,7 @@ class WebSocketHandler:
         context = self.client_contexts.get(client_uid)
         if not context:
             return
+        self._recover_stale_reminder_claims(context)
         try:
             machine = self._proactive_machines.get(client_uid)
             config = self._proactive_config(context)
@@ -553,6 +600,136 @@ class WebSocketHandler:
             )
             return False
 
+    def _reminder_row_retry_store(self) -> Dict[str, Dict[str, datetime]]:
+        """Lazy accessor: tests construct the handler via ``__new__``."""
+        store = getattr(self, "_reminder_row_retry_not_before", None)
+        if store is None:
+            store = {}
+            self._reminder_row_retry_not_before = store
+        return store
+
+    def _reminder_retry_exclusions(
+        self, client_uid: str, now: Optional[datetime] = None
+    ) -> set[str]:
+        """Row ids still inside their own retry window (expired entries pruned)."""
+        moment = now or utcnow()
+        store = self._reminder_row_retry_store()
+        per_row = store.get(client_uid)
+        if not per_row:
+            return set()
+        for row_id, retry_at in list(per_row.items()):
+            if retry_at <= moment:
+                per_row.pop(row_id, None)
+        if not per_row:
+            store.pop(client_uid, None)
+        return set(per_row)
+
+    def _reminder_retry_delay(
+        self, client_uid: str, now: Optional[datetime] = None
+    ) -> Optional[float]:
+        """Seconds until this client's earliest per-row retry, if any."""
+        moment = now or utcnow()
+        per_row = self._reminder_row_retry_store().get(client_uid) or {}
+        future = [
+            (retry_at - moment).total_seconds()
+            for retry_at in per_row.values()
+            if retry_at > moment
+        ]
+        return min(future) if future else None
+
+    def _defer_reminder_retries(self, client_uid: str, row_ids: List[str]) -> None:
+        """Back off only the rows this attempt failed, never the whole client."""
+        ids = [str(row_id) for row_id in row_ids if row_id]
+        if not ids:
+            return
+        retry_at = utcnow() + timedelta(seconds=self.REMINDER_RETRY_DELAY_SECONDS)
+        per_row = self._reminder_row_retry_store().setdefault(client_uid, {})
+        for row_id in ids:
+            per_row[row_id] = retry_at
+
+    def _clear_reminder_retries(self, client_uid: str, row_ids: List[str]) -> None:
+        """Forget backoff for rows that were just claimed/completed."""
+        store = self._reminder_row_retry_store()
+        per_row = store.get(client_uid)
+        if not per_row:
+            return
+        for row_id in row_ids:
+            per_row.pop(str(row_id), None)
+        if not per_row:
+            store.pop(client_uid, None)
+
+    def _next_reminder_due_delay(
+        self, client_uid: str, context: Optional[ServiceContext]
+    ) -> Optional[float]:
+        """Seconds until the next due row that is not in per-row backoff."""
+        agent = getattr(context, "agent_engine", None) if context else None
+        next_due = getattr(agent, "next_future_intention_due", None)
+        if not callable(next_due):
+            return None
+        excluded_ids = self._reminder_retry_exclusions(client_uid)
+        try:
+            stamp = next_due(utcnow(), exclude_ids=excluded_ids)
+        except TypeError:
+            try:
+                stamp = next_due(utcnow())
+            except Exception:
+                return None
+        except Exception:
+            return None
+        if stamp is None:
+            return None
+        try:
+            return max(0.0, (stamp - utcnow()).total_seconds())
+        except Exception:
+            return None
+
+    def _due_reminder_lane(self, context: ServiceContext, now=None) -> bool:
+        """True when a due row is a user-scheduled REMINDER.
+
+        Deliberately narrower than ``_future_intention_trigger`` (which also
+        sees due future plans): only reminders are exempt from the spontaneous
+        pacing rules. Fail-soft: any problem means "no lane".
+        """
+        try:
+            agent = getattr(context, "agent_engine", None)
+            probe = getattr(agent, "has_due_reminder", None)
+            if not callable(probe):
+                return False
+            try:
+                return bool(probe(now) if now is not None else probe())
+            except TypeError:
+                return bool(probe())
+        except Exception as error:
+            logger.debug(
+                "Due reminder lane unavailable: type={}", type(error).__name__
+            )
+            return False
+
+    def _proactive_sleep_seconds(
+        self,
+        client_uid: str,
+        state: ProactiveRuntimeState,
+        machine: ProactiveStateMachine,
+        context: Optional[ServiceContext],
+    ) -> float:
+        """Seconds until the next idle tick OR the next reminder due time.
+
+        Bounded by ``REMINDER_WAKE_CAP_SECONDS`` so a clock change or a very
+        distant due time can never strand the loop for hours. Cheap: one pure
+        read of the in-memory character state.
+        """
+        wait = float(machine.seconds_until_eligible(state))
+        next_due_delay = self._next_reminder_due_delay(client_uid, context)
+        if next_due_delay is not None:
+            wait = min(wait, next_due_delay)
+        retry_delay = self._reminder_retry_delay(client_uid)
+        if retry_delay is not None:
+            # If every due row is in its own retry window, wake for the
+            # earliest one; if another row is due sooner, the next_due value
+            # above already keeps the wait shorter.
+            wait = min(wait, max(0.0, retry_delay))
+        return max(0.0, min(wait, self.REMINDER_WAKE_CAP_SECONDS))
+
     def _proactive_trigger(
         self,
         context: ServiceContext,
@@ -729,7 +906,13 @@ class WebSocketHandler:
                 claimed_reminders = []
                 claimed_ids = []
                 agent = None
-                await asyncio.sleep(machine.seconds_until_eligible(state))
+                context = self.client_contexts.get(client_uid)
+                # Sleep until whichever comes first: the idle eligibility tick
+                # or the next reminder's due time. A due reminder must not wait
+                # for an unrelated 45-90s idle roll.
+                await asyncio.sleep(
+                    self._proactive_sleep_seconds(client_uid, state, machine, context)
+                )
                 if not self._proactive_conditions_allow(client_uid, history_uid):
                     return
 
@@ -745,10 +928,20 @@ class WebSocketHandler:
                     machine.record_user_activity(state)
                     continue
 
-                if not machine.is_eligible(state):
+                context = context or self.client_contexts[client_uid]
+                # A due reminder bypasses the idle window (but never an
+                # in-flight turn or a disabled scheduler). Recomputed every
+                # loop so no user message is required to notice it.
+                due_reminder = self._due_reminder_lane(context, now=utcnow())
+                if due_reminder:
+                    if (
+                        not machine.config.enabled
+                        or state.proactive_generation_in_progress
+                    ):
+                        continue
+                elif not machine.is_eligible(state):
                     continue
 
-                context = self.client_contexts[client_uid]
                 websocket = self.client_connections[client_uid]
 
                 # ---- Proactive V2 deterministic gate -------------------
@@ -774,6 +967,7 @@ class WebSocketHandler:
                     or getattr(context, "user_timezone", None),
                     connection_valid=True,
                     generation_in_progress=False,
+                    reminder_due=due_reminder,
                 )
                 if not decision_gate.allowed:
                     logger.debug(
@@ -808,15 +1002,25 @@ class WebSocketHandler:
                 # owner+lease (so only one connection can deliver it). A
                 # concurrent attempt gets nothing and never calls the model.
                 if str(getattr(trigger, "reason", "")) == "explicit_reminder":
-                    claim_owner = f"{client_uid}:{uuid.uuid4().hex}"
+                    claim_owner = process_claim_owner(
+                        f"{client_uid}:{uuid.uuid4().hex}"
+                    )
                     agent = getattr(context, "agent_engine", None)
                     claim = getattr(agent, "claim_due_future_intentions", None)
+                    excluded_ids = self._reminder_retry_exclusions(client_uid)
                     if callable(claim):
                         try:
                             try:
-                                claimed_reminders = claim(claim_owner, utcnow())
+                                claimed_reminders = claim(
+                                    claim_owner,
+                                    utcnow(),
+                                    exclude_ids=excluded_ids,
+                                )
                             except TypeError:
-                                claimed_reminders = claim(claim_owner)
+                                try:
+                                    claimed_reminders = claim(claim_owner, utcnow())
+                                except TypeError:
+                                    claimed_reminders = claim(claim_owner)
                         except Exception as error:
                             logger.debug(
                                 "Future intention claim skipped: type={}",
@@ -826,31 +1030,68 @@ class WebSocketHandler:
                     else:
                         claimed_reminders = []
                     if not claimed_reminders:
-                        # Another live attempt owns the reminder (or the
-                        # claim could not be persisted). No model call, no
-                        # budget charge, no premature consumption.
+                        # Another live attempt owns every eligible reminder (or
+                        # the claim could not be persisted). No model call, no
+                        # budget charge, no premature consumption. If this
+                        # client's own failed rows are merely backing off, wake
+                        # for their retry instead of the generic idle window.
                         state.proactive_generation_in_progress = False
                         logger.info(
                             "Future intention claim unavailable: reason={} "
                             "owner_retained=false",
                             getattr(trigger, "reason", ""),
                         )
-                        await asyncio.sleep(
-                            min(60.0, max(5.0, machine.seconds_until_eligible(state)))
+                        retry_delay = self._reminder_retry_delay(client_uid)
+                        next_due_delay = self._next_reminder_due_delay(
+                            client_uid, context
                         )
+                        sleep_for = None
+                        if retry_delay is not None:
+                            sleep_for = max(0.05, retry_delay)
+                        if next_due_delay is not None:
+                            due_wait = (
+                                max(0.05, next_due_delay)
+                                if next_due_delay > 0
+                                else 5.0
+                            )
+                            sleep_for = (
+                                due_wait
+                                if sleep_for is None
+                                else min(sleep_for, due_wait)
+                            )
+                        if sleep_for is not None:
+                            await asyncio.sleep(min(60.0, sleep_for))
+                        else:
+                            await asyncio.sleep(
+                                min(
+                                    60.0,
+                                    max(5.0, machine.seconds_until_eligible(state)),
+                                )
+                            )
                         continue
                     claimed_ids = [
                         str(row.get("id", ""))
                         for row in claimed_reminders
                         if row.get("id")
                     ]
-                record_proactive_dispatch(
-                    budget,
-                    gate_config,
-                    trigger,
-                    now=utcnow(),
-                    tz=getattr(context, "user_timezone", None),
-                )
+                    self._clear_reminder_retries(client_uid, claimed_ids)
+                if due_reminder:
+                    # User obligation lane: count the call, but never raise the
+                    # unanswered/backoff pressure that paces spontaneous talk.
+                    record_reminder_dispatch(
+                        budget,
+                        gate_config,
+                        now=utcnow(),
+                        tz=getattr(context, "user_timezone", None),
+                    )
+                else:
+                    record_proactive_dispatch(
+                        budget,
+                        gate_config,
+                        trigger,
+                        now=utcnow(),
+                        tz=getattr(context, "user_timezone", None),
+                    )
                 self._persist_budget(client_uid, conf_uid)
                 # The turn is genuinely dispatched, so a deferred goal
                 # evidence anchor is consumed exactly once here.
@@ -948,9 +1189,14 @@ class WebSocketHandler:
                         "proactive_followup": followup_context.as_dict(),
                         "proactive_intent": intent_context.as_dict(),
                         "proactive_due_reminders": [
-                            str(row.get("text", ""))
+                            str(
+                                row.get("delivery_text")
+                                or row.get("text", "")
+                            )
                             for row in claimed_reminders
-                            if str(row.get("text", "")).strip()
+                            if str(
+                                row.get("delivery_text") or row.get("text", "")
+                            ).strip()
                         ],
                     },
                 )
@@ -979,6 +1225,12 @@ class WebSocketHandler:
                                 "Future intention settlement skipped: type={}",
                                 type(error).__name__,
                             )
+                    if response:
+                        self._clear_reminder_retries(client_uid, claimed_ids)
+                    else:
+                        # Released for a later retry, but only this row is
+                        # backed off so another due reminder can go next.
+                        self._defer_reminder_retries(client_uid, claimed_ids)
                 if response and revision == state.activity_revision:
                     machine.record_proactive_sent(
                         state, response_text=response, intent=decision.intent
@@ -1010,6 +1262,18 @@ class WebSocketHandler:
                         )
         except asyncio.CancelledError:
             state.proactive_generation_in_progress = False
+            # A cancelled provider call produced no deliverable response.
+            # Release only this attempt's still-owned rows (the owner+id guard
+            # makes a completed/taken-over row a no-op) and back off only those
+            # rows, so the reminder is retryable instead of waiting the lease.
+            if agent is not None and claimed_ids:
+                release = getattr(agent, "release_claimed_future_intentions", None)
+                if callable(release):
+                    try:
+                        release(claim_owner, claimed_ids)
+                    except Exception:
+                        pass
+                self._defer_reminder_retries(client_uid, claimed_ids)
             raise
         except Exception as error:
             state.proactive_generation_in_progress = False
@@ -1027,6 +1291,10 @@ class WebSocketHandler:
                 "Proactive generation failed safely: type={}",
                 type(error).__name__,
             )
+            if claimed_ids:
+                # Back off only the failed rows; other due reminders remain
+                # eligible instead of being gated by one broken row.
+                self._defer_reminder_retries(client_uid, claimed_ids)
         finally:
             if self.current_conversation_tasks.get(client_uid) is current_task:
                 self.current_conversation_tasks.pop(client_uid, None)

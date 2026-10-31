@@ -846,54 +846,136 @@ def build_character_memory_context(
     return f"{header}\n" + "\n".join(lines)
 
 
+REMINDER_CAPTURED = "captured"
+REMINDER_CLARIFY = "clarify"
+REMINDER_NONE = "none"
+REMINDER_FAILED = "failed"
+
+
+def _persist_detected_intention(
+    conf_uid: str, detected: Any
+) -> Optional[Dict[str, Any]]:
+    """Write one detected intention. Returns the stored row or None."""
+    try:
+        import uuid as _uuid
+
+        from .future_intentions import add_future_intention
+
+        filepath = get_character_state_path(conf_uid)
+        # Capture is a read-modify-write against the same authoritative file
+        # as claim/complete/release. Hold the same lock for the whole
+        # transaction so a pre-turn capture snapshot cannot overwrite a
+        # concurrent claim or completion. ``_get_state_lock`` returns an
+        # RLock; ``save_character_state`` re-enters it safely. This is an
+        # in-process lock only: it does not serialize a second process.
+        with _get_state_lock(filepath):
+            state = load_character_state(conf_uid)
+            intention_id = _uuid.uuid4().hex
+            updated = add_future_intention(
+                state.future_intentions, detected, intention_id=intention_id
+            )
+            state.future_intentions = updated
+            if not save_character_state(conf_uid, state):
+                return None
+            for item in reversed(updated):
+                if item.get("id") == intention_id:
+                    logger.info(
+                        "Future intention stored: kind={} due_at={} text_chars={} "
+                        "resolved={}",
+                        getattr(detected, "kind", "reminder"),
+                        detected.due_at,
+                        len(detected.text),
+                        bool(getattr(detected, "delivery_text", None)),
+                    )
+                    return dict(item)
+            # Same-turn duplicate (pre-turn receipt already wrote it, then the
+            # post-turn observer ran): the existing row is authoritative and no
+            # second write happened. Never log this as a new store.
+            normalized = detected.text.strip().lower()
+            for item in updated:
+                if (
+                    item.get("status") == "pending"
+                    and str(item.get("text", "")).strip().lower() == normalized
+                ):
+                    logger.debug(
+                        "Future intention deduplicated: kind={}",
+                        getattr(detected, "kind", "reminder"),
+                    )
+                    return dict(item)
+            return None
+    except Exception as error:
+        logger.warning("Future intention not persisted: type={}", type(error).__name__)
+        return None
+
+
+def capture_reminder(
+    conf_uid: str,
+    user_text: str,
+    *,
+    now: Optional[datetime] = None,
+    tz: Optional[str] = None,
+    recent_messages: Optional[Any] = None,
+) -> tuple[str, Optional[Dict[str, Any]]]:
+    """Verified reminder capture: ``(status, stored_row)``.
+
+    Statuses: ``captured`` (persisted), ``clarify`` (referenced payload could
+    not be resolved -- nothing stored), ``none`` (not a reminder) or
+    ``failed`` (the write did not persist). Callers must never report success
+    unless the status is ``captured``.
+    """
+    try:
+        from .future_intentions import detect_reminder_request
+    except Exception:
+        return (REMINDER_FAILED, None)
+    try:
+        detection = detect_reminder_request(
+            user_text, recent_messages, now=now, tz=tz
+        )
+    except Exception as error:
+        logger.debug("Reminder detection failed: type={}", type(error).__name__)
+        return (REMINDER_FAILED, None)
+    if detection.status == "clarify":
+        return (REMINDER_CLARIFY, None)
+    if detection.status != "captured" or detection.intention is None:
+        return (REMINDER_NONE, None)
+    row = _persist_detected_intention(conf_uid, detection.intention)
+    return (REMINDER_CAPTURED, row) if row else (REMINDER_FAILED, None)
+
+
 def record_future_intention(
     conf_uid: str,
     user_text: str,
     *,
     now: Optional[datetime] = None,
     tz: Optional[str] = None,
+    recent_messages: Optional[Any] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Detect and persist one explicit reminder request (fail-soft).
+    """Detect and persist one reminder request or natural future plan.
 
-    Tries the narrow reminder grammar first (category A), then the natural
-    future-plan grammar (category B). Returns the stored entry, or None when
-    the turn carried neither. Same-turn duplicates are not stored twice.
+    Tries the explicit reminder grammar and the referential reminder grammar
+    first, then the natural future-plan grammar. Returns the stored entry or
+    None when the turn carried neither (or the reference was ambiguous and
+    needs clarification). Same-turn duplicates are not stored twice.
     Never raises.
     """
     try:
-        from .future_intentions import add_future_intention, detect_any_future_intention
+        from .future_intentions import detect_future_plan
     except Exception:
         return None
+    status, row = capture_reminder(
+        conf_uid, user_text, now=now, tz=tz, recent_messages=recent_messages
+    )
+    if status in (REMINDER_CAPTURED, REMINDER_FAILED):
+        return row
+    if status == REMINDER_CLARIFY:
+        return None
     try:
-        detected = detect_any_future_intention(user_text, now=now, tz=tz)
+        detected = detect_future_plan(user_text, now=now, tz=tz)
     except Exception:
         return None
     if detected is None:
         return None
-    try:
-        import uuid as _uuid
-
-        state = load_character_state(conf_uid)
-        intention_id = _uuid.uuid4().hex
-        updated = add_future_intention(
-            state.future_intentions, detected, intention_id=intention_id
-        )
-        state.future_intentions = updated
-        if not save_character_state(conf_uid, state):
-            return None
-        logger.info(
-            "Future intention stored: kind={} due_at={} text_chars={}",
-            getattr(detected, "kind", "reminder"),
-            detected.due_at,
-            len(detected.text),
-        )
-        for item in reversed(updated):
-            if item.get("id") == intention_id:
-                return dict(item)
-        return None
-    except Exception as error:
-        logger.warning("Future intention not persisted: type={}", type(error).__name__)
-        return None
+    return _persist_detected_intention(conf_uid, detected)
 
 
 def complete_future_intention(conf_uid: str, intention_id: str) -> bool:
@@ -995,13 +1077,16 @@ def claim_due_future_intentions(
     owner: str,
     now: Optional[datetime] = None,
     lease_seconds: int = 600,
+    max_claims: Optional[int] = None,
+    exclude_ids: Any = None,
 ) -> List[Dict[str, Any]]:
     """Atomically claim due pending reminders for one dispatch attempt.
 
     Returns the claimed rows (with ``claimed_by``/``claim_until``) or an empty
     list when another live attempt owns them. Rows stay ``pending`` so the
     reminder text still renders in the proactive prompt; ``status`` becomes
-    ``done`` only after ``complete_claimed_future_intentions``.
+    ``done`` only after ``complete_claimed_future_intentions``. ``exclude_ids``
+    lets the dispatcher skip rows that are in a per-row retry window.
     """
     try:
         from .future_intentions import claim_due_intentions as _claim
@@ -1014,6 +1099,8 @@ def claim_due_future_intentions(
                 now=now,
                 owner=owner,
                 lease_seconds=lease_seconds,
+                max_claims=max_claims,
+                exclude_ids=exclude_ids,
             )
             if not claimed:
                 return []
@@ -1024,6 +1111,63 @@ def claim_due_future_intentions(
     except Exception as error:
         logger.debug("Future intention claim failed: type={}", type(error).__name__)
         return []
+
+
+def recover_stale_claims(
+    conf_uid: str,
+) -> Optional[int]:
+    """Clear reminder claims left by a provably dead process.
+
+    Runs once per character per process (the handler calls it when a history
+    becomes active). Safety comes from :mod:`claim_identity`: a claim held by
+    a live process -- including a second instance sharing this data directory
+    -- is never touched, and a legacy owner without a process token falls
+    back to the lease. Only rows that are still ``pending`` are considered;
+    ``done`` rows are terminal. Returns the number of claims cleared, or
+    ``None`` when the state could not be read/written so the caller may retry
+    on a later activation instead of waiting for the lease.
+    """
+    if not conf_uid:
+        return 0
+    try:
+        from .claim_identity import owner_is_dead
+        from .future_intentions import normalize_stored_intention
+
+        filepath = get_character_state_path(conf_uid)
+        with _get_state_lock(filepath):
+            state = load_character_state(conf_uid)
+            rows: List[Dict[str, Any]] = []
+            cleared = 0
+            for item in state.future_intentions or []:
+                parsed = normalize_stored_intention(item)
+                if parsed is None:
+                    rows.append(item)
+                    continue
+                holder = parsed.get("claimed_by", "")
+                if (
+                    parsed.get("status") == "pending"
+                    and holder
+                    and owner_is_dead(holder)
+                ):
+                    parsed.pop("claimed_by", None)
+                    parsed.pop("claim_until", None)
+                    cleared += 1
+                rows.append(parsed)
+            if not cleared:
+                return 0
+            state.future_intentions = rows
+            if not save_character_state(conf_uid, state):
+                return None
+            logger.info(
+                "Reminder claims recovered from dead processes: count={}",
+                cleared,
+            )
+            return cleared
+    except Exception as error:
+        logger.debug(
+            "Reminder claim recovery skipped: type={}", type(error).__name__
+        )
+        return None
 
 
 def complete_claimed_future_intentions(

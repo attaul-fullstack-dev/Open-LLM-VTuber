@@ -73,15 +73,50 @@ _PLAN_SUBJECT = re.compile(
     re.IGNORECASE,
 )
 
-# Future markers for natural plans: explicit anchors plus intent verbs.
-# Kept narrow on purpose; habitual/uncertain wording is rejected elsewhere.
-_PLAN_MARKER = re.compile(
+# Strong plan markers: an explicit future anchor or a strong intent verb.
+# These are enough with a first-person subject. "mau" is deliberately NOT
+# here: bare "aku mau ..." is also how people ask for things or describe an
+# immediate desire, so it needs a separate substance check below.
+_PLAN_STRONG_MARKER = re.compile(
     r"\b(?:besok|lusa|nanti|minggu\s+depan|bulan\s+depan|tahun\s+depan|"
     r"senin|selasa|rabu|kamis|jumat|sabtu|minggu|"
     r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
     r"tomorrow|next\s+week|next\s+month|"
-    r"bakal|akan|mau\b|rencana|berencana|planning|will\b|going\s+to|"
+    r"bakal|akan|rencana|berencana|planning|will\b|going\s+to|"
     r"jam\s*\d{1,2}(?:[:.]\d{2})?|pukul\s*\d{1,2}(?:[:.]\d{2})?)\b",
+    re.IGNORECASE,
+)
+
+# "mau" is a weak marker. It is accepted only when the clause is a concrete
+# plan, not a request for help or a vague immediate desire.
+_PLAN_MAU = re.compile(r"\bmau\b", re.IGNORECASE)
+
+# Requests / vague desire clauses that must never be stored as plans.
+# Examples: "aku mau minta tolong anu", "mau yang enak enak", "mau itu lagi".
+_PLAN_MAU_REJECT = re.compile(
+    r"\bmau\s+(?:yang|itu|ini|anu|apa|sih|dong|deh|aja|saja|juga|lagi)\b|"
+    r"\bmau\s+(?:minta|mohon)\b|"
+    r"\bmau\s+(?:tolong|bantuan|dibantu)\b",
+    re.IGNORECASE,
+)
+
+# A request for help is not a plan, even when the sentence has a strong
+# future marker ("aku akan minta tolong ...").
+_PLAN_REQUEST = re.compile(
+    r"\b(?:minta\s+(?:tolong|bantuan)|mohon)\b",
+    re.IGNORECASE,
+)
+
+# Concrete actions that make a bare "aku mau ..." a future plan even without
+# an explicit time. Kept narrow; false negatives are acceptable here.
+_PLAN_MAU_ACTION = re.compile(
+    r"\bmau\b[^.!?]{0,80}?\b(?:mulai|memulai|belajar|nanya|bertanya|"
+    r"pergi|berangkat|datang|pulang|bikin|membuat|kerjakan|mengerjakan|"
+    r"selesai|menyelesaikan|ikut|mengikuti|ambil|mengambil|beli|membeli|"
+    r"pesan|memesan|masak|memasak|latihan|berlatih|nulis|menulis|"
+    r"baca|membaca|kerja|bekerja|kuliah|sekolah|olahraga|pindah|"
+    r"buka|membuka|daftar|mendaftar|cari|mencari|revisi|ngoding|coding|"
+    r"meeting|presentasi|jalan-jalan)\b",
     re.IGNORECASE,
 )
 
@@ -108,6 +143,42 @@ _RECALL_QUESTION = re.compile(
     re.IGNORECASE,
 )
 
+# Delivery verbs: the user tells Mili WHAT to say, without naming the product
+# word "reminder". Only combined with a context reference below, so ordinary
+# "nanti jam 7 bilang ke ibu" is not captured.
+_DELIVERY_VERB = re.compile(
+    r"\b(?:bilang(?:in)?|ucapin|ucapkan|sampaikan|kirim|sebutin|sebutkan|"
+    r"ulangi|ulang|katakan)\b",
+    re.IGNORECASE,
+)
+
+# Context references: the payload lives in the previous conversation turn.
+# This is the narrow bridge between "bilang kaya tadi lagi ya" and the earlier
+# explicit reminder ("... dengan bilang 'TES PENGINGAT BERHASIL'").
+_CONTEXT_REFERENCE = re.compile(
+    r"\b(?:kaya(?:k)?\s+tadi|seperti\s+tadi|sama\s+(?:kaya(?:k)?|seperti)\s+tadi|"
+    r"yang\s+tadi|tadi\s+lagi|lagi\s+kaya(?:k)?\s+tadi|ulangi|ulang)\b",
+    re.IGNORECASE,
+)
+
+# Quoted payload: the literal words to deliver.
+_QUOTED_PAYLOAD = re.compile(
+    r"['\"\u201c\u201d\u2018\u2019]([^'\"\u201c\u201d\u2018\u2019]{2,200})"
+    r"['\"\u201c\u201d\u2018\u2019]"
+)
+
+# Unquoted "bilang <payload>" form, used only when reading EARLIER turns.
+_SAY_PAYLOAD = re.compile(
+    r"\b(?:bilang(?:in)?|ucapin|ucapkan|sampaikan|kirim|sebutin|sebutkan|"
+    r"katakan)\s+(?:dengan\s+)?(?:bahwa\s+)?(.{2,160})",
+    re.IGNORECASE,
+)
+
+_TRAILING_FILLER = re.compile(
+    r"(?:\s+(?:ya|yah|dong|deh|sih|oke|ok|nanti|lagi)\b[\s.!?]*)+$",
+    re.IGNORECASE,
+)
+
 _JAM = re.compile(
     r"(?:jam|pukul)?\s*(\d{1,2})(?:[:.](\d{2}))?",
     re.IGNORECASE,
@@ -123,6 +194,7 @@ class FutureIntention:
     created_at: str  # UTC ISO-8601
     kind: str = KIND_REMINDER  # KIND_REMINDER | KIND_PLAN
     tz: Optional[str] = None  # user tz name at capture (audit only)
+    delivery_text: Optional[str] = None  # resolved payload for referential reminders
 
 
 # Weekday (full names only — shorts are ambiguous) → Python weekday().
@@ -273,10 +345,11 @@ def detect_future_plan(
 ) -> Optional[FutureIntention]:
     """Detect ONE natural future plan in a single user turn (category B).
 
-    Requires first-person subject + future marker + minimal substance.
-    Rejects hypotheticals (C), questions (D), habitual/general statements
-    (E) and stage-direction roleplay frames (F). Undated plans return
-    ``due_at=None``: stored and recallable, never proactively due.
+    Requires first-person subject + a strong future marker, or a weak
+    "mau" clause with concrete plan substance. Rejects hypotheticals (C),
+    questions (D), habitual/general statements (E), stage-direction roleplay
+    frames (F), requests for help, and vague immediate desires. Undated plans
+    return ``due_at=None``: stored and recallable, never proactively due.
     Pure and deterministic.
     """
     text = _normalize(user_text)
@@ -294,8 +367,21 @@ def detect_future_plan(
         return None
     if not _PLAN_SUBJECT.search(text):
         return None
-    if not _PLAN_MARKER.search(text):
+    if _PLAN_REQUEST.search(text):
         return None
+
+    has_strong_marker = bool(_PLAN_STRONG_MARKER.search(text))
+    has_mau = bool(_PLAN_MAU.search(text))
+    if not has_strong_marker and not has_mau:
+        return None
+    if has_mau:
+        # "mau" is not enough by itself: reject requests and vague desires.
+        if _PLAN_MAU_REJECT.search(text):
+            return None
+        # Without a time/strong intent, require a concrete plan action.
+        if not has_strong_marker and not _PLAN_MAU_ACTION.search(text):
+            return None
+
     moment = _now_aware(now)
     zone = _resolve_tz(tz)
     return FutureIntention(
@@ -317,6 +403,138 @@ def detect_any_future_intention(
     if found is not None:
         return found
     return detect_future_plan(user_text, now=now, tz=tz)
+
+
+@dataclass(frozen=True)
+class ReminderDetection:
+    """Outcome of reading one turn for a reminder request.
+
+    ``status`` is one of ``captured`` (payload known), ``clarify`` (the turn
+    clearly asks for a reminder but the referenced payload cannot be resolved
+    from context) or ``none`` (ordinary conversation).
+    """
+
+    status: str
+    intention: Optional[FutureIntention] = None
+    reason: str = ""
+
+
+def _quoted(text: Any) -> Optional[str]:
+    for match in _QUOTED_PAYLOAD.finditer(str(text or "")):
+        value = _normalize(match.group(1)).strip(" .,!?:;")
+        if len(value) >= 2:
+            return value
+    return None
+
+
+def _say_payload(text: Any) -> Optional[str]:
+    """Extract an unquoted "bilang X" payload from a PRIOR turn."""
+    match = _SAY_PAYLOAD.search(str(text or ""))
+    if not match:
+        return None
+    value = _normalize(match.group(1))
+    value = _TRAILING_FILLER.sub("", value).strip(" .,!?:;'\"")
+    if len(value) < 2 or _CONTEXT_REFERENCE.search(value):
+        return None
+    return value
+
+
+def resolve_referenced_payload(
+    text: Any,
+    recent_messages: Optional[Any] = None,
+) -> Optional[str]:
+    """Resolve WHAT to say for a referential reminder, or None if ambiguous.
+
+    Order: a quoted payload in this turn, then the most recent quoted payload
+    in the conversation, then an unquoted "bilang X" from an earlier turn.
+    Pure and deterministic; never invents content.
+    """
+    direct = _quoted(text)
+    if direct:
+        return direct
+    messages = list(recent_messages or [])[-8:]
+    for message in reversed(messages):
+        content = message.get("content") if isinstance(message, dict) else message
+        found = _quoted(content)
+        if found:
+            return found
+    for message in reversed(messages):
+        content = message.get("content") if isinstance(message, dict) else message
+        found = _say_payload(content)
+        if found:
+            return found
+    return None
+
+
+def detect_contextual_reminder(
+    user_text: Any,
+    recent_messages: Optional[Any] = None,
+    now: Optional[datetime] = None,
+    tz: Optional[str] = None,
+) -> ReminderDetection:
+    """Detect a reminder phrased by reference instead of by verb.
+
+    Narrow by construction: it requires a future anchor AND a delivery verb
+    AND a context reference ("kaya tadi", "seperti tadi", "ulangi", ...).
+    That keeps ordinary mentions ("nanti jam 7 aku bilang ke ibu") out while
+    accepting the real case "nanti jam 11.54 bilang kaya tadi lagi ya".
+
+    When the referenced payload cannot be resolved the result is ``clarify``
+    and NOTHING is stored: the caller must ask a clarifying question instead
+    of silently inventing what to say.
+    """
+    text = _normalize(user_text)
+    if not text or len(text) > _MAX_INTENTION_CHARS:
+        return ReminderDetection("none")
+    if text.rstrip().endswith(("?", "\uff1f")):
+        return ReminderDetection("none")
+    if _RECALL_QUESTION.match(text) or _HYPOTHETICAL.search(text):
+        return ReminderDetection("none")
+    if not _FUTURE_ANCHOR.search(text):
+        return ReminderDetection("none")
+    if not _DELIVERY_VERB.search(text) or not _CONTEXT_REFERENCE.search(text):
+        return ReminderDetection("none")
+    moment = _now_aware(now)
+    zone = _resolve_tz(tz)
+    payload = resolve_referenced_payload(text, recent_messages)
+    if not payload:
+        return ReminderDetection("clarify", reason="unresolved_reference")
+    return ReminderDetection(
+        "captured",
+        intention=FutureIntention(
+            text=text,
+            due_at=_parse_due_at(text, moment, zone),
+            created_at=_utc_iso(moment),
+            kind=KIND_REMINDER,
+            tz=str(tz or "") or None,
+            delivery_text=payload,
+        ),
+    )
+
+
+def detect_reminder_request(
+    user_text: Any,
+    recent_messages: Optional[Any] = None,
+    now: Optional[datetime] = None,
+    tz: Optional[str] = None,
+) -> ReminderDetection:
+    """Read one turn for a reminder: explicit grammar first, then reference."""
+    explicit = detect_future_intention(user_text, now=now, tz=tz)
+    if explicit is not None:
+        payload = _quoted(user_text)
+        if payload and payload != explicit.text:
+            explicit = FutureIntention(
+                text=explicit.text,
+                due_at=explicit.due_at,
+                created_at=explicit.created_at,
+                kind=explicit.kind,
+                tz=explicit.tz,
+                delivery_text=payload,
+            )
+        return ReminderDetection("captured", intention=explicit)
+    return detect_contextual_reminder(
+        user_text, recent_messages, now=now, tz=tz
+    )
 
 
 def normalize_stored_intention(item: Any) -> Optional[Dict[str, Any]]:
@@ -353,6 +571,9 @@ def normalize_stored_intention(item: Any) -> Optional[Dict[str, Any]]:
     if claimed_by and claim_until:
         normalized["claimed_by"] = claimed_by
         normalized["claim_until"] = claim_until
+    delivery_text = _normalize(item.get("delivery_text", ""))
+    if delivery_text:
+        normalized["delivery_text"] = delivery_text
     return normalized
 
 
@@ -405,6 +626,37 @@ def due_intentions(
     return out
 
 
+def next_due_at(
+    stored: Any,
+    now: Optional[datetime] = None,
+    exclude_ids: Any = None,
+) -> Optional[datetime]:
+    """Earliest pending ``due_at`` (past or future), or None.
+
+    Used by the scheduler to sleep exactly until the next reminder instead of
+    waiting for an unrelated idle interval. Pure read. ``exclude_ids`` skips
+    rows currently in their per-row retry window so the scheduler can wake for
+    another due row instead of the excluded one.
+    """
+    excluded = {
+        _normalize(value)
+        for value in (
+            [exclude_ids] if isinstance(exclude_ids, str) else (exclude_ids or [])
+        )
+    }
+    excluded.discard("")
+    earliest: Optional[datetime] = None
+    for item in pending_intentions(stored):
+        if item["id"] in excluded:
+            continue
+        stamp = _parse_iso(item.get("due_at"))
+        if stamp is None:
+            continue
+        if earliest is None or stamp < earliest:
+            earliest = stamp
+    return earliest
+
+
 def _claim_expired(row: Dict[str, Any], moment: datetime) -> bool:
     until = _parse_iso(row.get("claim_until"))
     return until is None or until <= moment
@@ -416,6 +668,8 @@ def claim_due_intentions(
     now: Optional[datetime] = None,
     owner: str = "",
     lease_seconds: int = 600,
+    max_claims: Optional[int] = None,
+    exclude_ids: Any = None,
 ) -> tuple:
     """Claim due pending intentions for one dispatch attempt (pure).
 
@@ -425,11 +679,28 @@ def claim_due_intentions(
     interrupted sender) can be taken over. Claiming never changes ``status``:
     the row stays ``pending`` so the reminder text still reaches the prompt,
     and it becomes ``done`` only after a verified delivery.
+
+    ``max_claims`` caps how many rows one dispatch may take. The live
+    dispatcher passes ``1`` so a turn carries exactly one reminder and can
+    only complete the row it was generated for; ``None`` keeps the legacy
+    all-due behavior for pure callers and tests.
+
+    ``exclude_ids`` skips rows that are in their own retry window, allowing
+    another due row to be attempted without marking the failed row done or
+    dropping its pending status.
     """
     moment = _now_aware(now)
     claimant = _normalize(owner)
     if not claimant:
         return (list(stored or []), [])
+    excluded = {
+        _normalize(value)
+        for value in (
+            [exclude_ids] if isinstance(exclude_ids, str) else (exclude_ids or [])
+        )
+    }
+    excluded.discard("")
+    limit = None if max_claims is None else max(1, int(max_claims))
     lease_until = moment + timedelta(seconds=max(1, int(lease_seconds)))
     out = []
     claimed = []
@@ -445,7 +716,13 @@ def claim_due_intentions(
                 and holder != claimant
                 and not _claim_expired(parsed, moment)
             )
-            if stamp is not None and stamp <= moment and not blocked:
+            if (
+                parsed["id"] not in excluded
+                and stamp is not None
+                and stamp <= moment
+                and not blocked
+                and (limit is None or len(claimed) < limit)
+            ):
                 claimed_row = dict(parsed)
                 claimed_row["claimed_by"] = claimant
                 claimed_row["claim_until"] = _utc_iso(lease_until)
@@ -562,6 +839,9 @@ def add_future_intention(
             "tz": getattr(detected, "tz", None),
         }
     )
+    delivery_text = _normalize(getattr(detected, "delivery_text", "") or "")
+    if delivery_text:
+        rows[-1]["delivery_text"] = delivery_text
     pending = [row for row in rows if row["status"] == STATUS_PENDING]
     if len(pending) > _MAX_PENDING:
         # Overflow evicts the least recall-critical rows first: undated rows
@@ -703,6 +983,9 @@ def build_future_intention_context(
                     line = "- [" + tag + ", no due time" + stated + "] " + item["text"]
             else:
                 line = "- [" + tag + ", no due time" + stated + "] " + item["text"]
+            payload = _normalize(item.get("delivery_text", ""))
+            if payload and payload.lower() not in item["text"].lower():
+                line += ' -> deliver: "' + payload + '"'
             cost = estimate_tokens(line) + 4
             if used + cost > max_tokens:
                 break
@@ -730,14 +1013,19 @@ __all__ = [
     "KIND_PLAN",
     "KIND_REMINDER",
     "FutureIntention",
+    "ReminderDetection",
     "add_future_intention",
     "build_future_intention_context",
     "cancel_future_intention",
     "complete_future_intention",
     "detect_any_future_intention",
+    "detect_contextual_reminder",
     "detect_future_intention",
     "detect_future_plan",
+    "detect_reminder_request",
     "due_intentions",
+    "next_due_at",
     "normalize_stored_intention",
     "pending_intentions",
+    "resolve_referenced_payload",
 ]
