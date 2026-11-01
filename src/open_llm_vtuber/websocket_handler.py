@@ -1424,6 +1424,7 @@ class WebSocketHandler:
 
                 delivery_probe = _ProactiveDeliveryProbe(websocket.send_text)
                 self.current_conversation_tasks[client_uid] = current_task
+                claims_settled = False
                 try:
                     response = await process_single_conversation(
                         context=context,
@@ -1437,27 +1438,39 @@ class WebSocketHandler:
                             "proactive_due_reminders": due_reminder_texts,
                         },
                     )
+                    delivered = self._reminder_delivery_evidence(delivery_probe, response)
+                    reason = self._reminder_delivery_reason(delivery_probe, response)
+                    self._settle_reminder_claims(
+                        agent,
+                        client_uid,
+                        claim_owner,
+                        claimed_ids,
+                        delivered=delivered,
+                        reason=reason,
+                    )
+                    claims_settled = True
+                    logger.info(
+                        "Independent reminder settled: count={} delivered={} reason={}",
+                        len(claimed_ids),
+                        delivered,
+                        reason,
+                    )
                 finally:
                     heartbeat.cancel()
                     if self.current_conversation_tasks.get(client_uid) is current_task:
                         self.current_conversation_tasks.pop(client_uid, None)
-
-                delivered = self._reminder_delivery_evidence(delivery_probe, response)
-                reason = self._reminder_delivery_reason(delivery_probe, response)
-                self._settle_reminder_claims(
-                    agent,
-                    client_uid,
-                    claim_owner,
-                    claimed_ids,
-                    delivered=delivered,
-                    reason=reason,
-                )
-                logger.info(
-                    "Independent reminder settled: count={} delivered={} reason={}",
-                    len(claimed_ids),
-                    delivered,
-                    reason,
-                )
+                    if not claims_settled and claimed_ids:
+                        delivered = self._reminder_delivery_evidence(
+                            delivery_probe, ""
+                        )
+                        self._settle_reminder_claims(
+                            agent,
+                            client_uid,
+                            claim_owner,
+                            claimed_ids,
+                            delivered=delivered,
+                            reason="cancelled_before_delivery",
+                        )
                 await asyncio.sleep(0.5)
         except asyncio.CancelledError:
             pass

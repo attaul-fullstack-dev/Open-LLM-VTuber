@@ -1597,6 +1597,7 @@ class BasicMemoryAgent(AgentInterface):
         lease_seconds: int = 600,
         max_claims: Optional[int] = 1,
         exclude_ids: Optional[List[str]] = None,
+        kind: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Claim due reminders for this proactive attempt; empty when taken.
 
@@ -1622,6 +1623,7 @@ class BasicMemoryAgent(AgentInterface):
                 lease_seconds=lease_seconds,
                 max_claims=max_claims,
                 exclude_ids=exclude_ids,
+                kind=kind,
             )
             try:
                 refreshed = load_character_state(self._character_conf_uid)
