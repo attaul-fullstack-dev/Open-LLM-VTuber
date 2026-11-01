@@ -1212,6 +1212,7 @@ def claim_due_future_intentions(
     lease_seconds: int = 600,
     max_claims: Optional[int] = None,
     exclude_ids: Any = None,
+    kind: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Atomically claim due pending reminders for one dispatch attempt.
 
@@ -1275,6 +1276,7 @@ def claim_due_future_intentions(
                 lease_seconds=lease_seconds,
                 max_claims=max_claims,
                 exclude_ids=excluded,
+                kind=kind,
             )
             if not claimed:
                 return []

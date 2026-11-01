@@ -151,15 +151,17 @@ def format_temporal_anchor(
     'what time is it' is answered from real time, never guessed or stale.
     """
     local = user_now(moment, tz)
+    utc_moment = ensure_aware(moment).astimezone(timezone.utc)
     date_str = f"{local:%B} {local.day}, {local.year}"
     weekday = f"{local:%A}"
-    clock_str = f"{local:%H:%M}"
+    clock_str = f"{local:%H:%M:%S}"
     zone = resolve_tz(tz)
     tz_label = tz if zone is not None else "UTC"
+    utc_iso_str = utc_moment.strftime("%Y-%m-%dT%H:%M:%SZ")
     return (
         f"Current date: {date_str} ({weekday})\n"
         f"Current time: {clock_str}\n"
-        f"Timezone: {tz_label}"
+        f"Timezone: {tz_label} (UTC {utc_iso_str})"
     )
 
 

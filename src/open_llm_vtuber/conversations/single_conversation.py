@@ -289,7 +289,7 @@ async def process_single_conversation(
     # probe is read AFTER the turn has flushed its queue (see the settlement
     # just before the history write).
     proactive_partial_undecided = False
-    proactive = bool((metadata or {}).get("request_origin") == "proactive")
+    proactive = bool((metadata or {}).get("request_origin") in ("proactive", "reminder"))
     # Stable identity of the assistant message this turn produces. A caller
     # that REDELIVERS a message (e.g. a reminder retry) supplies the id it
     # used before via metadata["msg_id"]; otherwise a fresh one is minted.

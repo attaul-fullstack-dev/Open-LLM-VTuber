@@ -63,14 +63,17 @@ _REMINDER_VERB = re.compile(
     r"bangunin|bangunkan|"
     r"tanyakan|tanya|tanyain|tanya(?:kan)?\s+(?:ke\s+aku|sama\s+aku|apakah)|"
     r"kabari|kabarin|kasih\s+tahu|kasih\s+tau|beritahu|beritahu\s+aku|"
-    r"cek|periksa|follow\s*up"
+    r"cek|periksa|follow\s*up|"
+    r"bilang(?:in)?(?:\s+(?:ke\s+aku|sama\s+aku|padaku))?"
     r")\b",
     re.IGNORECASE,
 )
 
 # Indonesian & English number words for relative time intervals
 _NUMBER_WORDS = {
+    "seperempat": 0.25,
     "setengah": 0.5,
+    "tiga perempat": 0.75,
     "se": 1.0,
     "satu": 1.0,
     "dua": 2.0,
@@ -97,12 +100,12 @@ _NUMBER_WORDS = {
 }
 
 _RELATIVE_RE = re.compile(
-    r"(?:dalam\s+)?(?P<val>\d+(?:\.\d+)?|setengah|se|satu|dua|tiga|empat|lima|enam|tujuh|delapan|sembilan|sepuluh|sebelas|dua\s*belas|duabelas|lima\s*belas|limabelas|dua\s*puluh|duapuluh|tiga\s*puluh|tigapuluh|empat\s*puluh|lima\s*puluh)\s*(?P<unit>detik|menit|jam|hari|minggu|seconds?|minutes?|hours?|days?|weeks?)(?:\s+lagi)?",
+    r"(?:dalam\s+)?(?P<val>\d+(?:\.\d+)?|seperempat|setengah|tiga\s*perempat|se|satu|dua|tiga|empat|lima|enam|tujuh|delapan|sembilan|sepuluh|sebelas|dua\s*belas|duabelas|lima\s*belas|limabelas|dua\s*puluh|duapuluh|tiga\s*puluh|tigapuluh|empat\s*puluh|lima\s*puluh)\s*(?P<unit>detik|menit|jam|hari|minggu|seconds?|minutes?|hours?|days?|weeks?)(?:\s+lagi)?",
     re.IGNORECASE,
 )
 
 _SHORTHAND_RE = re.compile(
-    r"(?:dalam\s+)?(?P<short>setengah\s+jam|sejam|semenit|sehari|seminggu)(?:\s+lagi)?",
+    r"(?:dalam\s+)?(?P<short>setengah\s+jam|seperempat\s+jam|sejam|semenit|sehari|seminggu)(?:\s+lagi)?",
     re.IGNORECASE,
 )
 
@@ -114,6 +117,8 @@ def parse_relative_delta(text: str) -> Optional[timedelta]:
         s = m_short.group("short").lower().replace(" ", "")
         if s == "setengahjam":
             return timedelta(minutes=30)
+        if s == "seperempatjam":
+            return timedelta(minutes=15)
         if s == "sejam":
             return timedelta(hours=1)
         if s == "semenit":
@@ -137,7 +142,7 @@ def parse_relative_delta(text: str) -> Optional[timedelta]:
             if unit in ("menit", "minute", "minutes"):
                 return timedelta(minutes=val)
             if unit in ("jam", "hour", "hours"):
-                return timedelta(hours=val)
+                return timedelta(minutes=int(val * 60)) if val < 1.0 else timedelta(hours=val)
             if unit in ("hari", "day", "days"):
                 return timedelta(days=val)
             if unit in ("minggu", "week", "weeks"):
@@ -153,14 +158,16 @@ _FUTURE_ANCHOR = re.compile(
     r"besok|lusa|nanti|sore\s+ini|malam\s+ini|hari\s+ini|pagi\s+ini|siang\s+ini|"
     r"minggu\s+depan|bulan\s+depan|tahun\s+depan|"
     r"tomorrow|tonight|next\s+week|next\s+month|"
+    r"(?:senin|selasa|rabu|kamis|jumat|sabtu|minggu)\s+depan|"
+    r"next\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
     r"hari\s+(?:senin|selasa|rabu|kamis|jumat|sabtu|minggu)|"
     r"senin|selasa|rabu|kamis|jumat|sabtu|minggu|"
     r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
     r"jam\s*\d{1,2}(?:[:.]\d{2})?|pukul\s*\d{1,2}(?:[:.]\d{2})?|"
     r"\b\d{1,2}[:.]\d{2}\b|"
-    r"(?:dalam\s+)?(?:\d+|setengah|se|satu|dua|tiga|empat|lima|enam|tujuh|delapan|sembilan|sepuluh|sebelas|dua\s*belas|duabelas|lima\s*belas|limabelas|dua\s*puluh|duapuluh|tiga\s*puluh|tigapuluh)\s*(?:detik|menit|jam|hari|minggu)\s+lagi|"
-    r"dalam\s+(?:\d+|setengah|se|satu|dua|tiga|empat|lima|enam|tujuh|delapan|sembilan|sepuluh|sebelas|dua\s*belas|duabelas|lima\s*belas|limabelas|dua\s*puluh|duapuluh|tiga\s*puluh|tigapuluh)\s*(?:detik|menit|jam|hari|minggu)|"
-    r"(?:dalam\s+)?(?:setengah\s+jam|sejam|semenit|sehari|seminggu)(?:\s+lagi)?|"
+    r"(?:dalam\s+)?(?:\d+|seperempat|setengah|tiga\s*perempat|se|satu|dua|tiga|empat|lima|enam|tujuh|delapan|sembilan|sepuluh|sebelas|dua\s*belas|duabelas|lima\s*belas|limabelas|dua\s*puluh|duapuluh|tiga\s*puluh|tigapuluh)\s*(?:detik|menit|jam|hari|minggu)\s+lagi|"
+    r"dalam\s+(?:\d+|seperempat|setengah|tiga\s*perempat|se|satu|dua|tiga|empat|lima|enam|tujuh|delapan|sembilan|sepuluh|sebelas|dua\s*belas|duabelas|lima\s*belas|limabelas|dua\s*puluh|duapuluh|tiga\s*puluh|tigapuluh)\s*(?:detik|menit|jam|hari|minggu)|"
+    r"(?:dalam\s+)?(?:setengah\s+jam|seperempat\s+jam|sejam|semenit|sehari|seminggu)(?:\s+lagi)?|"
     r"pagi|siang|sore|malam"
     r")\b",
     re.IGNORECASE,
@@ -213,7 +220,8 @@ _CASUAL_BANTER_REJECT = re.compile(
     r"kontol|memek|pepek|itil|hantam|telanjang|binal|cabul|manjain|"
     r"ronde\s+\d+|ronde\s+kedua|ronde\s+ketiga|ronde\s+keempat|lubang|"
     r"kucing\s+yang\s+penurut|tendang\s+istri|"
-    r"asik\b|wah\b|aduh\b|haha\b|hehe\b|wkwk\b|lol\b|canda\b|bercanda\b"
+    r"asik\b|wah\b|aduh\b|haha\b|hehe\b|wkwk\b|lol\b|canda\b|bercanda\b|"
+    r"seru\b|serunya\b|deg-degan|degdegan"
     r")\b",
     re.IGNORECASE,
 )
@@ -231,7 +239,8 @@ _PLAN_ACTION_VERBS = re.compile(
     r"meeting|presentasi|jalan-jalan|liburan|pindah|istirahat|tidur|bangun|"
     r"cek|periksa|mengecek|evaluasi|diskusi|telepon|hubungi|chat|kirim|unggah|upload|"
     r"download|install|deploy|tes|testing|uji|"
-    r"ingat(?:kan)?|inget(?:in)?"
+    r"ingat(?:kan)?|inget(?:in)?|"
+    r"makan|minum|kunjung|mengunjungi|ketemu|bertemu|nonton|menonton|belanja|main|bermain|push\s*up"
     r")\b",
     re.IGNORECASE,
 )
@@ -449,19 +458,34 @@ def _parse_due_at(
             if re.search(r"\b" + name + r"\b", lowered):
                 days_ahead = (weekday - local_now.weekday()) % 7
                 hour, minute = _jam_or(7)
+                is_depan = bool(
+                    re.search(r"\b" + name + r"\s+depan\b|\bnext\s+" + name + r"\b", lowered)
+                )
                 if days_ahead == 0:
                     cand_local = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
                     if cand_local <= local_now:
                         days_ahead = 7
+                if is_depan and days_ahead < 7:
+                    days_ahead += 7
                 day = local_now + timedelta(days=days_ahead)
                 return _at(day, hour, minute)
 
         # 3. Relative days
+        if "kapan-kapan" in lowered or "kapan kapan" in lowered:
+            return None
         if "lusa" in lowered or "day after tomorrow" in lowered:
             day = local_now + timedelta(days=2)
             hour, minute = _jam_or(7)
             return _at(day, hour, minute)
         if "besok" in lowered or "tomorrow" in lowered:
+            is_bare_besok_prompt = bool(
+                re.search(
+                    r"^(?:tolong\s+)?(?:besok\s+(?:inget(?:in|kan)|ingatkan)(?:\s+aku)?|(?:inget(?:in|kan)|ingatkan)(?:\s+aku)?\s+besok)[\s.!?]*$",
+                    lowered,
+                )
+            )
+            if is_bare_besok_prompt:
+                return None
             day = local_now + timedelta(days=1)
             hour, minute = _jam_or(7)
             return _at(day, hour, minute)
@@ -740,11 +764,14 @@ def detect_contextual_reminder(
     payload = resolve_referenced_payload(text, recent_messages)
     if not payload:
         return ReminderDetection("clarify", reason="unresolved_reference")
+    due_at = _parse_due_at(text, moment, zone)
+    if due_at is None:
+        return ReminderDetection("clarify", reason="unspecified_time")
     return ReminderDetection(
         "captured",
         intention=FutureIntention(
             text=text,
-            due_at=_parse_due_at(text, moment, zone),
+            due_at=due_at,
             created_at=_utc_iso(moment),
             kind=KIND_REMINDER,
             tz=str(tz or "") or None,
@@ -768,6 +795,12 @@ def detect_reminder_request(
     """
     explicit = detect_future_intention(user_text, now=now, tz=tz)
     if explicit is not None:
+        if explicit.due_at is None:
+            lowered = str(user_text or "").lower()
+            if re.search(r"\b(?:nanti|besok)\b", lowered):
+                # Ambiguous/unspecified time ("nanti ingetin aku", "besok ingetin aku"): request clarification,
+                # never store an active reminder with a missing or guessed due_at.
+                return ReminderDetection("clarify", reason="unspecified_time")
         quoted = _quoted_all(user_text)
         concrete = [
             value
@@ -895,6 +928,7 @@ def next_due_at(
     stored: Any,
     now: Optional[datetime] = None,
     exclude_ids: Any = None,
+    kind: Optional[str] = None,
 ) -> Optional[datetime]:
     """Earliest pending ``due_at`` (past or future), or None.
 
@@ -913,6 +947,8 @@ def next_due_at(
     earliest: Optional[datetime] = None
     for item in pending_intentions(stored):
         if item["id"] in excluded:
+            continue
+        if kind is not None and item.get("kind") != kind:
             continue
         stamp = _parse_iso(item.get("due_at"))
         if stamp is None:
@@ -935,6 +971,7 @@ def claim_due_intentions(
     lease_seconds: int = 600,
     max_claims: Optional[int] = None,
     exclude_ids: Any = None,
+    kind: Optional[str] = None,
 ) -> tuple:
     """Claim due pending intentions for one dispatch attempt (pure).
 
@@ -985,7 +1022,13 @@ def claim_due_intentions(
         blocked = bool(holder) and holder != claimant and not _claim_expired(
             row, moment
         )
-        if row["id"] in excluded or stamp is None or stamp > moment or blocked:
+        if (
+            row["id"] in excluded
+            or stamp is None
+            or stamp > moment
+            or blocked
+            or (kind is not None and row.get("kind") != kind)
+        ):
             continue
         eligible.append(row)
     # Reminders are user obligations and must never be starved by a due future

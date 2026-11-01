@@ -336,6 +336,8 @@ class WebSocketHandler:
         self.default_context_cache = default_context_cache
         self.received_data_buffers: Dict[str, np.ndarray] = {}
         self._proactive_timer_tasks: Dict[str, asyncio.Task] = {}
+        self._reminder_scheduler_tasks: Dict[str, asyncio.Task] = {}
+        self._reminder_wakeup_events: Dict[str, asyncio.Event] = {}
         self._proactive_states: Dict[str, Dict[str, ProactiveRuntimeState]] = {}
         # Earliest time each failed reminder row may be retried (UTC), keyed
         # by client then row id. Per-row pacing means one failing reminder
@@ -515,9 +517,84 @@ class WebSocketHandler:
         except asyncio.CancelledError:
             pass
 
+    def _reminder_conditions_allow(
+        self,
+        client_uid: str,
+        history_uid: str,
+    ) -> bool:
+        context = self.client_contexts.get(client_uid)
+        websocket = self.client_connections.get(client_uid)
+        if (
+            not context
+            or not websocket
+            or context.history_uid != history_uid
+            or client_uid in self._proactive_maintenance
+        ):
+            return False
+        group = self.chat_group_manager.get_client_group(client_uid)
+        return not group or len(group.members) <= 1
+
+    async def _cancel_reminder_scheduler(self, client_uid: str) -> None:
+        if not hasattr(self, "_reminder_scheduler_tasks"):
+            self._reminder_scheduler_tasks = {}
+        if not hasattr(self, "_reminder_wakeup_events"):
+            self._reminder_wakeup_events = {}
+        task = self._reminder_scheduler_tasks.pop(client_uid, None)
+        self._reminder_wakeup_events.pop(client_uid, None)
+        if not task or task.done() or task is asyncio.current_task():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    def _wake_reminder_scheduler(self, client_uid: str) -> None:
+        if not hasattr(self, "_reminder_wakeup_events"):
+            self._reminder_wakeup_events = {}
+        event = self._reminder_wakeup_events.get(client_uid)
+        if event is not None:
+            event.set()
+
+    async def _ensure_reminder_scheduler(
+        self,
+        client_uid: str,
+        history_uid: Optional[str],
+    ) -> None:
+        """Start or wake the independent high-priority reminder scheduler."""
+        if not hasattr(self, "_reminder_scheduler_tasks"):
+            self._reminder_scheduler_tasks = {}
+        if not hasattr(self, "_reminder_wakeup_events"):
+            self._reminder_wakeup_events = {}
+        if not history_uid or client_uid not in self.client_connections:
+            return
+        context = self.client_contexts.get(client_uid)
+        if not context:
+            return
+        self._recover_stale_reminder_claims(context)
+        task = self._reminder_scheduler_tasks.get(client_uid)
+        if task is not None and not task.done():
+            self._wake_reminder_scheduler(client_uid)
+            return
+
+        wakeup_event = self._reminder_wakeup_events.setdefault(client_uid, asyncio.Event())
+        wakeup_event.clear()
+        self._reminder_scheduler_tasks[client_uid] = asyncio.create_task(
+            self._run_reminder_scheduler(client_uid, history_uid),
+            name=f"reminder-scheduler-{client_uid}-{history_uid}",
+        )
+
+    def _has_active_reminder_scheduler(self, client_uid: str) -> bool:
+        tasks = getattr(self, "_reminder_scheduler_tasks", None)
+        if not isinstance(tasks, dict):
+            return False
+        task = tasks.get(client_uid)
+        return bool(task is not None and not task.done())
+
     async def _pause_proactive_for_maintenance(self, client_uid: str) -> None:
         self._proactive_maintenance.add(client_uid)
         await self._cancel_proactive_timer(client_uid)
+        await self._cancel_reminder_scheduler(client_uid)
 
     async def _resume_proactive_after_maintenance(
         self, client_uid: str, context: ServiceContext
@@ -571,6 +648,8 @@ class WebSocketHandler:
         if not context:
             return
         self._recover_stale_reminder_claims(context)
+        # Always ensure independent high-priority reminder scheduler is running
+        await self._ensure_reminder_scheduler(client_uid, history_uid)
         try:
             machine = self._proactive_machines.get(client_uid)
             config = self._proactive_config(context)
@@ -957,7 +1036,10 @@ class WebSocketHandler:
             store.pop(client_uid, None)
 
     def _next_reminder_due_delay(
-        self, client_uid: str, context: Optional[ServiceContext]
+        self,
+        client_uid: str,
+        context: Optional[ServiceContext],
+        kind: Optional[str] = None,
     ) -> Optional[float]:
         """Seconds until the next due row that is not in per-row backoff."""
         agent = getattr(context, "agent_engine", None) if context else None
@@ -966,12 +1048,15 @@ class WebSocketHandler:
             return None
         excluded_ids = self._reminder_retry_exclusions(client_uid)
         try:
-            stamp = next_due(utcnow(), exclude_ids=excluded_ids)
+            stamp = next_due(utcnow(), exclude_ids=excluded_ids, kind=kind)
         except TypeError:
             try:
-                stamp = next_due(utcnow())
-            except Exception:
-                return None
+                stamp = next_due(utcnow(), exclude_ids=excluded_ids)
+            except TypeError:
+                try:
+                    stamp = next_due(utcnow())
+                except Exception:
+                    return None
         except Exception:
             return None
         if stamp is None:
@@ -1097,6 +1182,8 @@ class WebSocketHandler:
                     await task
                 except asyncio.CancelledError:
                     pass
+        # Wake the independent reminder scheduler to immediately account for any new intentions
+        self._wake_reminder_scheduler(client_uid)
 
     def _proactive_conditions_allow(
         self,
@@ -1183,6 +1270,208 @@ class WebSocketHandler:
             ),
         )
 
+    async def _run_reminder_scheduler(
+        self,
+        client_uid: str,
+        history_uid: str,
+    ) -> None:
+        """Independent high-priority scheduler for scheduled reminders.
+
+        Runs completely decoupled from ProactiveStateMachine and idle intervals.
+        Executes immediately when due_at arrives without waiting for idle rolls or gate checks.
+        """
+        current_task = asyncio.current_task()
+        logger.info(
+            "Independent reminder scheduler active: client_uid={} history_uid={}",
+            client_uid,
+            history_uid,
+        )
+        try:
+            while self._reminder_conditions_allow(client_uid, history_uid):
+                wakeup_event = self._reminder_wakeup_events.get(client_uid)
+                if wakeup_event is not None:
+                    wakeup_event.clear()
+
+                context = self.client_contexts.get(client_uid)
+                if not context:
+                    await asyncio.sleep(1.0)
+                    continue
+
+                delay = self._next_reminder_due_delay(
+                    client_uid, context, kind="reminder"
+                )
+                if delay is None:
+                    if wakeup_event is not None:
+                        try:
+                            await asyncio.wait_for(wakeup_event.wait(), timeout=5.0)
+                        except asyncio.TimeoutError:
+                            pass
+                    else:
+                        await asyncio.sleep(5.0)
+                    continue
+
+                if delay > 0.05:
+                    sleep_time = min(delay, 5.0)
+                    if wakeup_event is not None:
+                        try:
+                            await asyncio.wait_for(wakeup_event.wait(), timeout=sleep_time)
+                        except asyncio.TimeoutError:
+                            pass
+                    else:
+                        await asyncio.sleep(sleep_time)
+                    continue
+
+                # Reminder is DUE (delay <= 0.05)!
+                active = self.current_conversation_tasks.get(client_uid)
+                if active and not active.done() and active is not current_task:
+                    try:
+                        await asyncio.shield(active)
+                    except Exception:
+                        pass
+                    if not self._reminder_conditions_allow(client_uid, history_uid):
+                        return
+
+                claim_owner = process_claim_owner(
+                    f"reminder:{client_uid}:{uuid.uuid4().hex}"
+                )
+                agent = getattr(context, "agent_engine", None)
+                claim = getattr(agent, "claim_due_future_intentions", None)
+                excluded_ids = self._reminder_retry_exclusions(client_uid)
+                claimed_reminders: List[Dict[str, Any]] = []
+                if callable(claim):
+                    try:
+                        try:
+                            claimed_reminders = claim(
+                                claim_owner,
+                                utcnow(),
+                                lease_seconds=self.REMINDER_CLAIM_LEASE_SECONDS,
+                                exclude_ids=excluded_ids,
+                                kind="reminder",
+                            )
+                        except TypeError:
+                            try:
+                                claimed_reminders = claim(
+                                    claim_owner,
+                                    utcnow(),
+                                    lease_seconds=self.REMINDER_CLAIM_LEASE_SECONDS,
+                                    exclude_ids=excluded_ids,
+                                )
+                            except TypeError:
+                                claimed_reminders = claim(claim_owner, utcnow())
+                    except Exception as error:
+                        logger.debug(
+                            "Reminder claim error in independent scheduler: type={}",
+                            type(error).__name__,
+                        )
+                        claimed_reminders = []
+
+                if not claimed_reminders:
+                    await asyncio.sleep(0.5)
+                    continue
+
+                claimed_ids = [
+                    str(row.get("id", ""))
+                    for row in claimed_reminders
+                    if row.get("id")
+                ]
+                self._clear_reminder_retries(client_uid, claimed_ids)
+
+                due_reminder_texts = [
+                    str(row.get("delivery_text") or row.get("text", "")).strip()
+                    for row in claimed_reminders
+                    if (row.get("kind") or "reminder") == "reminder"
+                ]
+                due_reminder_texts = [t for t in due_reminder_texts if t]
+                if not due_reminder_texts:
+                    self._settle_reminder_claims(
+                        agent,
+                        client_uid,
+                        claim_owner,
+                        claimed_ids,
+                        delivered=True,
+                        reason="empty_payload",
+                    )
+                    continue
+
+                websocket = self.client_connections.get(client_uid)
+                if not websocket:
+                    self._settle_reminder_claims(
+                        agent,
+                        client_uid,
+                        claim_owner,
+                        claimed_ids,
+                        delivered=False,
+                        reason="websocket_disconnected",
+                    )
+                    return
+
+                logger.info(
+                    "Executing independent scheduled reminder: client_uid={} count={} texts={}",
+                    client_uid,
+                    len(claimed_ids),
+                    due_reminder_texts,
+                )
+
+                heartbeat = asyncio.create_task(
+                    self._renew_reminder_claim(
+                        agent,
+                        claim_owner,
+                        claimed_ids,
+                        self.REMINDER_CLAIM_LEASE_SECONDS,
+                        self.REMINDER_CLAIM_RENEW_SECONDS,
+                    )
+                )
+
+                delivery_probe = _ProactiveDeliveryProbe(websocket.send_text)
+                self.current_conversation_tasks[client_uid] = current_task
+                try:
+                    response = await process_single_conversation(
+                        context=context,
+                        websocket_send=delivery_probe,
+                        client_uid=client_uid,
+                        user_input="",
+                        images=None,
+                        session_emoji=str(np.random.choice(EMOJI_LIST)),
+                        metadata={
+                            "request_origin": "reminder",
+                            "proactive_due_reminders": due_reminder_texts,
+                        },
+                    )
+                finally:
+                    heartbeat.cancel()
+                    if self.current_conversation_tasks.get(client_uid) is current_task:
+                        self.current_conversation_tasks.pop(client_uid, None)
+
+                delivered = self._reminder_delivery_evidence(delivery_probe, response)
+                reason = self._reminder_delivery_reason(delivery_probe, response)
+                self._settle_reminder_claims(
+                    agent,
+                    client_uid,
+                    claim_owner,
+                    claimed_ids,
+                    delivered=delivered,
+                    reason=reason,
+                )
+                logger.info(
+                    "Independent reminder settled: count={} delivered={} reason={}",
+                    len(claimed_ids),
+                    delivered,
+                    reason,
+                )
+                await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            pass
+        except Exception as error:
+            logger.exception(
+                "Reminder scheduler error: type={} error={}",
+                type(error).__name__,
+                error,
+            )
+        finally:
+            if self._reminder_scheduler_tasks.get(client_uid) is current_task:
+                self._reminder_scheduler_tasks.pop(client_uid, None)
+            self._reminder_wakeup_events.pop(client_uid, None)
+
     async def _run_proactive_timer(
         self,
         client_uid: str,
@@ -1234,31 +1523,25 @@ class WebSocketHandler:
                     continue
 
                 context = context or self.client_contexts[client_uid]
-                # A due reminder bypasses the idle window (but never an
-                # in-flight turn or a disabled scheduler). Recomputed every
-                # loop so no user message is required to notice it.
                 due_reminder = self._due_reminder_lane(context, now=utcnow())
-                if due_reminder:
-                    if (
-                        not machine.config.enabled
-                        or state.proactive_generation_in_progress
-                    ):
-                        # The due lane made the top-of-loop sleep 0, so leaving
-                        # without a wait would spin this loop at 100% CPU for
-                        # as long as the scheduler is disabled or a turn is
-                        # still in flight. Wait one tick instead.
+                if self._has_active_reminder_scheduler(client_uid):
+                    # Dedicated independent reminder scheduler is active: yield so it
+                    # handles the reminder immediately without idle-window delays.
+                    if due_reminder:
                         await asyncio.sleep(1.0)
                         continue
-                elif not machine.is_eligible(state):
-                    # A due plan (or an already-due row that cannot use the
-                    # reminder lane) also makes the top sleep 0. Without this
-                    # wait the loop would re-enter immediately until the idle
-                    # window opens; with a disabled scheduler the idle window
-                    # never opens at all.
-                    await asyncio.sleep(
-                        min(5.0, max(0.5, machine.seconds_until_eligible(state)))
-                    )
-                    continue
+                    elif not machine.is_eligible(state):
+                        await asyncio.sleep(
+                            min(5.0, max(0.5, machine.seconds_until_eligible(state)))
+                        )
+                        continue
+                else:
+                    # Legacy fallback when no dedicated scheduler task is running (e.g. isolated tests):
+                    if not due_reminder and not machine.is_eligible(state):
+                        await asyncio.sleep(
+                            min(5.0, max(0.5, machine.seconds_until_eligible(state)))
+                        )
+                        continue
 
                 websocket = self.client_connections[client_uid]
 
@@ -1320,80 +1603,76 @@ class WebSocketHandler:
                 # owner+lease (so only one connection can deliver it). A
                 # concurrent attempt gets nothing and never calls the model.
                 if str(getattr(trigger, "reason", "")) == "explicit_reminder":
-                    claim_owner = process_claim_owner(
-                        f"{client_uid}:{uuid.uuid4().hex}"
-                    )
-                    agent = getattr(context, "agent_engine", None)
-                    claim = getattr(agent, "claim_due_future_intentions", None)
-                    excluded_ids = self._reminder_retry_exclusions(client_uid)
-                    if callable(claim):
-                        try:
-                            try:
-                                claimed_reminders = claim(
-                                    claim_owner,
-                                    utcnow(),
-                                    lease_seconds=self.REMINDER_CLAIM_LEASE_SECONDS,
-                                    exclude_ids=excluded_ids,
-                                )
-                            except TypeError:
-                                try:
-                                    claimed_reminders = claim(claim_owner, utcnow())
-                                except TypeError:
-                                    claimed_reminders = claim(claim_owner)
-                        except Exception as error:
-                            logger.debug(
-                                "Future intention claim skipped: type={}",
-                                type(error).__name__,
-                            )
-                            claimed_reminders = []
-                    else:
-                        claimed_reminders = []
-                    if not claimed_reminders:
-                        # Another live attempt owns every eligible reminder (or
-                        # the claim could not be persisted). No model call, no
-                        # budget charge, no premature consumption. If this
-                        # client's own failed rows are merely backing off, wake
-                        # for their retry instead of the generic idle window.
+                    if self._has_active_reminder_scheduler(client_uid):
                         state.proactive_generation_in_progress = False
-                        logger.info(
-                            "Future intention claim unavailable: reason={} "
-                            "owner_retained=false",
-                            getattr(trigger, "reason", ""),
-                        )
-                        retry_delay = self._reminder_retry_delay(client_uid)
-                        next_due_delay = self._next_reminder_due_delay(
-                            client_uid, context
-                        )
-                        sleep_for = None
-                        if retry_delay is not None:
-                            sleep_for = max(0.05, retry_delay)
-                        if next_due_delay is not None:
-                            due_wait = (
-                                max(0.05, next_due_delay)
-                                if next_due_delay > 0
-                                else 5.0
-                            )
-                            sleep_for = (
-                                due_wait
-                                if sleep_for is None
-                                else min(sleep_for, due_wait)
-                            )
-                        if sleep_for is not None:
-                            await asyncio.sleep(min(60.0, sleep_for))
-                        else:
-                            await asyncio.sleep(
-                                min(
-                                    60.0,
-                                    max(5.0, machine.seconds_until_eligible(state)),
-                                )
-                            )
+                        await asyncio.sleep(1.0)
                         continue
-                    claimed_ids = [
-                        str(row.get("id", ""))
-                        for row in claimed_reminders
-                        if row.get("id")
-                    ]
-                    self._clear_reminder_retries(client_uid, claimed_ids)
+                    else:
+                        # Legacy fallback when no dedicated scheduler task is running:
+                        claim_owner = process_claim_owner(
+                            f"{client_uid}:{uuid.uuid4().hex}"
+                        )
+                        agent = getattr(context, "agent_engine", None)
+                        claim = getattr(agent, "claim_due_future_intentions", None)
+                        excluded_ids = self._reminder_retry_exclusions(client_uid)
+                        if callable(claim):
+                            try:
+                                try:
+                                    claimed_reminders = claim(
+                                        claim_owner,
+                                        utcnow(),
+                                        lease_seconds=self.REMINDER_CLAIM_LEASE_SECONDS,
+                                        exclude_ids=excluded_ids,
+                                    )
+                                except TypeError:
+                                    try:
+                                        claimed_reminders = claim(claim_owner, utcnow())
+                                    except TypeError:
+                                        claimed_reminders = claim(claim_owner)
+                            except Exception as error:
+                                logger.debug(
+                                    "Future intention claim skipped: type={}",
+                                    type(error).__name__,
+                                )
+                                claimed_reminders = []
+                        else:
+                            claimed_reminders = []
+                        if not claimed_reminders:
+                            state.proactive_generation_in_progress = False
+                            retry_delay = self._reminder_retry_delay(client_uid)
+                            next_due_delay = self._next_reminder_due_delay(
+                                client_uid, context
+                            )
+                            sleep_for = None
+                            if retry_delay is not None:
+                                sleep_for = max(0.05, retry_delay)
+                            if next_due_delay is not None:
+                                due_wait = (
+                                    max(0.05, next_due_delay)
+                                    if next_due_delay > 0
+                                    else 5.0
+                                )
+                                sleep_for = (
+                                    due_wait
+                                    if sleep_for is None
+                                    else min(sleep_for, due_wait)
+                                )
+                            if sleep_for is not None:
+                                await asyncio.sleep(min(60.0, sleep_for))
+                            else:
+                                await asyncio.sleep(
+                                    min(
+                                        60.0,
+                                        max(5.0, machine.seconds_until_eligible(state)),
+                                    )
+                                )
+                            continue
+                        claimed_ids = [
+                            str(row.get("id", ""))
+                            for row in claimed_reminders
+                            if row.get("id")
+                        ]
+                        self._clear_reminder_retries(client_uid, claimed_ids)
                 if due_reminder:
                     # User obligation lane: count the call, but never raise the
                     # unanswered/backoff pressure that paces spontaneous talk.
@@ -1902,6 +2181,7 @@ class WebSocketHandler:
         # need it, and a second cleanup call must not crash on lookups.
         context = self.client_contexts.get(client_uid)
         await self._cancel_proactive_timer(client_uid)
+        await self._cancel_reminder_scheduler(client_uid)
         group = self.chat_group_manager.get_client_group(client_uid)
         if group:
             try:
@@ -2000,6 +2280,7 @@ class WebSocketHandler:
     async def _cleanup_failed_connection(self, client_uid: str) -> None:
         """Clean up failed connection data"""
         await self._cancel_proactive_timer(client_uid)
+        await self._cancel_reminder_scheduler(client_uid)
         self.client_connections.pop(client_uid, None)
         self.client_contexts.pop(client_uid, None)
         self._protocol_registry().pop(client_uid, None)

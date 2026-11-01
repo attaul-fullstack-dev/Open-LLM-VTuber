@@ -623,6 +623,14 @@ class BasicMemoryAgent(AgentInterface):
         """Expose the character-level relationship state for backend/tests."""
         return self._relationship_state.status
 
+    @property
+    def _effective_user_timezone(self) -> str:
+        return (
+            self._user_timezone
+            or getattr(self._character_state, "user_timezone", None)
+            or "Asia/Jakarta"
+        )
+
     def _relationship_system_prompt(
         self,
         base_prompt: str,
@@ -635,9 +643,9 @@ class BasicMemoryAgent(AgentInterface):
         self._refresh_character_state_if_changed()
         parts = [
             base_prompt,
-            # Temporal anchor: reliable "today" (date + weekday + user tz).
-            # Real clock by design (a date, not a ticking clock); the pure
-            # formatter stays deterministic under test via fixed moments.
+            # Real-time temporal anchor: authoritative current date, weekday,
+            # exact clock time with seconds, user timezone, and UTC timestamp.
+            # Evaluated dynamically on every single turn right before model execution.
             format_temporal_anchor(tz=self._user_timezone),
         ]
         # Previous-session recency: absolute timestamp rendered per turn
@@ -878,6 +886,7 @@ class BasicMemoryAgent(AgentInterface):
         self,
         moment: Optional[datetime] = None,
         exclude_ids: Optional[List[str]] = None,
+        kind: Optional[str] = None,
     ) -> Optional[datetime]:
         """Earliest pending reminder instant (pure read; None when none).
 
@@ -894,6 +903,7 @@ class BasicMemoryAgent(AgentInterface):
                 getattr(self._character_state, "future_intentions", None),
                 now=moment,
                 exclude_ids=exclude_ids,
+                kind=kind,
             )
         except Exception:
             return None

@@ -81,10 +81,10 @@ def build_reminder_receipt_block(
     if status == "clarify":
         return (
             "Backend reminder receipt (verified, authoritative for this turn): "
-            "the user asked for a reminder that refers to earlier content, but "
-            "the referenced text could NOT be resolved from the conversation. "
-            "NOTHING was stored. Ask ONE short clarifying question about what "
-            "exactly you should say, and do NOT claim a reminder is scheduled."
+            "the user asked for a reminder, but either the specific due time was not "
+            "specified/ambiguous or the referenced text could NOT be resolved. "
+            "NOTHING was stored. Ask ONE short clarifying question (for example, "
+            "asking what exact time or what to say), and do NOT claim a reminder is scheduled."
         )
     if status == "failed":
         return (
