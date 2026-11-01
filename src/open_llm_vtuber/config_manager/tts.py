@@ -590,7 +590,7 @@ class ElevenLabsTTSConfig(I18nMixin):
 
     api_key: str = Field(..., alias="api_key")
     voice_id: str = Field(..., alias="voice_id")
-    model_id: str = Field("eleven_v3_conversational", alias="model_id")
+    model_id: str = Field("eleven_v4_turbo", alias="model_id")
     output_format: str = Field("mp3_44100_128", alias="output_format")
     stability: float = Field(0.5, alias="stability")
     similarity_boost: float = Field(0.5, alias="similarity_boost")
@@ -611,8 +611,8 @@ class ElevenLabsTTSConfig(I18nMixin):
             zh="来自 ElevenLabs 的语音 ID（如 JBFqnCBsd6RMkjVDRZzb）",
         ),
         "model_id": Description(
-            en="Model ID for ElevenLabs (e.g., eleven_multilingual_v2)",
-            zh="ElevenLabs 模型 ID（如 eleven_multilingual_v2）",
+            en="Model ID for ElevenLabs (e.g., eleven_v4_turbo, eleven_v3_conversational)",
+            zh="ElevenLabs 模型 ID（如 eleven_v4_turbo, eleven_v3_conversational）",
         ),
         "output_format": Description(
             en="Output audio format (e.g., mp3_44100_128)",

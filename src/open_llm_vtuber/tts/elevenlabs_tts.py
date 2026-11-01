@@ -100,19 +100,25 @@ class TTSEngine(TTSInterface):
                 f"Generating audio via ElevenLabs for text: '{text[:50]}...' with voice '{self.voice_id}' model '{self.model_id}'"
             )
 
+            # Eleven v4 models (e.g. eleven_v4_turbo) only support stability and similarity_boost.
+            # Passing style, speed, or use_speaker_boost causes HTTP 400 Bad Request.
+            is_v4 = bool(self.model_id and self.model_id.lower().startswith("eleven_v4"))
+            voice_settings = {
+                "stability": self.stability,
+                "similarity_boost": self.similarity_boost,
+            }
+            if not is_v4:
+                voice_settings["style"] = self.style
+                voice_settings["use_speaker_boost"] = self.use_speaker_boost
+                voice_settings["speed"] = self.speed
+
             # Generate audio using ElevenLabs API
             audio = self.client.text_to_speech.convert(
                 text=text,
                 voice_id=self.voice_id,
                 model_id=self.model_id,
                 output_format=self.output_format,
-                voice_settings={
-                    "stability": self.stability,
-                    "similarity_boost": self.similarity_boost,
-                    "style": self.style,
-                    "use_speaker_boost": self.use_speaker_boost,
-                    "speed": self.speed,
-                },
+                voice_settings=voice_settings,
             )
 
             # Write the audio data to file
