@@ -34,7 +34,12 @@ from .conversations.conversation_handler import (
     handle_individual_interrupt,
 )
 from .world_state import load_and_reconcile_world_state, utcnow
-from .character_state import recover_stale_claims, set_character_timezone
+from .character_state import (
+    get_character_voice_output_enabled,
+    recover_stale_claims,
+    set_character_timezone,
+    set_character_voice_output_enabled,
+)
 from .claim_identity import claim_owner as process_claim_owner
 from .conversations.single_conversation import process_single_conversation
 from .conversations.conversation_utils import EMOJI_LIST, send_canonical_final
@@ -2115,6 +2120,14 @@ class WebSocketHandler:
             send_text=send_text,
             client_uid=client_uid,
         )
+        conf_uid = (
+            session_service_context.character_config.conf_uid
+            if session_service_context.character_config
+            else "default"
+        )
+        session_service_context.voice_output_enabled = (
+            get_character_voice_output_enabled(conf_uid, default=True)
+        )
         return session_service_context
 
     async def handle_websocket_communication(
@@ -3907,20 +3920,47 @@ class WebSocketHandler:
 
         When OFF the backend skips ElevenLabs/audio synthesis entirely and
         sends text-only display payloads, so no credits are consumed.
-        Confirms the authoritative state back to the client.
+        Confirms the authoritative state back to the client and persists
+        durably into the character state.
         """
         context = self.client_contexts.get(client_uid)
         enabled = bool(data.get("enabled", True))
         if context is None:
             return
         context.voice_output_enabled = enabled
+        char_cfg = getattr(context, "character_config", None)
+        conf_uid = getattr(char_cfg, "conf_uid", "default") if char_cfg else "default"
+        set_character_voice_output_enabled(conf_uid, enabled)
+        if hasattr(self, "default_context_cache") and self.default_context_cache:
+            self.default_context_cache.voice_output_enabled = enabled
+
         logger.info(
-            "Voice output toggle for client {} -> enabled={}", client_uid, enabled
+            "Voice output toggle for client {} (conf={}) -> enabled={}",
+            client_uid,
+            conf_uid,
+            enabled,
         )
+
+        notification = json.dumps({"type": "voice-output-state", "enabled": enabled})
+        # Keep concurrent WebSocket sessions sharing this conf_uid synchronized
+        for other_uid, other_context in list(self.client_contexts.items()):
+            other_char_cfg = getattr(other_context, "character_config", None)
+            other_conf = getattr(other_char_cfg, "conf_uid", "default") if other_char_cfg else "default"
+            if other_conf == conf_uid:
+                other_context.voice_output_enabled = enabled
+                other_ws = self.client_connections.get(other_uid)
+                if other_ws and other_uid != client_uid:
+                    try:
+                        await other_ws.send_text(notification)
+                    except Exception as err:
+                        logger.warning(
+                            "Failed to broadcast voice-output-state to client {}: {}",
+                            other_uid,
+                            err,
+                        )
+
         try:
-            await websocket.send_text(
-                json.dumps({"type": "voice-output-state", "enabled": enabled})
-            )
+            await websocket.send_text(notification)
         except Exception as e:
             logger.warning(
                 "Failed to send voice-output-state confirmation to client {}: {}",

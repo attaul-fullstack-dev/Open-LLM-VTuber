@@ -199,6 +199,63 @@ class VoiceOutputToggleBackendTests(unittest.IsolatedAsyncioTestCase):
         await handler._handle_voice_output_toggle(websocket, "ghost", {"enabled": False})
         self.assertEqual(len(websocket.messages), 0)
 
+    async def test_concurrent_websocket_connections_synchronized(self):
+        """When client 1 toggles Voice OFF, client 2 sharing same conf_uid receives broadcast and flips."""
+        char_cfg = SimpleNamespace(conf_uid="test_char_concurrent")
+        ctx1 = SimpleNamespace(voice_output_enabled=True, character_config=char_cfg)
+        ctx2 = SimpleNamespace(voice_output_enabled=True, character_config=char_cfg)
+        handler = WebSocketHandler(default_context_cache=None)
+        handler.client_contexts["client1"] = ctx1
+        handler.client_contexts["client2"] = ctx2
+        ws1 = _FakeWebSocket()
+        ws2 = _FakeWebSocket()
+        handler.client_connections["client1"] = ws1
+        handler.client_connections["client2"] = ws2
+
+        await handler._handle_voice_output_toggle(ws1, "client1", {"enabled": False})
+
+        # Both contexts are updated to False
+        self.assertFalse(ctx1.voice_output_enabled)
+        self.assertFalse(ctx2.voice_output_enabled)
+        # Client 1 received direct confirmation
+        self.assertEqual(ws1.messages, [{"type": "voice-output-state", "enabled": False}])
+        # Client 2 received broadcast notification
+        self.assertEqual(ws2.messages, [{"type": "voice-output-state", "enabled": False}])
+
+    def test_character_state_voice_output_persistence(self):
+        """Verify durable persistence of voice output preference in character state."""
+        import tempfile
+        import uuid
+        import os
+        from src.open_llm_vtuber.character_state import (
+            get_character_voice_output_enabled,
+            set_character_voice_output_enabled,
+            load_character_state,
+        )
+
+        test_conf = f"test_persistence_{uuid.uuid4().hex}"
+        # Uninitialized returns default True
+        self.assertTrue(get_character_voice_output_enabled(test_conf, default=True))
+
+        # Explicitly set False
+        saved = set_character_voice_output_enabled(test_conf, False)
+        self.assertIsNotNone(saved)
+        self.assertFalse(saved.voice_output_enabled)
+
+        # Fresh load verifies False persisted
+        loaded = load_character_state(test_conf)
+        self.assertFalse(loaded.voice_output_enabled)
+        self.assertFalse(get_character_voice_output_enabled(test_conf))
+
+        # Clean up temporary test file
+        from src.open_llm_vtuber.character_state import get_character_state_path
+        path = get_character_state_path(test_conf)
+        if os.path.exists(path):
+            os.remove(path)
+        lock_path = path + ".lock"
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
+
 
 if __name__ == "__main__":
     unittest.main()

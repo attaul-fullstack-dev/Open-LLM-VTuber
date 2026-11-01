@@ -212,6 +212,10 @@ class CharacterState:
     # atomic store as memories/goals/preferences — not a new memory system.
     # Old state files without this key load as empty (restart/old-state safe).
     future_intentions: List[Dict[str, Any]] = field(default_factory=list)
+    # Durable user preference for voice output (TTS synthesis).
+    # When False, backend skips ElevenLabs/audio synthesis completely (0 credits).
+    # None means no explicit preference stored yet (default fallback True).
+    voice_output_enabled: Optional[bool] = None
 
 
 GoalStatus = Literal["seed", "active", "done"]
@@ -531,6 +535,8 @@ def load_character_state(conf_uid: str) -> CharacterState:
                         intentions.append(parsed_intention)
         except Exception:
             intentions = []
+        raw_voice = data.get("voice_output_enabled")
+        voice_output = bool(raw_voice) if raw_voice is not None else None
         return CharacterState(
             relationship_status=normalize_relationship_status(
                 data.get("relationship_status", "stranger")
@@ -543,6 +549,7 @@ def load_character_state(conf_uid: str) -> CharacterState:
             interaction_preferences=preferences,
             user_timezone=str(data.get("user_timezone") or "") or None,
             future_intentions=intentions,
+            voice_output_enabled=voice_output,
         )
     except Exception as error:
         logger.error(
@@ -568,6 +575,7 @@ def save_character_state(conf_uid: str, state: CharacterState) -> bool:
                 "interaction_preferences": state.interaction_preferences,
                 "user_timezone": state.user_timezone,
                 "future_intentions": state.future_intentions,
+                "voice_output_enabled": state.voice_output_enabled,
             }
             _write_state_atomic(filepath, data)
         return True
@@ -693,6 +701,36 @@ def set_character_timezone(
     if state.user_timezone == name:
         return state
     state.user_timezone = name
+    if not save_character_state(conf_uid, state):
+        return None
+    return state
+
+
+def get_character_voice_output_enabled(
+    conf_uid: str, default: bool = True
+) -> bool:
+    """Return the persisted voice output preference for a character.
+
+    If not explicitly set in the character state, returns `default` (True).
+    """
+    state = load_character_state(conf_uid)
+    if state.voice_output_enabled is not None:
+        return bool(state.voice_output_enabled)
+    return default
+
+
+@_state_transaction
+def set_character_voice_output_enabled(
+    conf_uid: str, enabled: bool
+) -> Optional[CharacterState]:
+    """Atomically persist the voice output preference for a character.
+
+    Returns updated CharacterState on success, or None on write failure.
+    """
+    state = load_character_state(conf_uid)
+    if state.voice_output_enabled == enabled:
+        return state
+    state.voice_output_enabled = enabled
     if not save_character_state(conf_uid, state):
         return None
     return state
