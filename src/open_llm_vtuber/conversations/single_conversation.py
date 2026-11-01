@@ -565,7 +565,7 @@ async def process_single_conversation(
                         websocket_send=websocket_send,  # Pass websocket_send for audio/tts messages
                         tts_manager=tts_manager,
                         translate_engine=context.translate_engine,
-                        synthesize_audio=getattr(
+                        synthesize_audio=lambda: getattr(
                             context, "voice_output_enabled", True
                         ),
                         before_content_send=durable_content.before_content,

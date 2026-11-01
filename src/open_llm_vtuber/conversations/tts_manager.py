@@ -4,7 +4,7 @@ import re
 import time
 import uuid
 from datetime import datetime
-from typing import Awaitable, Callable, List, Optional, Dict, Tuple
+from typing import Awaitable, Callable, List, Optional, Dict, Tuple, Union
 from loguru import logger
 
 from ..agent.output_types import DisplayText, Actions
@@ -139,7 +139,7 @@ class TTSTaskManager:
         live2d_model: Live2dModel,
         tts_engine: TTSInterface,
         websocket_send: WebSocketSend,
-        synthesize_audio: bool = True,
+        synthesize_audio: Union[bool, Callable[[], bool]] = True,
         emotion_tag: Optional[str] = None,
         history_text: str = "",
         before_content_send: Optional[Callable[[str], Awaitable[bool]]] = None,
@@ -182,7 +182,12 @@ class TTSTaskManager:
                 "earlier frame; dropping this segment"
             )
             return
-        if emotion_tag and synthesize_audio and self._emotion_tags_allowed(tts_engine):
+        should_synthesize_now = (
+            synthesize_audio()
+            if callable(synthesize_audio)
+            else bool(synthesize_audio)
+        )
+        if emotion_tag and should_synthesize_now and self._emotion_tags_allowed(tts_engine):
             from ..voice_emotion import tag_tts_text
 
             tts_text = tag_tts_text(tts_text, emotion_tag)
@@ -436,7 +441,7 @@ class TTSTaskManager:
         live2d_model: Live2dModel,
         tts_engine: TTSInterface,
         sequence_number: int,
-        synthesize_audio: bool = True,
+        synthesize_audio: Union[bool, Callable[[], bool]] = True,
         history_text: str = "",
         before_content_send: Optional[Callable[[str], Awaitable[bool]]] = None,
         after_content_send: Optional[
@@ -450,7 +455,12 @@ class TTSTaskManager:
         audio_file_path = None
         synthesis_started = time.perf_counter()
         try:
-            if synthesize_audio:
+            should_synthesize = (
+                synthesize_audio()
+                if callable(synthesize_audio)
+                else bool(synthesize_audio)
+            )
+            if should_synthesize:
                 audio_file_path = await self._generate_audio(tts_engine, tts_text)
                 if tracker:
                     tracker.add_tts_synthesis(

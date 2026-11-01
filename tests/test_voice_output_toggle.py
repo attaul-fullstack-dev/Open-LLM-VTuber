@@ -92,7 +92,7 @@ class VoiceOutputToggleBackendTests(unittest.IsolatedAsyncioTestCase):
         engine.async_generate_audio.assert_awaited_once()
 
     async def test_websocket_voice_output_toggle_sets_context_flag(self):
-        """The voice-output-toggle WS message flips the per-client runtime flag."""
+        """The voice-output-toggle WS message flips the per-client runtime flag and sends confirmation."""
         context = SimpleNamespace(voice_output_enabled=True)
         handler = WebSocketHandler(default_context_cache=None)
         handler.client_contexts["client"] = context
@@ -100,15 +100,104 @@ class VoiceOutputToggleBackendTests(unittest.IsolatedAsyncioTestCase):
 
         await handler._handle_voice_output_toggle(websocket, "client", {"enabled": False})
         self.assertFalse(context.voice_output_enabled)
+        self.assertEqual(len(websocket.messages), 1)
+        self.assertEqual(websocket.messages[0], {"type": "voice-output-state", "enabled": False})
 
         await handler._handle_voice_output_toggle(websocket, "client", {"enabled": True})
         self.assertTrue(context.voice_output_enabled)
+        self.assertEqual(len(websocket.messages), 2)
+        self.assertEqual(websocket.messages[1], {"type": "voice-output-state", "enabled": True})
+
+    async def test_callable_synthesize_audio_skips_when_context_is_false(self):
+        """Callable synthesize_audio dynamically evaluated as False must skip engine call."""
+        context = SimpleNamespace(voice_output_enabled=False)
+        engine = MagicMock()
+        engine.async_generate_audio = AsyncMock(
+            side_effect=AssertionError("Must not synthesize when voice is OFF")
+        )
+        engine.__class__.__module__ = "some_module.edge_tts"
+        engine.remove_file = MagicMock()
+
+        live2d_model = MagicMock()
+        websocket = _FakeWebSocket()
+        manager = TTSTaskManager()
+
+        display = DisplayText(text="Teks saja ya.", name="Mili", avatar="a")
+        actions = Actions(emotions=["smile"])
+
+        await manager.speak(
+            tts_text="Teks saja ya.",
+            display_text=display,
+            actions=actions,
+            live2d_model=live2d_model,
+            tts_engine=engine,
+            websocket_send=websocket.send_text,
+            synthesize_audio=lambda: context.voice_output_enabled,
+        )
+        await self._drain(manager)
+
+        engine.async_generate_audio.assert_not_awaited()
+        self.assertEqual(len(websocket.messages), 1)
+        payload = websocket.messages[0]
+        self.assertEqual(payload["type"], "audio")
+        self.assertFalse(payload.get("audio"))
+        self.assertEqual(payload["display_text"]["text"], "Teks saja ya.")
+        self.assertEqual(payload["actions"]["emotions"], ["smile"])
+
+    async def test_in_flight_callable_evaluates_at_synthesis_time(self):
+        """If context flips to False before synthesis starts, the callable cancels generation."""
+        context = SimpleNamespace(voice_output_enabled=True)
+        engine = MagicMock()
+        engine.async_generate_audio = AsyncMock(return_value="/tmp/fake.wav")
+        engine.__class__.__module__ = "some_module.edge_tts"
+        engine.remove_file = MagicMock()
+
+        live2d_model = MagicMock()
+        websocket = _FakeWebSocket()
+        manager = TTSTaskManager()
+
+        display = DisplayText(text="Menunggu proses.", name="Mili", avatar="a")
+        actions = Actions(emotions=["neutral"])
+
+        # Flip the flag immediately after queueing, before tasks run
+        await manager.speak(
+            tts_text="Menunggu proses.",
+            display_text=display,
+            actions=actions,
+            live2d_model=live2d_model,
+            tts_engine=engine,
+            websocket_send=websocket.send_text,
+            synthesize_audio=lambda: context.voice_output_enabled,
+        )
+        context.voice_output_enabled = False
+
+        await self._drain(manager)
+
+        # Dynamic callable in _process_tts checked context and skipped synthesis
+        engine.async_generate_audio.assert_not_awaited()
+        self.assertEqual(len(websocket.messages), 1)
+        self.assertFalse(websocket.messages[0].get("audio"))
+
+    async def test_rapid_toggle_sequence_consistency(self):
+        """Rapid toggles OFF -> ON -> OFF settle consistently to final state."""
+        context = SimpleNamespace(voice_output_enabled=True)
+        handler = WebSocketHandler(default_context_cache=None)
+        handler.client_contexts["client"] = context
+        websocket = _FakeWebSocket()
+
+        for state in [False, True, False, True, False]:
+            await handler._handle_voice_output_toggle(websocket, "client", {"enabled": state})
+
+        self.assertFalse(context.voice_output_enabled)
+        self.assertEqual(len(websocket.messages), 5)
+        self.assertEqual([m["enabled"] for m in websocket.messages], [False, True, False, True, False])
 
     async def test_websocket_voice_output_toggle_missing_context_is_safe(self):
         handler = WebSocketHandler(default_context_cache=None)
         websocket = _FakeWebSocket()
         # No context registered -> must not raise.
         await handler._handle_voice_output_toggle(websocket, "ghost", {"enabled": False})
+        self.assertEqual(len(websocket.messages), 0)
 
 
 if __name__ == "__main__":

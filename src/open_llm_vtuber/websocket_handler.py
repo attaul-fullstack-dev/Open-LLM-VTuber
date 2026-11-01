@@ -2082,6 +2082,16 @@ class WebSocketHandler:
         # Start microphone
         await websocket.send_text(json.dumps({"type": "control", "text": "start-mic"}))
 
+        # Send initial voice output state confirmation
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "type": "voice-output-state",
+                    "enabled": session_service_context.voice_output_enabled,
+                }
+            )
+        )
+
     async def _init_service_context(
         self, send_text: Callable, client_uid: str
     ) -> ServiceContext:
@@ -3897,6 +3907,7 @@ class WebSocketHandler:
 
         When OFF the backend skips ElevenLabs/audio synthesis entirely and
         sends text-only display payloads, so no credits are consumed.
+        Confirms the authoritative state back to the client.
         """
         context = self.client_contexts.get(client_uid)
         enabled = bool(data.get("enabled", True))
@@ -3906,6 +3917,16 @@ class WebSocketHandler:
         logger.info(
             "Voice output toggle for client {} -> enabled={}", client_uid, enabled
         )
+        try:
+            await websocket.send_text(
+                json.dumps({"type": "voice-output-state", "enabled": enabled})
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to send voice-output-state confirmation to client {}: {}",
+                client_uid,
+                e,
+            )
 
     async def _handle_audio_play_start(
         self, websocket: WebSocket, client_uid: str, data: WSMessage

@@ -181,7 +181,7 @@ async def process_agent_output(
     websocket_send: WebSocketSend,
     tts_manager: TTSTaskManager,
     translate_engine: Optional[Any] = None,
-    synthesize_audio: bool = True,
+    synthesize_audio: Union[bool, Callable[[], bool]] = True,
     before_content_send: Optional[Callable[[str], Awaitable[bool]]] = None,
     after_content_send: Optional[
         Callable[[str, bool], Awaitable[None]]
@@ -237,7 +237,7 @@ async def handle_sentence_output(
     websocket_send: WebSocketSend,
     tts_manager: TTSTaskManager,
     translate_engine: Optional[Any] = None,
-    synthesize_audio: bool = True,
+    synthesize_audio: Union[bool, Callable[[], bool]] = True,
     before_content_send: Optional[Callable[[str], Awaitable[bool]]] = None,
     after_content_send: Optional[
         Callable[[str, bool], Awaitable[None]]
