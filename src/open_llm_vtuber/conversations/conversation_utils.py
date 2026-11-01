@@ -535,6 +535,13 @@ async def finalize_conversation_turn(
             # is contradictory.
             if failed_segments and outcome != "failed":
                 outcome = "failed"
+            played_count = response.get("audio_played_segments")
+            if outcome == "played" and played_count is not None:
+                try:
+                    if int(played_count) <= 0:
+                        outcome = "failed" if failed_segments else "text_only"
+                except (TypeError, ValueError):
+                    pass
             if tracker:
                 tracker.playback_outcome = outcome or "unknown"
                 tracker.playback_failed_segments = failed_segments

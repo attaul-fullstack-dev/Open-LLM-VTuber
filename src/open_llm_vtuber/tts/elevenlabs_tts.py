@@ -5,7 +5,7 @@ from pathlib import Path
 from loguru import logger
 from elevenlabs.client import ElevenLabs
 
-from .tts_interface import TTSInterface
+from .tts_interface import TTSInterface, TTSError, TTSQuotaExceededError
 
 
 class TTSEngine(TTSInterface):
@@ -134,7 +134,92 @@ class TTSEngine(TTSInterface):
                     logger.error(
                         f"Could not remove incomplete file {speech_file_path}: {rm_err}"
                     )
-            raise e
+
+            if isinstance(e, TTSError):
+                raise e
+
+            status_code = getattr(e, "status_code", None)
+            body = getattr(e, "body", None)
+            detail = {}
+            if isinstance(body, dict):
+                detail = (
+                    body.get("detail", {})
+                    if isinstance(body.get("detail"), dict)
+                    else body
+                )
+
+            code = detail.get("code") or detail.get("status") if isinstance(detail, dict) else None
+            msg = detail.get("message") if isinstance(detail, dict) else (str(body) if body else str(e))
+            msg_str = str(msg or e)
+            body_str = str(body or "").lower()
+
+            # 1. Quota Exceeded (specifically checking code/status/message, even with HTTP 401)
+            if (
+                code == "quota_exceeded"
+                or "quota_exceeded" in body_str
+                or "exceeds your quota" in body_str
+                or "exceeds your quota" in msg_str.lower()
+                or (status_code == 402)
+            ):
+                raise TTSQuotaExceededError(
+                    msg_str,
+                    http_status=status_code or 401,
+                    original_error=e,
+                ) from e
+            elif status_code == 401:
+                raise TTSError(
+                    msg_str,
+                    error_code=code or "authentication_failed",
+                    error_category="authentication",
+                    http_status=401,
+                    retryable=False,
+                    original_error=e,
+                ) from e
+            elif status_code == 403:
+                raise TTSError(
+                    msg_str,
+                    error_code=code or "permission_denied",
+                    error_category="permission",
+                    http_status=403,
+                    retryable=False,
+                    original_error=e,
+                ) from e
+            elif status_code == 404:
+                raise TTSError(
+                    msg_str,
+                    error_code=code or "not_found",
+                    error_category="not_found",
+                    http_status=404,
+                    retryable=False,
+                    original_error=e,
+                ) from e
+            elif status_code == 400:
+                raise TTSError(
+                    msg_str,
+                    error_code=code or "invalid_request",
+                    error_category="invalid_request",
+                    http_status=400,
+                    retryable=False,
+                    original_error=e,
+                ) from e
+            elif status_code == 429:
+                raise TTSError(
+                    msg_str,
+                    error_code=code or "rate_limited",
+                    error_category="rate_limited",
+                    http_status=429,
+                    retryable=False,
+                    original_error=e,
+                ) from e
+            else:
+                raise TTSError(
+                    str(e),
+                    error_code="synthesis_failed",
+                    error_category="unknown",
+                    http_status=status_code,
+                    retryable=False,
+                    original_error=e,
+                ) from e
 
         return str(speech_file_path)
 

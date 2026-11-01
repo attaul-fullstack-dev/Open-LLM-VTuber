@@ -1,8 +1,60 @@
 import abc
 import os
 import asyncio
+from typing import Optional
 
 from loguru import logger
+
+
+class TTSError(Exception):
+    """Base structured exception for TTS synthesis failures."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str = "unknown",
+        error_category: str = "unknown",
+        http_status: Optional[int] = None,
+        retryable: bool = False,
+        original_error: Optional[Exception] = None,
+    ):
+        super().__init__(message)
+        self.error_code = error_code
+        self.error_category = error_category
+        self.http_status = http_status
+        self.retryable = retryable
+        self.original_error = original_error
+
+    def to_dict(self, provider: str = "") -> dict:
+        return {
+            "provider": provider,
+            "code": self.error_code,
+            "category": self.error_category,
+            "message": str(self),
+            "http_status": self.http_status,
+            "retryable": self.retryable,
+        }
+
+
+class TTSQuotaExceededError(TTSError):
+    """Raised when TTS provider quota or credits have been exceeded."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        http_status: Optional[int] = 401,
+        original_error: Optional[Exception] = None,
+    ):
+        super().__init__(
+            message,
+            error_code="quota_exceeded",
+            error_category="quota_exceeded",
+            http_status=http_status,
+            retryable=False,
+            original_error=original_error,
+        )
 
 
 class TTSInterface(metaclass=abc.ABCMeta):

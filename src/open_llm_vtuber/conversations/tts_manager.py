@@ -480,11 +480,66 @@ class TTSTaskManager:
 
         except Exception as e:
             logger.error(f"Error preparing audio payload: {e}")
-            # Queue silent payload for error case
+            from ..tts.tts_interface import TTSError
+
+            provider_name = tts_engine.__class__.__module__.split(".")[-1]
+            if isinstance(e, TTSError):
+                tts_error_info = e.to_dict(provider=provider_name)
+            else:
+                status_code = getattr(
+                    e, "status_code", getattr(e, "http_status", None)
+                )
+                body = getattr(e, "body", None)
+                body_str = str(body or "").lower()
+                e_str = str(e).lower()
+
+                if (
+                    "quota_exceeded" in body_str
+                    or "exceeds your quota" in body_str
+                    or "quota_exceeded" in e_str
+                    or "exceeds your quota" in e_str
+                    or status_code == 402
+                ):
+                    error_code = "quota_exceeded"
+                    error_category = "quota_exceeded"
+                    http_status = status_code or 401
+                elif status_code == 401:
+                    error_code = "authentication_failed"
+                    error_category = "authentication"
+                    http_status = 401
+                elif status_code == 403:
+                    error_code = "permission_denied"
+                    error_category = "permission"
+                    http_status = 403
+                elif status_code == 404:
+                    error_code = "not_found"
+                    error_category = "not_found"
+                    http_status = 404
+                elif status_code == 429:
+                    error_code = "rate_limited"
+                    error_category = "rate_limited"
+                    http_status = 429
+                else:
+                    error_code = getattr(e, "error_code", "synthesis_failed")
+                    error_category = getattr(e, "error_category", "unknown")
+                    http_status = status_code
+
+                tts_error_info = {
+                    "provider": provider_name,
+                    "code": error_code,
+                    "category": error_category,
+                    "message": str(e),
+                    "http_status": http_status,
+                    "retryable": False,
+                }
+
+            # Queue silent payload for error case with explicit error metadata
             payload = prepare_audio_payload(
                 audio_path=None,
                 display_text=display_text,
                 actions=actions,
+                tts_status="failed",
+                tts_error=tts_error_info,
             )
             _stamp_turn_identity(payload, tracker)
             if not self._content_blocked:

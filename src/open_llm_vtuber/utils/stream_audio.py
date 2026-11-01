@@ -30,6 +30,8 @@ def prepare_audio_payload(
     display_text: DisplayText = None,
     actions: Actions = None,
     forwarded: bool = False,
+    tts_status: str | None = None,
+    tts_error: dict[str, any] | None = None,
 ) -> dict[str, any]:
     """
     Prepares the audio payload for sending to a broadcast endpoint.
@@ -40,6 +42,8 @@ def prepare_audio_payload(
         chunk_length_ms (int): The length of each audio chunk in milliseconds
         display_text (DisplayText, optional): Text to be displayed with the audio
         actions (Actions, optional): Actions associated with the audio
+        tts_status (str, optional): Explicit TTS status ('failed', 'skipped', etc.)
+        tts_error (dict, optional): Structured TTS error metadata
 
     Returns:
         dict: The audio payload to be sent
@@ -49,7 +53,7 @@ def prepare_audio_payload(
 
     if not audio_path:
         # Return payload for silent display
-        return {
+        payload = {
             "type": "audio",
             "audio": None,
             "volumes": [],
@@ -58,6 +62,11 @@ def prepare_audio_payload(
             "actions": actions.to_dict() if actions else None,
             "forwarded": forwarded,
         }
+        if tts_status is not None:
+            payload["tts_status"] = tts_status
+        if tts_error is not None:
+            payload["tts_error"] = tts_error
+        return payload
 
     try:
         audio = AudioSegment.from_file(audio_path)
